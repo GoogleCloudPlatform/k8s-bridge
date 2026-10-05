@@ -25,7 +25,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/GoogleCloudPlatform/k8s-bridge/internal/controller/slurmjob"
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 )
 
@@ -74,7 +73,7 @@ var _ = Describe("Interactive Slurm Allocations", func() {
 		))
 
 		By("verifying slurmd probes left the idle interactive worker alone")
-		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, workerPodName, slurmjob.SlurmdProbePeriodSeconds*time.Second)
+		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, workerPodName)
 
 		session.Exit()
 
@@ -119,7 +118,7 @@ var _ = Describe("Interactive Slurm Allocations", func() {
 		))
 
 		By("verifying slurmd probes left the idle interactive worker alone")
-		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, workerPodName, slurmjob.SlurmdProbePeriodSeconds*time.Second)
+		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, workerPodName)
 
 		session.Exit()
 

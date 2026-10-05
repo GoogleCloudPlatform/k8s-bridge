@@ -904,7 +904,23 @@ func expectSlurmdProbesSucceeded(g gomega.Gomega, slurmNamespace, podName string
 	}
 }
 
-func VerifySlurmdProbesStayHealthy(slurmNamespace, podName string, probePeriod time.Duration) {
+const (
+	// slurmdProbePeriod mirrors SlurmdProbePeriodSeconds in
+	// internal/controller/slurmjob/translator.go.
+	slurmdProbePeriod = 10 * time.Second
+	// slurmdProbeObservationWindow leaves room for a livenessProbe to start
+	// (within one period) and finish (within its 5s timeout) inside the window.
+	slurmdProbeObservationWindow = 2 * slurmdProbePeriod
+)
+
+// VerifySlurmdProbesStayHealthy waits for the slurmd startupProbe to pass on
+// podName and then keeps verifying the probes for longer than a probe period.
+//
+// VerifySlurmdProbesSuccess only inspects probe results recorded so far, so
+// right after the worker enters a new state, e.g. goes idle while holding an
+// interactive allocation, it can pass before any probe has run in that state.
+// Call this once the worker is in the state under test instead.
+func VerifySlurmdProbesStayHealthy(slurmNamespace, podName string) {
 	ginkgo.GinkgoHelper()
 
 	ginkgo.By(fmt.Sprintf("waiting for the slurmd startupProbe to pass on pod %s", podName))
@@ -917,11 +933,8 @@ func VerifySlurmdProbesStayHealthy(slurmNamespace, podName string, probePeriod t
 			fmt.Sprintf("slurmd startupProbe has not passed on pod %s yet", podName))
 	}, time.Minute, time.Second).Should(gomega.Succeed())
 
-	// observationWindow leaves room for a livenessProbe to start
-	// (within one period) and finish (within its 5s timeout) inside the window.
-	observationWindow := 2 * probePeriod
-	ginkgo.By(fmt.Sprintf("verifying slurmd probes keep passing on pod %s for %s", podName, observationWindow))
+	ginkgo.By(fmt.Sprintf("verifying slurmd probes keep passing on pod %s for %s", podName, slurmdProbeObservationWindow))
 	gomega.Consistently(func(g gomega.Gomega) {
 		expectSlurmdProbesSucceeded(g, slurmNamespace, podName)
-	}, observationWindow, 2*time.Second).Should(gomega.Succeed())
+	}, slurmdProbeObservationWindow, 2*time.Second).Should(gomega.Succeed())
 }
