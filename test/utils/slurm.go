@@ -867,12 +867,19 @@ func GetSlurmJobOutput(slurmNamespace, jobID string) (string, error) {
 func VerifySlurmdProbesSuccess(slurmNamespace, podName string) {
 	ginkgo.GinkgoHelper()
 	ginkgo.By(fmt.Sprintf("verifying slurmd startup and liveness probes on pod %s", podName))
+	expectSlurmdProbesSucceeded(gomega.Default, slurmNamespace, podName)
+}
+
+// expectSlurmdProbesSucceeded asserts through g that the slurmd container of
+// podName has not restarted and has no failed startupProbe or livenessProbe events.
+func expectSlurmdProbesSucceeded(g gomega.Gomega, slurmNamespace, podName string) {
+	ginkgo.GinkgoHelper()
 
 	cmd := exec.Command("kubectl", "get", "pod", podName, "-n", slurmNamespace,
 		"-o", "jsonpath={.status.containerStatuses[?(@.name=='slurmd')].restartCount}")
 	restartCount, err := Run(cmd)
 	if err == nil && strings.TrimSpace(restartCount) != "" {
-		gomega.Expect(strings.TrimSpace(restartCount)).To(gomega.Equal("0"),
+		g.Expect(strings.TrimSpace(restartCount)).To(gomega.Equal("0"),
 			fmt.Sprintf("Expected slurmd container on pod %s to have 0 restarts", podName))
 	}
 
@@ -881,9 +888,9 @@ func VerifySlurmdProbesSuccess(slurmNamespace, podName string) {
 		"-o", "jsonpath={.items[*].message}")
 	eventsOut, err := Run(eventsCmd)
 	if err == nil && strings.TrimSpace(eventsOut) != "" {
-		gomega.Expect(eventsOut).NotTo(gomega.ContainSubstring("failed liveness probe"),
+		g.Expect(eventsOut).NotTo(gomega.ContainSubstring("failed liveness probe"),
 			fmt.Sprintf("Pod %s slurmd container failed liveness probe: %s", podName, eventsOut))
-		gomega.Expect(eventsOut).NotTo(gomega.ContainSubstring("failed startup probe"),
+		g.Expect(eventsOut).NotTo(gomega.ContainSubstring("failed startup probe"),
 			fmt.Sprintf("Pod %s slurmd container failed startup probe: %s", podName, eventsOut))
 	}
 
@@ -892,7 +899,42 @@ func VerifySlurmdProbesSuccess(slurmNamespace, podName string) {
 		"-o", "jsonpath={.items[*].message}")
 	unhealthyOut, err := Run(unhealthyCmd)
 	if err == nil && strings.TrimSpace(unhealthyOut) != "" {
-		gomega.Expect(unhealthyOut).NotTo(gomega.ContainSubstring("Liveness probe failed"),
+		g.Expect(unhealthyOut).NotTo(gomega.ContainSubstring("Liveness probe failed"),
 			fmt.Sprintf("Pod %s slurmd container reported unhealthy liveness probe: %s", podName, unhealthyOut))
 	}
+}
+
+const (
+	// slurmdProbePeriod mirrors SlurmdProbePeriodSeconds in
+	// internal/controller/slurmjob/translator.go.
+	slurmdProbePeriod = 10 * time.Second
+	// slurmdProbeObservationWindow leaves room for a livenessProbe to start
+	// (within one period) and finish (within its 5s timeout) inside the window.
+	slurmdProbeObservationWindow = 2 * slurmdProbePeriod
+)
+
+// VerifySlurmdProbesStayHealthy waits for the slurmd startupProbe to pass on
+// podName and then keeps verifying the probes for longer than a probe period.
+//
+// VerifySlurmdProbesSuccess only inspects probe results recorded so far, so
+// right after the worker enters a new state, e.g. goes idle while holding an
+// interactive allocation, it can pass before any probe has run in that state.
+// Call this once the worker is in the state under test instead.
+func VerifySlurmdProbesStayHealthy(slurmNamespace, podName string) {
+	ginkgo.GinkgoHelper()
+
+	ginkgo.By(fmt.Sprintf("waiting for the slurmd startupProbe to pass on pod %s", podName))
+	gomega.Eventually(func(g gomega.Gomega) {
+		cmd := exec.Command("kubectl", "get", "pod", podName, "-n", slurmNamespace,
+			"-o", "jsonpath={.status.containerStatuses[?(@.name=='slurmd')].started}")
+		started, err := Run(cmd)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get slurmd container status of pod "+podName)
+		g.Expect(strings.TrimSpace(started)).To(gomega.Equal("true"),
+			fmt.Sprintf("slurmd startupProbe has not passed on pod %s yet", podName))
+	}, time.Minute, time.Second).Should(gomega.Succeed())
+
+	ginkgo.By(fmt.Sprintf("verifying slurmd probes keep passing on pod %s for %s", podName, slurmdProbeObservationWindow))
+	gomega.Consistently(func(g gomega.Gomega) {
+		expectSlurmdProbesSucceeded(g, slurmNamespace, podName)
+	}, slurmdProbeObservationWindow, 2*time.Second).Should(gomega.Succeed())
 }
