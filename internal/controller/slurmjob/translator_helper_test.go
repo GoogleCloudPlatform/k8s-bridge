@@ -48,11 +48,16 @@ const (
 	testGpuTypeL4           = "nvidia-l4"
 	testGpuTypeA100         = "nvidia-tesla-a100"
 	testCustomSlurmdImage   = "custom-slurmd:v1"
-	testPartitionHighPrio   = "'Features=k8s-id-123'"
-	testPartitionLowPrio    = "'Features=k8s-id-123'"
+	// testDefaultNodeResources is what Translate derives for newTestJob():
+	// 1 node, 1 task, no --cpus-per-task => 1 CPU, times defaultMemoryPerCPUMB.
+	testDefaultNodeResources = "CPUs=1 RealMemory=2048"
+	testPartitionHighPrio    = "'" + testDefaultNodeResources + " Features=k8s-id-123'"
+	testPartitionLowPrio     = "'" + testDefaultNodeResources + " Features=k8s-id-123'"
+	// testFeatureWithPart is expected from appendSlurmdArgs on a bare slurmd
+	// container without resource requests, hence no CPUs/RealMemory.
 	testFeatureWithPart     = "'Features=k8s-id-123'"
-	testExpectedGpuL4Args   = "'Features=k8s-id-123 Gres=gpu:l4:1'"
-	testExpectedGpuL4_2Args = "'Features=k8s-id-123 Gres=gpu:l4:2'"
+	testExpectedGpuL4Args   = "'CPUs=4 RealMemory=8192 Features=k8s-id-123 Gres=gpu:l4:1'"
+	testExpectedGpuL4_2Args = "'" + testDefaultNodeResources + " Features=k8s-id-123 " + testGresGpuL4 + "'"
 	testSidecarName         = "my-sidecar"
 	testSidecarImage        = "sidecar:latest"
 	testUserVolumeName      = "user-vol"
@@ -227,6 +232,21 @@ func (b *testJobBuilder) withNodes(nodes int32) *testJobBuilder {
 			Number: ptr.To(nodes),
 		}
 	}
+	return b
+}
+
+// withMaxNodes sets max_nodes, which slurmctld reports as the upper bound of
+// the submitted -N (0 when the job did not bound its node count).
+func (b *testJobBuilder) withMaxNodes(nodes int32) *testJobBuilder {
+	b.job.MaxNodes = &slurmapi.V0044Uint32NoValStruct{
+		Set:    ptr.To(true),
+		Number: ptr.To(nodes),
+	}
+	return b
+}
+
+func (b *testJobBuilder) withInfiniteMaxNodes() *testJobBuilder {
+	b.job.MaxNodes = &slurmapi.V0044Uint32NoValStruct{Set: ptr.To(true), Infinite: ptr.To(true)}
 	return b
 }
 

@@ -166,6 +166,7 @@ func (t *JobSetTranslator) Translate(
 	if ptr.Deref(job.NodeCount.Infinite, false) {
 		return nil, errors.New("infinite NodeCount is not supported")
 	}
+	replicas = clampReplicasToMaxNodes(job, replicas)
 
 	// 3. Resource Calculation
 	resources, gresInfo, err := resolvePodResources(job, replicas, wmSpec)
@@ -610,6 +611,31 @@ type gresRequest struct {
 	count        int64
 }
 
+// clampReplicasToMaxNodes caps the replica count at the job's maximum node
+// count.
+//
+// For a pending job slurmctld does not report the submitted -N as node_count
+// but an estimate of how many nodes the job needs (_pack_default_job_details
+// in slurmctld/job_mgr.c). Without --ntasks-per-node that estimate divides the
+// task count by how many tasks fit on the largest node of the partition, and a
+// workload mixing partition usually has no nodes at all until k8s-bridge
+// creates them, so e.g. `-N 2 --ntasks=4 --cpus-per-task=2` is reported as
+// needing 4 nodes. Translating that estimate verbatim yields twice the pods,
+// each with half the CPUs the job needs per node, and the job never becomes
+// runnable. max_nodes, in contrast, is always the submitted bound (0 when the
+// job did not bound its node count) and a job can never need more nodes than
+// it, so it is a safe cap.
+func clampReplicasToMaxNodes(job *slurmclienttypes.V0044JobInfo, replicas int32) int32 {
+	if job.MaxNodes == nil || !ptr.Deref(job.MaxNodes.Set, false) || ptr.Deref(job.MaxNodes.Infinite, false) {
+		return replicas
+	}
+	maxNodes := ptr.Deref(job.MaxNodes.Number, 0)
+	if maxNodes <= 0 || replicas <= maxNodes {
+		return replicas
+	}
+	return maxNodes
+}
+
 func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int64 {
 	if replicas <= 0 {
 		return 0
@@ -957,6 +983,32 @@ var dynamicNodeFeatureRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 const UniqueFeaturePrefix = "k8s-id-"
 
+// slurmdNodeResources derives the CPUs and RealMemory (MiB) a dynamic node must
+// register with from the slurmd container's resource requests.
+//
+// A worker pod shares the kernel of the Kubernetes node it lands on, so left to
+// itself slurmd detects and registers that node's hardware (e.g. 8 CPUs on an
+// e2-standard-8) rather than the CPUs and memory the pod actually requested.
+// slurmctld then lays tasks out against resources the pod does not have: for a
+// `-N 2 --ntasks=4 --cpus-per-task=2` job on two 4-CPU pods it packs 3 tasks on
+// the first node and 1 on the second instead of 2 and 2.
+//
+// A zero value means the resource is not requested and must be left for slurmd
+// to detect.
+func slurmdNodeResources(requests corev1.ResourceList) (cpus int64, memMB int64) {
+	if qty, ok := requests[corev1.ResourceCPU]; ok {
+		// Slurm counts whole CPUs; a fractional request is rounded up so the
+		// node can still run at least one task.
+		cpus = qty.Value()
+	}
+	if qty, ok := requests[corev1.ResourceMemory]; ok {
+		// Slurm's RealMemory is in MiB. Round down so the node never promises
+		// more memory than the pod requested.
+		memMB = qty.Value() / (1024 * 1024)
+	}
+	return cpus, memMB
+}
+
 func appendSlurmdArgs(podSpec *corev1.PodSpec, jobIDStr string, confServer string, gresList []resolvedGRES, dynamicNodeFeature string) error {
 	for i := range podSpec.Containers {
 		c := &podSpec.Containers[i]
@@ -1030,6 +1082,16 @@ func appendSlurmdArgs(podSpec *corev1.PodSpec, jobIDStr string, confServer strin
 			c.Env = append(filteredEnvs, deterministicNodeEnvs...)
 
 			var confParts []string
+			// Register the node with the pod's requested resources rather than
+			// the host hardware slurmd would otherwise detect, see
+			// slurmdNodeResources.
+			cpus, memMB := slurmdNodeResources(c.Resources.Requests)
+			if cpus > 0 {
+				confParts = append(confParts, fmt.Sprintf("CPUs=%d", cpus))
+			}
+			if memMB > 0 {
+				confParts = append(confParts, fmt.Sprintf("RealMemory=%d", memMB))
+			}
 			var features []string
 			if jobIDStr != "" {
 				features = append(features, fmt.Sprintf("%s%s", UniqueFeaturePrefix, jobIDStr))

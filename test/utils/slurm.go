@@ -63,6 +63,8 @@ var (
 	derivedECRegex  = regexp.MustCompile(`\bDerivedEC=(\S+)`)
 	nodeListRegex   = regexp.MustCompile(`\bNodeList=(\S+)`)
 	allocNodesRegex = regexp.MustCompile(`\bAllocNodes=(\S+)`)
+	batchHostRegex  = regexp.MustCompile(`\bBatchHost=(\S+)`)
+	stdOutRegex     = regexp.MustCompile(`\bStdOut=(\S+)`)
 	// userIDRegex splits Slurm's "name(uid)" rendering, e.g. UserId=foo(2000),
 	// into the account name and its numeric UID.
 	userIDRegex         = regexp.MustCompile(`\bUserId=([^(\s]+)\((\d+)\)`)
@@ -70,6 +72,10 @@ var (
 	availFeaturesRegex  = regexp.MustCompile(`\bAvailableFeatures=(\S+)`)
 	activeFeaturesRegex = regexp.MustCompile(`\bActiveFeatures=(\S+)`)
 	nodeReasonRegex     = regexp.MustCompile(`\bReason=(.*?)(?:\s+\[|$)`)
+	// CPUTot and RealMemory are what slurmctld believes the node has, i.e. what
+	// slurmd registered: the hardware it detected unless overridden by -Z --conf.
+	cpuTotRegex     = regexp.MustCompile(`\bCPUTot=(\d+)`)
+	realMemoryRegex = regexp.MustCompile(`\bRealMemory=(\d+)`)
 )
 
 // SetupSlinkySlurm deploys the Slinky Slurm operator, JobSubmit and CliFilter Lua configmaps, and Slurm cluster.
@@ -490,6 +496,7 @@ type BatchJobBuilder struct {
 	partition      string
 	wrap           string
 	nodes          int
+	ntasks         int
 	cpusPerTask    int
 	mem            int
 	gres           string
@@ -529,6 +536,14 @@ func (b *BatchJobBuilder) WithNodes(nodes int) *BatchJobBuilder {
 	return b
 }
 
+// WithNtasks sets the total task count (-n/--ntasks). How slurmctld spreads
+// the tasks over the allocated nodes is left to it unless --ntasks-per-node is
+// passed via WithArgs.
+func (b *BatchJobBuilder) WithNtasks(ntasks int) *BatchJobBuilder {
+	b.ntasks = ntasks
+	return b
+}
+
 func (b *BatchJobBuilder) WithCpusPerTask(cpus int) *BatchJobBuilder {
 	b.cpusPerTask = cpus
 	return b
@@ -564,6 +579,9 @@ func (b *BatchJobBuilder) BuildArgs() []string {
 	}
 	if b.nodes > 0 {
 		args = append(args, fmt.Sprintf("--nodes=%d", b.nodes))
+	}
+	if b.ntasks > 0 {
+		args = append(args, fmt.Sprintf("--ntasks=%d", b.ntasks))
 	}
 	if b.cpusPerTask > 0 {
 		args = append(args, fmt.Sprintf("--cpus-per-task=%d", b.cpusPerTask))
@@ -603,6 +621,12 @@ type SlurmJobState struct {
 	DerivedEC  string
 	NodeList   string
 	AllocNodes string
+	// BatchHost is the node running the batch script and therefore the only
+	// place its StdOut file exists, there being no shared filesystem in the
+	// E2E cluster. k8s-bridge names the worker pod after the node, so this is
+	// also the pod to exec into to read that file.
+	BatchHost string
+	StdOut    string
 	// UserName and UserID are the job's owner, parsed from Slurm's
 	// "UserId=name(uid)" rendering.
 	UserName string
@@ -662,6 +686,8 @@ func QuerySlurmJobState(slurmNamespace, jobID string) (SlurmJobState, error) {
 		DerivedEC:  extractRegexField(derivedECRegex, output),
 		NodeList:   extractRegexField(nodeListRegex, output),
 		AllocNodes: extractRegexField(allocNodesRegex, output),
+		BatchHost:  extractRegexField(batchHostRegex, output),
+		StdOut:     extractRegexField(stdOutRegex, output),
 		UserName:   userName,
 		UserID:     userID,
 	}, nil
@@ -791,6 +817,13 @@ type SlurmNodeState struct {
 	AvailableFeatures string
 	ActiveFeatures    string
 	Reason            string
+	// CPUTot and RealMemory (MB) are the resources slurmd registered the node
+	// with and hence what slurmctld schedules against. A dynamic worker pod
+	// shares its host's kernel, so unless k8s-bridge overrides them via
+	// `slurmd -Z --conf`, these are the host's totals rather than the pod's
+	// resource requests.
+	CPUTot     string
+	RealMemory string
 }
 
 // QuerySlurmNodeState reads a node's state with scontrol.
@@ -806,6 +839,8 @@ func QuerySlurmNodeState(slurmNamespace, nodeName string) (SlurmNodeState, error
 		AvailableFeatures: extractRegexField(availFeaturesRegex, output),
 		ActiveFeatures:    extractRegexField(activeFeaturesRegex, output),
 		Reason:            extractRegexComment(nodeReasonRegex, output),
+		CPUTot:            extractRegexField(cpuTotRegex, output),
+		RealMemory:        extractRegexField(realMemoryRegex, output),
 	}, nil
 }
 
@@ -821,6 +856,26 @@ func WaitForSlurmNodeState(slurmNamespace, nodeName, expectedState string, timeo
 			fmt.Sprintf("Node %s state mismatch: got %s, expected %s", nodeName, ns.State, expectedState))
 		g.Expect(ns.Reason).NotTo(gomega.ContainSubstring("Node unexpected socket down"),
 			fmt.Sprintf("Node %s is down unexpectedly: %s", nodeName, ns.Reason))
+	}, timeout, time.Second).Should(gomega.Succeed())
+}
+
+// VerifySlurmNodeResources polls until the dynamic node is registered with
+// exactly expectedCPUs CPUs and expectedMemMB MB of RealMemory. Those are the
+// values slurmctld lays tasks out against, so a node that reports its host's
+// hardware instead of the pod's requests makes slurmctld over-pack it.
+func VerifySlurmNodeResources(slurmNamespace, nodeName, expectedCPUs, expectedMemMB string, timeout time.Duration) {
+	ginkgo.GinkgoHelper()
+	ginkgo.By(fmt.Sprintf("verifying Slurm node %s registered CPUTot=%s RealMemory=%s",
+		nodeName, expectedCPUs, expectedMemMB))
+
+	gomega.Eventually(func(g gomega.Gomega) {
+		ns, err := QuerySlurmNodeState(slurmNamespace, nodeName)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Slurm node state for "+nodeName)
+		g.Expect(ns.CPUTot).To(gomega.Equal(expectedCPUs),
+			fmt.Sprintf("Node %s registered CPUTot=%s, expected the pod's CPU request %s", nodeName, ns.CPUTot, expectedCPUs))
+		g.Expect(ns.RealMemory).To(gomega.Equal(expectedMemMB),
+			fmt.Sprintf("Node %s registered RealMemory=%s, expected the pod's memory request %s MB",
+				nodeName, ns.RealMemory, expectedMemMB))
 	}, timeout, time.Second).Should(gomega.Succeed())
 }
 
@@ -853,13 +908,80 @@ func WaitForSlurmJobCompletion(slurmNamespace, jobID string, timeout time.Durati
 	}, timeout, time.Second).Should(gomega.Succeed())
 }
 
-// GetSlurmJobOutput reads the batch output file from the working directory on the login node.
-func GetSlurmJobOutput(slurmNamespace, jobID string) (string, error) {
-	cmd := fmt.Sprintf(
-		"cat /tmp/slurm-%s.out 2>/dev/null || cat /var/spool/slurm/slurm-%s.out 2>/dev/null || true",
-		jobID, jobID,
-	)
-	return RunOnLoginNodeAsUser(slurmNamespace, DefaultSlurmTestUser, cmd)
+// ReadBatchJobOutput returns the current contents of a batch job's StdOut file.
+//
+// There is no shared filesystem in the E2E cluster, so the file exists only on
+// the batch host. The read only works while the batch host's pod is alive,
+// i.e. while the job is still running.
+func ReadBatchJobOutput(slurmNamespace, jobID string) (string, error) {
+	js, err := QuerySlurmJobState(slurmNamespace, jobID)
+	if err != nil {
+		return "", err
+	}
+	if js.BatchHost == "" || js.StdOut == "" {
+		return "", fmt.Errorf("job %s has no batch host yet (JobState=%s)", jobID, js.JobState)
+	}
+	podName, err := workerPodForSlurmNode(slurmNamespace, js.BatchHost)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command("kubectl", "exec", "-n", slurmNamespace, podName, "-c", "slurmd",
+		"--", "cat", js.StdOut)
+	return Run(cmd)
+}
+
+// workerPodForSlurmNode returns the name of the worker pod backing the dynamic
+// Slurm node nodeName. k8s-bridge names the node after the pod's hostname,
+// <JobSet>-<replicated Job>-<Job index>-<pod index>, which the Job controller
+// assigns to indexed Job pods; the pod name itself has a random suffix.
+func workerPodForSlurmNode(slurmNamespace, nodeName string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "pods", "-n", slurmNamespace, "-o",
+		fmt.Sprintf("jsonpath={.items[?(@.spec.hostname=='%s')].metadata.name}", nodeName))
+	output, err := Run(cmd)
+	if err != nil {
+		return "", err
+	}
+	pods := strings.Fields(output)
+	if len(pods) != 1 {
+		return "", fmt.Errorf("expected 1 pod with hostname %s, found %d: %v", nodeName, len(pods), pods)
+	}
+	return pods[0], nil
+}
+
+// WaitForBatchJobOutput polls the batch job's output until it contains marker,
+// typically something the batch script echoes once the part under test has
+// finished, and returns the complete output at that point.
+func WaitForBatchJobOutput(slurmNamespace, jobID, marker string, timeout time.Duration) string {
+	ginkgo.GinkgoHelper()
+	ginkgo.By(fmt.Sprintf("waiting for the output of job %s to contain %q", jobID, marker))
+
+	var output string
+	gomega.Eventually(func(g gomega.Gomega) {
+		out, err := ReadBatchJobOutput(slurmNamespace, jobID)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to read the output of job "+jobID)
+		g.Expect(out).To(gomega.ContainSubstring(marker),
+			fmt.Sprintf("Output of job %s does not contain %q yet:\n%s", jobID, marker, out))
+		output = out
+	}, timeout, time.Second).Should(gomega.Succeed())
+	return output
+}
+
+// CountStepTasksPerNode counts how many lines of output are exactly each of the
+// given node names. With `srun hostname` every task prints the name of the node
+// it ran on (a worker pod's hostname is its node name), so the result is the
+// number of tasks slurmctld placed on each node. Other lines are ignored.
+func CountStepTasksPerNode(output string, nodeNames ...string) map[string]int {
+	counts := make(map[string]int, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		counts[nodeName] = 0
+	}
+	for _, line := range GetNonEmptyLines(output) {
+		line = strings.TrimSpace(line)
+		if _, ok := counts[line]; ok {
+			counts[line]++
+		}
+	}
+	return counts
 }
 
 // VerifySlurmdProbesSuccess verifies that the slurmd container did not restart
