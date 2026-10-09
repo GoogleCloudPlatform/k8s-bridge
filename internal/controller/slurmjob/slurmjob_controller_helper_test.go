@@ -338,6 +338,7 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 
 	reconciler := &SlurmJobReconciler{
 		Client:    fakeClient,
+		APIReader: baseClient,
 		Scheme:    scheme,
 		ClientMap: cMap,
 	}

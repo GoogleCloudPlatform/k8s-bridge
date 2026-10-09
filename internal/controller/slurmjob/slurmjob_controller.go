@@ -67,6 +67,7 @@ const (
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
 type SlurmJobReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	Recorder            record.EventRecorder
 	AdmissionEventsChan <-chan slurmtypes.SlurmJobAdmissionEvent
@@ -123,6 +124,9 @@ func (r *SlurmJobReconciler) Start(ctx context.Context) error {
 // SetupWithManager sets up the controller with the Manager.
 func (r *SlurmJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.genericEvents = make(chan event.GenericEvent, 1024)
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorderFor("slurmjob-controller") //nolint:staticcheck
 	}
@@ -395,6 +399,36 @@ func isJobSetSuspendedBySlurmHold(js *jobsetv1alpha2.JobSet) bool {
 	return js != nil && ptr.Deref(js.Spec.Suspend, false) && js.Annotations[AnnotationSuspendedBySlurmHold] == ValueTrue
 }
 
+// getExistingJobSet gets the JobSet from the cache, falling back to the API server
+// for active translated jobs so cache lag does not look like a missing JobSet.
+func (r *SlurmJobReconciler) getExistingJobSet(
+	ctx context.Context,
+	namespace string,
+	jobSetName string,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+) (*jobsetv1alpha2.JobSet, error) {
+	key := types.NamespacedName{Name: jobSetName, Namespace: namespace}
+	existingJS := &jobsetv1alpha2.JobSet{}
+	err := r.Get(ctx, key, existingJS)
+	if err == nil {
+		return existingJS, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to get JobSet: %w", err)
+	}
+	// Only active translated jobs expect a JobSet to exist.
+	if r.APIReader == nil || jobInfo == nil || hasTerminalSlurmState(jobInfo) || isUntranslatedNewJob(jobInfo) {
+		return nil, nil
+	}
+	if err := r.APIReader.Get(ctx, key, existingJS); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get JobSet from API server: %w", err)
+		}
+		return nil, nil
+	}
+	return existingJS, nil
+}
+
 func (r *SlurmJobReconciler) reconcileActiveJob(
 	ctx context.Context,
 	wm *k8sbridgev1alpha1.WorkloadMixing,
@@ -405,14 +439,10 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 ) (ReconciliationStatus, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
-	existingJS := &jobsetv1alpha2.JobSet{}
 
-	err := r.Get(ctx, types.NamespacedName{Name: jobSetName, Namespace: wm.Namespace}, existingJS)
+	existingJS, err := r.getExistingJobSet(ctx, wm.Namespace, jobSetName, jobInfo)
 	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to get JobSet: %w", err)
-		}
-		existingJS = nil
+		return ReconciliationDone, ctrl.Result{}, err
 	}
 
 	status := activeJobStatus(jobInfo, existingJS)
