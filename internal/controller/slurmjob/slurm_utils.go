@@ -83,17 +83,32 @@ func isJobSetOwnedByWM(js *jobsetv1alpha2.JobSet, wm *k8sbridgev1alpha1.Workload
 	return false
 }
 
-// isTerminalSlurmJob classifies Slurm job states into terminal vs non-terminal.
+// isTerminalSlurmJob checks whether a Slurm job is in a COMPLETED terminal state
 func isTerminalSlurmJob(jobInfo *slurmclienttypes.V0044JobInfo) (bool, string) {
+	if jobInfo == nil || jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateCOMPLETING) {
+		return false, ""
+	}
+	return classifyTerminalSlurmState(jobInfo)
+}
+
+// hasTerminalSlurmState checks whether a Slurm job is in a terminal state, regardless it it is just COMPLETING or past it
+func hasTerminalSlurmState(jobInfo *slurmclienttypes.V0044JobInfo) bool {
+	terminal, _ := classifyTerminalSlurmState(jobInfo)
+	return terminal
+}
+
+// classifyTerminalSlurmState checks whether a Slurm job is in a terminal state, regardless it it is just COMPLETING or past it, and returns its metrics reason.
+func classifyTerminalSlurmState(jobInfo *slurmclienttypes.V0044JobInfo) (bool, string) {
 	if jobInfo == nil {
 		return false, ""
 	}
 	states := jobInfo.GetStateAsSet()
-	if states.Has(slurmapi.V0044JobInfoJobStatePENDING) ||
-		states.Has(slurmapi.V0044JobInfoJobStateCONFIGURING) ||
-		states.Has(slurmapi.V0044JobInfoJobStateRUNNING) ||
-		states.Has(slurmapi.V0044JobInfoJobStateSUSPENDED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateCOMPLETING) {
+	if states.HasAny(
+		slurmapi.V0044JobInfoJobStatePENDING,
+		slurmapi.V0044JobInfoJobStateCONFIGURING,
+		slurmapi.V0044JobInfoJobStateRUNNING,
+		slurmapi.V0044JobInfoJobStateSUSPENDED,
+	) {
 		return false, ""
 	}
 	if states.Has(slurmapi.V0044JobInfoJobStateCOMPLETED) {
@@ -102,17 +117,19 @@ func isTerminalSlurmJob(jobInfo *slurmclienttypes.V0044JobInfo) (bool, string) {
 	if states.Has(slurmapi.V0044JobInfoJobStateCANCELLED) {
 		return true, metrics.ReasonJobCancelled
 	}
-	if states.Has(slurmapi.V0044JobInfoJobStateFAILED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateTIMEOUT) ||
-		states.Has(slurmapi.V0044JobInfoJobStateNODEFAIL) ||
-		states.Has(slurmapi.V0044JobInfoJobStatePREEMPTED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateBOOTFAIL) ||
-		states.Has(slurmapi.V0044JobInfoJobStateDEADLINE) ||
-		states.Has(slurmapi.V0044JobInfoJobStateOUTOFMEMORY) ||
-		states.Has(slurmapi.V0044JobInfoJobStateLAUNCHFAILED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateRECONFIGFAIL) ||
-		states.Has(slurmapi.V0044JobInfoJobStateREVOKED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateSPECIALEXIT) {
+	if states.HasAny(
+		slurmapi.V0044JobInfoJobStateFAILED,
+		slurmapi.V0044JobInfoJobStateTIMEOUT,
+		slurmapi.V0044JobInfoJobStateNODEFAIL,
+		slurmapi.V0044JobInfoJobStatePREEMPTED,
+		slurmapi.V0044JobInfoJobStateBOOTFAIL,
+		slurmapi.V0044JobInfoJobStateDEADLINE,
+		slurmapi.V0044JobInfoJobStateOUTOFMEMORY,
+		slurmapi.V0044JobInfoJobStateLAUNCHFAILED,
+		slurmapi.V0044JobInfoJobStateRECONFIGFAIL,
+		slurmapi.V0044JobInfoJobStateREVOKED,
+		slurmapi.V0044JobInfoJobStateSPECIALEXIT,
+	) {
 		return true, metrics.ReasonJobFailed
 	}
 	return false, ""

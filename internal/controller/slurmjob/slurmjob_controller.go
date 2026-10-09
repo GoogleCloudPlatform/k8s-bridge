@@ -296,6 +296,7 @@ const (
 type K8sbridgeJobStatus string
 
 const (
+	StatusNewJob              K8sbridgeJobStatus = "NewJob"
 	StatusExplicitlyHeld      K8sbridgeJobStatus = "ExplicitlyHeld"
 	StatusExplicitHoldRemoved K8sbridgeJobStatus = "ExplicitHoldRemoved"
 	StatusShouldUnhold        K8sbridgeJobStatus = "ShouldUnhold"
@@ -306,24 +307,21 @@ const (
 )
 
 func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) K8sbridgeJobStatus {
-	if existingJS == nil {
-		isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
-		isHeld := ptr.Deref(jobInfo.Hold, false)
-		if !isPending || !isHeld {
-			return StatusJobSetMissing
-		}
+	if status, isTerminal := terminalJobSetStatus(existingJS); isTerminal {
+		return status
+	}
+
+	if jobInfo == nil || hasTerminalSlurmState(jobInfo) {
 		return StatusNoAction
 	}
 
-	for _, cond := range existingJS.Status.Conditions {
-		if cond.Status == metav1.ConditionTrue {
-			if cond.Type == string(jobsetv1alpha2.JobSetCompleted) {
-				return StatusJobSetCompleted
-			}
-			if cond.Type == string(jobsetv1alpha2.JobSetFailed) {
-				return StatusJobSetFailed
-			}
+	if existingJS == nil {
+		isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
+		isHeld := ptr.Deref(jobInfo.Hold, false)
+		if isPending && isHeld {
+			return StatusNewJob
 		}
+		return StatusJobSetMissing
 	}
 
 	if isJobExplicitlyHeld(jobInfo) {
@@ -333,7 +331,7 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 		return StatusNoAction
 	}
 
-	if ptr.Deref(existingJS.Spec.Suspend, false) && existingJS.Annotations != nil && existingJS.Annotations[AnnotationSuspendedBySlurmHold] == ValueTrue {
+	if isJobSetSuspendedBySlurmHold(existingJS) {
 		return StatusExplicitHoldRemoved
 	}
 
@@ -342,6 +340,27 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 	}
 
 	return StatusNoAction
+}
+
+func terminalJobSetStatus(js *jobsetv1alpha2.JobSet) (K8sbridgeJobStatus, bool) {
+	if js == nil {
+		return "", false
+	}
+	for _, cond := range js.Status.Conditions {
+		if cond.Status == metav1.ConditionTrue {
+			switch jobsetv1alpha2.JobSetConditionType(cond.Type) {
+			case jobsetv1alpha2.JobSetCompleted:
+				return StatusJobSetCompleted, true
+			case jobsetv1alpha2.JobSetFailed:
+				return StatusJobSetFailed, true
+			}
+		}
+	}
+	return "", false
+}
+
+func isJobSetSuspendedBySlurmHold(js *jobsetv1alpha2.JobSet) bool {
+	return js != nil && ptr.Deref(js.Spec.Suspend, false) && js.Annotations[AnnotationSuspendedBySlurmHold] == ValueTrue
 }
 
 func (r *SlurmJobReconciler) reconcileActiveJob(
@@ -373,7 +392,7 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, jobID, wm.Namespace, partition, ReasonJobSetFailed)
 
 	case StatusJobSetMissing:
-		logger.Info("JobSet missing for a job that is not in a (PENDING + Hold) state", "jobID", jobID)
+		logger.Info("JobSet missing for active Slurm job, cancelling job", "jobID", jobID)
 		if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, ReasonJobSetMissing); cancelErr != nil {
 			return ReconciliationDone, ctrl.Result{}, cancelErr
 		}
@@ -416,14 +435,12 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 		}
 		return ReconciliationDone, ctrl.Result{}, nil
 
-	case StatusNoAction:
-		if existingJS != nil {
-			return ReconciliationDone, ctrl.Result{}, nil
-		}
+	case StatusNewJob:
 		return ReconciliationContinue, ctrl.Result{}, nil
-	}
 
-	return ReconciliationContinue, ctrl.Result{}, nil
+	default:
+		return ReconciliationDone, ctrl.Result{}, nil
+	}
 }
 
 func (r *SlurmJobReconciler) handleTerminalJobSet(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, jobID, namespace, partition, reason string) (ReconciliationStatus, ctrl.Result, error) {
@@ -625,14 +642,13 @@ func (r *SlurmJobReconciler) createK8sResource(ctx context.Context, obj client.O
 }
 
 func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, comment string) error {
+	if jobInfo == nil {
+		return nil
+	}
 	logger := log.FromContext(ctx)
-	jobID := *jobInfo.JobId
+	jobID := ptr.Deref(jobInfo.JobId, 0)
 
-	// If job is already in a terminal state, assume success
-	jobState := jobInfo.GetStateAsSet()
-	if jobState.Has(slurmapi.V0044JobInfoJobStateCANCELLED) ||
-		jobState.Has(slurmapi.V0044JobInfoJobStateCOMPLETED) ||
-		jobState.Has(slurmapi.V0044JobInfoJobStateFAILED) {
+	if hasTerminalSlurmState(jobInfo) {
 		logger.Info("Slurm job is already in a terminal state, assuming cancellation is successful", "jobID", jobID)
 		return nil
 	}
@@ -746,15 +762,7 @@ func CountActiveJobSets(ctx context.Context, c client.Client, wm *k8sbridgev1alp
 			continue
 		}
 
-		isTerminal := false
-		for _, cond := range js.Status.Conditions {
-			if cond.Status == metav1.ConditionTrue &&
-				(cond.Type == string(jobsetv1alpha2.JobSetCompleted) || cond.Type == string(jobsetv1alpha2.JobSetFailed)) {
-				isTerminal = true
-				break
-			}
-		}
-		if !isTerminal {
+		if _, isTerminal := terminalJobSetStatus(js); !isTerminal {
 			count++
 		}
 	}
