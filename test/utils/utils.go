@@ -198,13 +198,9 @@ func PreloadThirdPartyImages() {
 
 	var loadable []string
 	for _, img := range images {
-		if _, err := Run(exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", img)); err != nil {
-			if _, err := Run(exec.Command("docker", "pull", "-q", img)); err != nil {
-				WarnError(err)
-				continue
-			}
+		if _, err := Run(exec.Command("docker", "image", "inspect", "--format", "{{.Id}}", img)); err == nil {
+			loadable = append(loadable, img)
 		}
-		loadable = append(loadable, img)
 	}
 	if len(loadable) == 0 {
 		return
