@@ -684,7 +684,11 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 		Comment: ptr.To(comment),
 	}
 	if err := slurmClient.Update(ctx, jobInfo, commentReq); err != nil {
-		logger.Error(err, "Failed to set failure comment on Slurm job, proceeding with job cancellation", "jobID", jobID)
+		if isSlurmPartConfigUnavailable(err) {
+			logger.V(1).Info("Slurm returned partition configuration unavailable when setting failure comment, proceeding with job cancellation", "jobID", jobID, "error", err)
+		} else {
+			logger.Error(err, "Failed to set failure comment on Slurm job, proceeding with job cancellation", "jobID", jobID)
+		}
 	}
 
 	// 2. Cancel the job in Slurm
@@ -725,6 +729,10 @@ func (r *SlurmJobReconciler) releaseHold(ctx context.Context, slurmClient slurmc
 		Constraints: ptr.To(newFeatures),
 	}
 	if err := slurmClient.Update(ctx, jobInfo, updateReq); err != nil {
+		if isSlurmPartConfigUnavailable(err) {
+			logger.V(1).Info("Slurm returned partition configuration unavailable after unholding job", "jobID", jobID, "error", err)
+			return nil
+		}
 		return fmt.Errorf("failed to release hold on Slurm job %d: %w", jobID, err)
 	}
 	return nil

@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	slurmErrMsgInvalidJobID    = "Invalid job id specified"
-	slurmErrMsgInvalidNodeName = "Invalid node name specified"
-	slurmErrMsgNodeNotFound    = "Node not found"
+	slurmErrMsgInvalidJobID          = "Invalid job id specified"
+	slurmErrMsgInvalidNodeName       = "Invalid node name specified"
+	slurmErrMsgNodeNotFound          = "Node not found"
+	slurmErrMsgPartConfigUnavailable = "Requested partition configuration not available now"
 )
 
 // isSlurmNotFound checks if a Slurm REST API error indicates the resource was not found.
@@ -44,26 +45,7 @@ const (
 // Exact string matching is used to prevent false positives from other error messages containing "Not Found"
 // (e.g., account, QOS, or partition configuration errors).
 func isSlurmNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	var agg utilerrors.Aggregate
-	if errors.As(err, &agg) {
-		return slices.ContainsFunc(agg.Errors(), isSlurmNotFound)
-	}
-	errMsg := err.Error()
-	if isSlurmNotFoundString(errMsg) {
-		return true
-	}
-	// Handle string-formatted aggregates (e.g. "[Not Found, Invalid job id specified]").
-	if strings.HasPrefix(errMsg, "[") && strings.HasSuffix(errMsg, "]") {
-		for part := range strings.SplitSeq(errMsg[1:len(errMsg)-1], ", ") {
-			if isSlurmNotFoundString(strings.TrimSpace(part)) {
-				return true
-			}
-		}
-	}
-	return false
+	return slices.ContainsFunc(slurmErrorMessages(err), isSlurmNotFoundString)
 }
 
 func isSlurmNotFoundString(msg string) bool {
@@ -71,6 +53,47 @@ func isSlurmNotFoundString(msg string) bool {
 		msg == slurmErrMsgInvalidJobID ||
 		msg == slurmErrMsgInvalidNodeName ||
 		msg == slurmErrMsgNodeNotFound
+}
+
+// isSlurmPartConfigUnavailable reports whether err is only Slurm's HTTP 422
+// "Requested partition configuration not available now" warning. Slurm returns
+// this warning after updating a job when its partition has no nodes.
+func isSlurmPartConfigUnavailable(err error) bool {
+	msgs := slurmErrorMessages(err)
+	if !slices.Contains(msgs, slurmErrMsgPartConfigUnavailable) {
+		return false
+	}
+	for _, msg := range msgs {
+		if msg != slurmErrMsgPartConfigUnavailable && msg != http.StatusText(http.StatusUnprocessableEntity) {
+			return false
+		}
+	}
+	return true
+}
+
+// slurmErrorMessages extracts individual error messages from a Slurm client error,
+// unwrapping utilerrors.Aggregate and "[a, b]" formatted strings.
+func slurmErrorMessages(err error) []string {
+	if err == nil {
+		return nil
+	}
+	var agg utilerrors.Aggregate
+	if errors.As(err, &agg) {
+		var msgs []string
+		for _, subErr := range agg.Errors() {
+			msgs = append(msgs, slurmErrorMessages(subErr)...)
+		}
+		return msgs
+	}
+	errMsg := err.Error()
+	if strings.HasPrefix(errMsg, "[") && strings.HasSuffix(errMsg, "]") {
+		parts := strings.Split(errMsg[1:len(errMsg)-1], ", ")
+		for i, part := range parts {
+			parts[i] = strings.TrimSpace(part)
+		}
+		return parts
+	}
+	return []string{errMsg}
 }
 
 // isJobSetOwnedByWM returns true if the JobSet has an OwnerReference pointing to the WorkloadMixing.
