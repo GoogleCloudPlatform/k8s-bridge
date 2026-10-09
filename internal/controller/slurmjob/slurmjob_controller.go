@@ -449,9 +449,9 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 
 	switch status {
 	case StatusJobSetCompleted:
-		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, jobID, wm.Namespace, partition, ReasonJobSetCompleted)
+		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, existingJS, jobID, partition, ReasonJobSetCompleted)
 	case StatusJobSetFailed:
-		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, jobID, wm.Namespace, partition, ReasonJobSetFailed)
+		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, existingJS, jobID, partition, ReasonJobSetFailed)
 
 	case StatusJobSetMissing:
 		logger.Info("JobSet missing for active Slurm job, cancelling job", "jobID", jobID)
@@ -505,13 +505,25 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 	}
 }
 
-func (r *SlurmJobReconciler) handleTerminalJobSet(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, jobID, namespace, partition, reason string) (ReconciliationStatus, ctrl.Result, error) {
+func (r *SlurmJobReconciler) handleTerminalJobSet(
+	ctx context.Context,
+	wm *k8sbridgev1alpha1.WorkloadMixing,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	existingJS *jobsetv1alpha2.JobSet,
+	jobID string,
+	partition string,
+	reason string,
+) (ReconciliationStatus, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info(reason, "jobID", jobID)
 	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, reason); cancelErr != nil {
 		return ReconciliationDone, ctrl.Result{}, cancelErr
 	}
-	if errDelete := r.deleteJobSet(ctx, namespace, jobID, reason); errDelete != nil {
+	if err := cleanupDynamicNodes(ctx, slurmClient, existingJS); err != nil {
+		return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", existingJS.Name, err)
+	}
+	if errDelete := r.deleteJobSet(ctx, existingJS, reason); errDelete != nil {
 		return ReconciliationDone, ctrl.Result{}, errDelete
 	}
 
@@ -528,20 +540,14 @@ func (r *SlurmJobReconciler) handleTerminalJobSet(ctx context.Context, wm *k8sbr
 	return ReconciliationDone, ctrl.Result{}, nil
 }
 
-func (r *SlurmJobReconciler) deleteJobSet(ctx context.Context, namespace, jobID, reason string) error {
-	logger := log.FromContext(ctx)
-	jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
-
-	jobSet := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobSetName,
-			Namespace: namespace,
-		},
+func (r *SlurmJobReconciler) deleteJobSet(ctx context.Context, js *jobsetv1alpha2.JobSet, reason string) error {
+	if js == nil || !js.DeletionTimestamp.IsZero() {
+		return nil
 	}
-
-	logger.Info("Cleaning up terminal JobSet", "jobSetName", jobSetName, "reason", reason)
-	if err := r.Delete(ctx, jobSet); err != nil && !apierrors.IsNotFound(err) {
-		logger.Error(err, "Failed to clean up JobSet", "jobSetName", jobSetName)
+	logger := log.FromContext(ctx)
+	logger.Info("Cleaning up terminal JobSet", "jobSetName", js.Name, "reason", reason)
+	if err := r.Delete(ctx, js); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "Failed to clean up JobSet", "jobSetName", js.Name)
 		return err
 	}
 
