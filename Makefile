@@ -100,6 +100,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # - JOBSET_INSTALL_SKIP=true
 KIND_CLUSTER ?= k8s-bridge-test-e2e
 KIND_NODE_IMAGE ?= kindest/node:v1.32.2
+KIND_CONFIG ?= test/e2e/testdata/kind-config.yaml
 
 .PHONY: setup-test-e2e
 setup-test-e2e: kind ## Set up a Kind cluster for e2e tests if it does not exist
@@ -108,7 +109,7 @@ setup-test-e2e: kind ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)' with image $(KIND_NODE_IMAGE)..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) --image=$(KIND_NODE_IMAGE) ;; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) --image=$(KIND_NODE_IMAGE) --config=$(KIND_CONFIG) ;; \
 	esac
 
 .PHONY: test-e2e
