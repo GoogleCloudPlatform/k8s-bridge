@@ -185,6 +185,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) --build-arg GIT_COMMIT=$(GIT_COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE) -t ${IMG} .
+	@if [ "$${CI:-}" = "true" ]; then $(CONTAINER_TOOL) builder prune -af; fi
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
