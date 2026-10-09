@@ -323,6 +323,11 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 		return StatusJobSetMissing
 	}
 
+	// Treat a deleting JobSet as missing so its Slurm job is cancelled.
+	if !existingJS.DeletionTimestamp.IsZero() {
+		return StatusJobSetMissing
+	}
+
 	if isJobExplicitlyHeld(jobInfo) {
 		if !ptr.Deref(existingJS.Spec.Suspend, false) {
 			return StatusExplicitlyHeld
