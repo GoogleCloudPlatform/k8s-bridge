@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +60,8 @@ const (
 	ReasonJobSetCompleted = "JobSet completed"
 	ReasonJobSetFailed    = "JobSet failed"
 	ReasonJobSetMissing   = "JobSet missing"
+
+	UnheldCommentPrefix = "Unheld by k8s-bridge:"
 )
 
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
@@ -316,9 +317,7 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 	}
 
 	if existingJS == nil {
-		isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
-		isHeld := ptr.Deref(jobInfo.Hold, false)
-		if isPending && isHeld {
+		if isUntranslatedNewJob(jobInfo) {
 			return StatusNewJob
 		}
 		return StatusJobSetMissing
@@ -340,6 +339,31 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 	}
 
 	return StatusNoAction
+}
+
+// isUntranslatedNewJob check if a Slurm job seems active (PENDING + Held) but also that it is recent (untranslated)
+func isUntranslatedNewJob(jobInfo *slurmclienttypes.V0044JobInfo) bool {
+	if jobInfo == nil {
+		return false
+	}
+	isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
+	isHeld := ptr.Deref(jobInfo.Hold, false)
+	return isPending && isHeld && !isJobTranslated(jobInfo)
+}
+
+// isJobTranslated checks if a Slurm job was translated and unheld by k8s-bridge
+func isJobTranslated(jobInfo *slurmclienttypes.V0044JobInfo) bool {
+	if jobInfo == nil {
+		return false
+	}
+	if jobID := ptr.Deref(jobInfo.JobId, 0); jobID > 0 {
+		uniqueFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
+		if hasFeatureConstraint(ptr.Deref(jobInfo.Features, ""), uniqueFeature) {
+			return true
+		}
+	}
+	comment := ptr.Deref(jobInfo.Comment, "")
+	return strings.Contains(comment, UnheldCommentPrefix) && !strings.Contains(comment, AutoHoldMarker)
 }
 
 func terminalJobSetStatus(js *jobsetv1alpha2.JobSet) (K8sbridgeJobStatus, bool) {
@@ -496,11 +520,8 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
-	isHeld := ptr.Deref(jobInfo.Hold, false)
-
-	if !isPending || !isHeld {
-		logger.Info("Job is not PENDING or not Held, skipping reconciliation", "jobID", jobID, "isPending", isPending, "isHeld", isHeld)
+	if !isUntranslatedNewJob(jobInfo) {
+		logger.Info("Job is not an untranslated held pending job, skipping reconciliation", "jobID", jobID)
 		return ctrl.Result{}, nil
 	}
 
@@ -673,31 +694,24 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 func (r *SlurmJobReconciler) releaseHold(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, obj client.Object) error {
 	logger := log.FromContext(ctx)
 	jobID := ptr.Deref(jobInfo.JobId, 0)
-	jobIDStr := strconv.Itoa(int(jobID))
 
 	logger.Info("Assigning extra job-specific constraint and unholding Slurm job", "jobID", jobID)
-	msg := fmt.Sprintf("Unheld by k8s-bridge: Kubernetes resource %s created successfully", obj.GetName())
+	msg := fmt.Sprintf("%s Kubernetes resource %s created successfully", UnheldCommentPrefix, obj.GetName())
 	existingComment := stripAutoHoldMarker(strings.TrimSpace(ptr.Deref(jobInfo.Comment, "")))
-	var newComment string
-	if existingComment != "" {
-		if strings.Contains(existingComment, msg) {
-			newComment = existingComment
-		} else {
-			newComment = fmt.Sprintf("%s, %s", existingComment, msg)
-		}
-	} else {
-		newComment = msg
+	newComment := msg
+	if strings.Contains(existingComment, msg) {
+		newComment = existingComment
+	} else if existingComment != "" {
+		newComment = fmt.Sprintf("%s, %s", existingComment, msg)
 	}
 
-	uniqueFeature := fmt.Sprintf("%s%s", UniqueFeaturePrefix, jobIDStr)
+	uniqueFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
 	existingFeatures := strings.TrimSpace(ptr.Deref(jobInfo.Features, ""))
 	newFeatures := uniqueFeature
-	if existingFeatures != "" {
-		if hasFeatureConstraint(existingFeatures, uniqueFeature) {
-			newFeatures = existingFeatures
-		} else {
-			newFeatures = fmt.Sprintf("(%s)&%s", existingFeatures, uniqueFeature)
-		}
+	if hasFeatureConstraint(existingFeatures, uniqueFeature) {
+		newFeatures = existingFeatures
+	} else if existingFeatures != "" {
+		newFeatures = fmt.Sprintf("(%s)&%s", existingFeatures, uniqueFeature)
 	}
 
 	updateReq := slurmapi.V0044JobDescMsg{
