@@ -21,6 +21,7 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -39,6 +40,62 @@ const (
 	// watching for a re-created JobSet after the Slurm job has been cancelled.
 	jobSetRecreationWindow = 15 * time.Second
 )
+
+func setLocalQueueStopPolicy(queueName, stopPolicy, wantActiveStatus string) {
+	GinkgoHelper()
+
+	patch := fmt.Sprintf(`{"spec":{"stopPolicy":%q}}`, stopPolicy)
+	cmd := exec.Command(
+		"kubectl", "patch", "localqueue", queueName,
+		"-n", slurmNamespace, "--type=merge", "-p", patch,
+	)
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to set stopPolicy=%s on LocalQueue %s", stopPolicy, queueName)
+
+	Eventually(func(g Gomega) {
+		getCmd := exec.Command(
+			"kubectl", "get", "localqueue", queueName,
+			"-n", slurmNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='Active')].status}",
+		)
+		out, err := utils.Run(getCmd)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(strings.TrimSpace(out)).To(Equal(wantActiveStatus))
+	}, 30*time.Second, 500*time.Millisecond).Should(Succeed())
+}
+
+func holdLocalQueueWithCleanup(queueName string) {
+	GinkgoHelper()
+
+	DeferCleanup(func() {
+		delCmd := exec.Command(
+			"kubectl", "delete", "jobsets", "--all",
+			"-n", slurmNamespace, "--ignore-not-found=true", "--wait=true",
+		)
+		_, _ = utils.Run(delCmd)
+		setLocalQueueStopPolicy(queueName, "None", "True")
+	})
+
+	setLocalQueueStopPolicy(queueName, "Hold", "False")
+}
+
+func waitForJobSetUID(jobSetName string) string {
+	GinkgoHelper()
+	var uid string
+	Eventually(func(g Gomega) {
+		var err error
+		uid, err = utils.JobSetUID(jobSetName, slurmNamespace)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(uid).NotTo(BeEmpty())
+	}, jobsetTimeout, time.Second).Should(Succeed())
+	return uid
+}
+
+func deleteJobSetForSlurmJob(jobSetName string) {
+	GinkgoHelper()
+	cmd := exec.Command("kubectl", "delete", "jobset", jobSetName, "-n", slurmNamespace, "--wait=true")
+	_, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to delete JobSet "+jobSetName)
+}
 
 // verifySlurmJobCancelledWithoutJobSetRecreation waits for the Slurm job to be
 // CANCELLED with the "JobSet missing" comment while asserting, on every poll,
@@ -273,11 +330,7 @@ func setupJobSetTerminalStateTest() (string, string) {
 	jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
 
 	By("waiting for JobSet to be created")
-	Eventually(func(g Gomega) {
-		cmd := exec.Command("kubectl", "get", "jobset", jobSetName, "-n", slurmNamespace)
-		_, err := utils.Run(cmd)
-		g.Expect(err).NotTo(HaveOccurred(), "Failed to find JobSet")
-	}, jobsetTimeout, time.Second).Should(Succeed())
+	_ = waitForJobSetUID(jobSetName)
 
 	return jobID, jobSetName
 }

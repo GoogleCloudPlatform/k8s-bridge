@@ -219,6 +219,32 @@ func TestIsTerminalSlurmJob(t *testing.T) {
 			wantTerminal: false,
 			wantReason:   "",
 		},
+		{
+			name: "Completed and Completing (non-terminal)",
+			job: &slurmclienttypes.V0044JobInfo{
+				V0044JobInfo: slurmapi.V0044JobInfo{
+					JobState: ptr.To([]slurmapi.V0044JobInfoJobState{
+						slurmapi.V0044JobInfoJobStateCOMPLETED,
+						slurmapi.V0044JobInfoJobStateCOMPLETING,
+					}),
+				},
+			},
+			wantTerminal: false,
+			wantReason:   "",
+		},
+		{
+			name: "Cancelled and Completing (non-terminal)",
+			job: &slurmclienttypes.V0044JobInfo{
+				V0044JobInfo: slurmapi.V0044JobInfo{
+					JobState: ptr.To([]slurmapi.V0044JobInfoJobState{
+						slurmapi.V0044JobInfoJobStateCANCELLED,
+						slurmapi.V0044JobInfoJobStateCOMPLETING,
+					}),
+				},
+			},
+			wantTerminal: false,
+			wantReason:   "",
+		},
 	}
 
 	for _, tt := range tests {
