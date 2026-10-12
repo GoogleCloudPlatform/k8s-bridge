@@ -60,5 +60,7 @@ jobs:
         if: steps.cache-third-party-images.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/docker-cache
-          IMAGES=$( (echo "curlimages/curl:8.16.0"; grep -hEo 'image:[[:space:]]*["'\'']?[^"'\''[:space:]@]+["'\'']?' test/e2e/testdata/third_party/*.yaml | sed -E 's/^image:[[:space:]]*["'\'']?([^"'\''[:space:]]+)["'\'']?$/\1/') | sort -u )
+          # LINT.IfChange(curl_image)
+          IMAGES=$( (echo "curlimages/curl:8.16.0"; grep -hEo 'image:[[:space:]]*["'\'']?[^"'\''[:space:]]+["'\'']?' test/e2e/testdata/third_party/*.yaml | sed -E 's/^image:[[:space:]]*["'\'']?([^"'\''[:space:]]+)["'\'']?$/\1/' | grep -v '@') | sort -u )
+          # LINT.ThenChange(test/utils/utils.go:curl_image)
           docker save -o /tmp/docker-cache/third-party.tar ${IMAGES}

@@ -42,7 +42,10 @@ const (
 // LINT.IfChange(curl_image)
 const CurlImage = "curlimages/curl:8.16.0"
 
-// LINT.ThenChange(test/e2e/testdata/workloadmixing_template.yaml:curl_image)
+// LINT.ThenChange(
+//   test/e2e/testdata/workloadmixing_template.yaml:curl_image,
+//   .github/workflows/test-e2e.yml:curl_image
+// )
 
 var (
 	certmanagerManifest = fmt.Sprintf("%s/cert-manager-%s.yaml", thirdPartyManifestDir, certmanagerVersion)
