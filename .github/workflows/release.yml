@@ -25,8 +25,12 @@ jobs:
   release:
     permissions:
       contents: write
+      packages: write
     name: Create Release Artifacts
     runs-on: ubuntu-latest
+    env:
+      IMAGE_REPO: ghcr.io/googlecloudplatform/k8s-bridge
+      CHART_REPO: oci://ghcr.io/googlecloudplatform/charts
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -39,6 +43,8 @@ jobs:
           go-version-file: go.mod
 
       - name: Verify tag matches VERSION file
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           EXPECTED_TAG="v$(tr -d '[:space:]' < ./VERSION)"
           if [ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]; then
@@ -48,15 +54,47 @@ jobs:
           make version-sync
           git diff --exit-code
 
+      - name: Log in to GitHub Container Registry
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
+
+      - name: Build and push multi-arch container image
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="$(tr -d '[:space:]' < ./VERSION)"
+          GIT_COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          TAGS="--tag ${IMAGE_REPO}:${VERSION} --tag ${IMAGE_REPO}:${GITHUB_REF_NAME}"
+          if ! echo "${GITHUB_REF_NAME}" | grep -Eq '-'; then
+            TAGS="${TAGS} --tag ${IMAGE_REPO}:latest"
+          fi
+          docker buildx create --name k8s-bridge-release --driver docker-container --use
+          docker buildx build \
+            --push \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=false \
+            --build-arg VERSION="${VERSION}" \
+            --build-arg GIT_COMMIT="${GIT_COMMIT}" \
+            --build-arg BUILD_DATE="${BUILD_DATE}" \
+            ${TAGS} \
+            .
+
       - name: Build consolidated installer manifest
         run: make build-installer
 
-      - name: Package Helm chart
-        run: helm package ./helm
+      - name: Package and push Helm chart
+        run: |
+          helm package ./helm
+          helm push k8s-bridge-*.tgz "${CHART_REPO}"
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           PRERELEASE_FLAG=""
           if echo "${GITHUB_REF_NAME}" | grep -Eq '-'; then

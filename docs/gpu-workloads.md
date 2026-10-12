@@ -26,7 +26,7 @@ This guide extends the [Quickstart guide](quickstart.md) to configure a GPU-enab
 
 1. Complete the base setup from the [Quickstart guide](quickstart.md):
    - [Step 1: Install prerequisites](quickstart.md#1-install-prerequisites) (`cert-manager`, Slinky Slurm operator, `JobSet`, and `Kueue`)
-   - [Step 4: Build and install k8s-bridge](quickstart.md#4-build-and-install-k8s-bridge)
+   - [Step 4: Install k8s-bridge](quickstart.md#4-install-k8s-bridge)
 2. Ensure your Kubernetes cluster has 2 GPU worker nodes with the NVIDIA device plugin installed, labeled with `nvidia.com/gpu.product=NVIDIA-L4`, and each reporting `1` allocatable `nvidia.com/gpu`:
 
 ```bash

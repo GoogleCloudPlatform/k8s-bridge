@@ -12,10 +12,18 @@ A Helm chart for installing the `k8s-bridge` custom controller. This controller 
 
 ## Installing the Chart
 
-To install the chart with the release name `my-release`:
+To install the published OCI chart with the release name `k8s-bridge`:
 
 ```console
-helm install my-release . --namespace k8s-bridge-system --create-namespace
+helm install k8s-bridge oci://ghcr.io/googlecloudplatform/charts/k8s-bridge \
+  --version 0.1.0 \
+  --namespace k8s-bridge-system --create-namespace
+```
+
+Or to install from the local chart directory:
+
+```console
+helm install k8s-bridge . --namespace k8s-bridge-system --create-namespace
 ```
 
 ## Uninstalling the Chart

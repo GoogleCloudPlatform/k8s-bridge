@@ -18,16 +18,18 @@ This project is distributed and installed via Helm.
 
 **1. Install the k8s-bridge Controller:**
 
-You can install the controller into the cluster using the provided Makefile target:
+Install the published OCI Helm chart from GitHub Container Registry:
+
+```sh
+helm upgrade --install k8s-bridge oci://ghcr.io/googlecloudplatform/charts/k8s-bridge \
+  --version 0.1.0 \
+  --namespace k8s-bridge-system --create-namespace
+```
+
+Alternatively, you can install from the local `./helm` chart in the repository:
 
 ```sh
 make helm-install
-```
-
-Alternatively, you can install the local Helm chart directly:
-
-```sh
-helm upgrade --install k8s-bridge ./helm --namespace k8s-bridge-system --create-namespace
 ```
 
 **2. Configure Workload Mixing:**

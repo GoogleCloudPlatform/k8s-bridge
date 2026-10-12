@@ -26,7 +26,7 @@ This guide extends the [Quickstart guide](quickstart.md) to configure priority-b
 
 Complete the base setup from the [Quickstart guide](quickstart.md):
 - [Step 1: Install prerequisites](quickstart.md#1-install-prerequisites) (`cert-manager`, Slinky Slurm operator, `JobSet`, and `Kueue`)
-- [Step 4: Build and install k8s-bridge](quickstart.md#4-build-and-install-k8s-bridge)
+- [Step 4: Install k8s-bridge](quickstart.md#4-install-k8s-bridge)
 
 ---
 
