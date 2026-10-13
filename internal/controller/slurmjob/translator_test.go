@@ -320,7 +320,7 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 		verifyJobSet(t, obj, err, "123", 2,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 " + testGresGpuL4 + "'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testExpectedGpuL4_2Args}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("2"),
 			}),
@@ -340,7 +340,7 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 		verifyJobSet(t, obj, err, "123", 1,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 Gres=gpu:1'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'" + testDefaultNodeResources + " Features=k8s-id-123 Gres=gpu:1'"}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("1"),
 			}),
@@ -356,8 +356,9 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 			build()
 
 		obj, err := translator.Translate(job, wmSpec, controller)
+		// 4 tasks over 2 nodes => 2 tasks per node => 2 CPUs and 2*2048 MiB per pod.
 		verifyJobSet(t, obj, err, "123", 2,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 Gres=gpu:a100:2'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'CPUs=2 RealMemory=4096 Features=k8s-id-123 Gres=gpu:a100:2'"}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("2"),
 			}),
@@ -375,7 +376,7 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 		verifyJobSet(t, obj, err, "123", 2,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 " + testGresGpuL4 + "'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testExpectedGpuL4_2Args}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("2"),
 			}),
@@ -548,6 +549,154 @@ func TestAppendSlurmdArgs(t *testing.T) {
 			t.Errorf("Unexpected args (-want +got):\n%s", diff)
 		}
 	})
+
+	t.Run("Success_RegistersPodRequestedCPUsAndMemory", func(t *testing.T) {
+		// slurmd must register the pod's requests, not the host hardware it
+		// would detect on its own, so slurmctld lays tasks out against what the
+		// pod actually has.
+		podSpec := &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: ContainerSlurmd,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("4"),
+							corev1.ResourceMemory: resource.MustParse("8192Mi"),
+						},
+					},
+				},
+			},
+		}
+		gresList := []resolvedGRES{
+			{name: GRESGPU, count: 2, resourceType: "l4"},
+		}
+		err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, gresList, "dynamic_kpartition")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		expected := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf,
+			"'CPUs=4 RealMemory=8192 Features=k8s-id-123,dynamic_kpartition " + testGresGpuL4 + "'"}
+		if diff := cmp.Diff(expected, podSpec.Containers[0].Args); diff != "" {
+			t.Errorf("Unexpected args (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("Success_RoundsFractionalRequestsToWholeSlurmUnits", func(t *testing.T) {
+		// Slurm counts whole CPUs and MiB: CPUs round up so the node can run a
+		// task at all, memory rounds down so the node never promises more than
+		// the pod requested.
+		podSpec := &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: ContainerSlurmd,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("1500m"),
+							corev1.ResourceMemory: resource.MustParse("1G"),
+						},
+					},
+				},
+			},
+		}
+		err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, "")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		expected := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'CPUs=2 RealMemory=953 Features=k8s-id-123'"}
+		if diff := cmp.Diff(expected, podSpec.Containers[0].Args); diff != "" {
+			t.Errorf("Unexpected args (-want +got):\n%s", diff)
+		}
+	})
+}
+
+func TestTranslateSlurmJobToJobSet_NodeResourcesInSlurmdConf(t *testing.T) {
+	wmSpec := getTestWMSpec()
+	translator := NewJobSetTranslator()
+	controller := getTestController()
+
+	t.Run("Multi-node job registers each pod with its own CPU and memory share", func(t *testing.T) {
+		// sbatch -N 2 --ntasks=4 --cpus-per-task=2 (no --ntasks-per-node):
+		// 2 tasks per pod => 4 CPUs and 4*2048 MiB per pod. Without CPUs= and
+		// RealMemory= in --conf slurmd would register the host's CPUs and
+		// slurmctld would pack 3 of the 4 tasks onto the first node.
+		job := newTestJob().
+			withNodes(2).
+			withTasks(4).
+			withCpusPerTask(2).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 2,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'CPUs=4 RealMemory=8192 Features=k8s-id-123'"}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			}),
+		)
+	})
+
+	t.Run("Explicit memory request is registered as RealMemory", func(t *testing.T) {
+		// --cpus-per-task=2 --mem=4096 on one node.
+		job := newTestJob().
+			withCpusPerTask(2).
+			withMemoryPerNode(4096).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 1,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'CPUs=2 RealMemory=4096 Features=k8s-id-123'"}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("4096Mi"),
+			}),
+		)
+	})
+}
+
+func TestTranslateSlurmJobToJobSet_NodeCountEstimateClampedToMaxNodes(t *testing.T) {
+	// sbatch -N 2 --ntasks=4 --cpus-per-task=2 into a partition that has no
+	// nodes yet: slurmctld reports the pending job's node_count as its estimate
+	// of 4 and max_nodes as the submitted 2. The job must still get 2 pods with
+	// 2 tasks' worth of CPUs and memory each, not 4 pods with 1 task each that
+	// it could never run on.
+	job := newTestJob().
+		withNodes(4).
+		withMaxNodes(2).
+		withTasks(4).
+		withCpusPerTask(2).
+		build()
+
+	obj, err := NewJobSetTranslator().Translate(job, getTestWMSpec(), getTestController())
+	verifyJobSet(t, obj, err, "123", 2,
+		withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'CPUs=4 RealMemory=8192 Features=k8s-id-123'"}),
+		withRequests(corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("4"),
+			corev1.ResourceMemory: resource.MustParse("8192Mi"),
+		}),
+	)
+}
+
+func TestClampReplicasToMaxNodes(t *testing.T) {
+	tests := []struct {
+		name     string
+		job      *slurmclienttypes.V0044JobInfo
+		replicas int32
+		want     int32
+	}{
+		{name: "max nodes unset", job: newTestJob().build(), replicas: 4, want: 4},
+		{name: "max nodes zero means unbounded", job: newTestJob().withMaxNodes(0).build(), replicas: 4, want: 4},
+		{name: "infinite max nodes", job: newTestJob().withInfiniteMaxNodes().build(), replicas: 4, want: 4},
+		{name: "replicas below max nodes", job: newTestJob().withMaxNodes(4).build(), replicas: 2, want: 2},
+		{name: "replicas equal to max nodes", job: newTestJob().withMaxNodes(2).build(), replicas: 2, want: 2},
+		{name: "estimate above max nodes", job: newTestJob().withMaxNodes(2).build(), replicas: 4, want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clampReplicasToMaxNodes(tt.job, tt.replicas); got != tt.want {
+				t.Errorf("clampReplicasToMaxNodes() = %d, want %d", got, tt.want)
+			}
+		})
+	}
 }
 
 //nolint:goconst // Test deliberately duplicates constant literals for contract verification.
@@ -1257,7 +1406,7 @@ func TestTranslateSlurmJobToJobSet_Features(t *testing.T) {
 		job := newTestJob().build()
 
 		obj, err := translator.Translate(job, customWMSpec, controller)
-		expectedArgs := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123,dynamic_kpartition'"}
+		expectedArgs := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'" + testDefaultNodeResources + " Features=k8s-id-123,dynamic_kpartition'"}
 		verifyJobSet(t, obj, err, "123", 1, withArgs(expectedArgs))
 	})
 }

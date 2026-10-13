@@ -231,6 +231,50 @@ var _ = Describe("Manager", func() {
 			utils.VerifySlurmNodeNotFound(slurmNamespace, nodeName, 2*time.Minute)
 		})
 
+		It("should register the dynamic node with the CPUs the single-node job requested "+
+			"rather than the host's hardware", func() {
+			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
+
+			// -N 1 --ntasks=2 -c 2 => the pod requests 2 * 2 CPUs and, with no
+			// --mem given, 4 * 2048 MiB of memory. While the partition has no
+			// nodes slurmctld estimates the pending job needs 2 nodes (as if no
+			// node fit both tasks), so this also covers capping that estimate at
+			// the submitted -N 1: 2 pods with 2 CPUs each could never run the job.
+			const (
+				expectedCPUs  = "4"
+				expectedMemMB = "8192"
+			)
+
+			By("applying the WorkloadMixing template CR")
+			utils.ApplyManifestWithCleanup(configPath)
+
+			By("submitting a single-node batch job requesting " + expectedCPUs + " CPUs")
+			jobID := utils.NewBatchJobBuilder(slurmNamespace).
+				WithPartition(defaultSlurmPartition).
+				WithNodes(1).
+				WithNtasks(2).
+				WithCpusPerTask(2).
+				WithWrap("sleep 300").
+				Submit()
+			jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+			nodeName := fmt.Sprintf("%s-slurmd-0-0", jobSetName)
+
+			verifySlurmdResourceConf(jobSetName, expectedCPUs, expectedMemMB)
+
+			By("verifying worker pod is scheduled and running")
+			utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetName, 1, 3*time.Minute)
+
+			By("verifying the job is running on the dynamic node in Slurmctld")
+			utils.NewSlurmJobVerifier(slurmNamespace, jobID).
+				WithState("RUNNING").
+				WithNodeList(nodeName).
+				WithTimeout(3 * time.Minute).
+				Verify()
+
+			By("verifying slurmd registered the node with the pod's CPUs and memory, not the host's")
+			utils.VerifySlurmNodeResources(slurmNamespace, nodeName, expectedCPUs, expectedMemMB, 2*time.Minute)
+		})
+
 		It("should execute a multi-node batch job across two dynamic worker pods "+
 			"without liveness probe failure", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
@@ -276,6 +320,22 @@ var _ = Describe("Manager", func() {
 			utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
 			utils.VerifySlurmNodeNotFound(slurmNamespace, nodeName0, 2*time.Minute)
 			utils.VerifySlurmNodeNotFound(slurmNamespace, nodeName1, 2*time.Minute)
+		})
+
+		It("should lay out the tasks of a multi-node job against the CPUs the pods requested "+
+			"rather than the host's hardware", func() {
+			// Without --ntasks-per-node slurmctld spreads the tasks over what
+			// the nodes registered: with 2 CPUs each it has to place 2 tasks per
+			// node, whereas nodes registered with the host's CPUs let it pack
+			// the first node and leave a single task for the second.
+			verifyTwoNodeTaskLayout()
+		})
+
+		It("should lay out the tasks of a multi-node job as --ntasks-per-node requests", func() {
+			// --ntasks-per-node=2 pins the layout itself; what is verified here
+			// is that k8s-bridge sizes and registers each pod for exactly the
+			// tasks slurmctld will place on it.
+			verifyTwoNodeTaskLayout("--ntasks-per-node=2")
 		})
 	})
 })

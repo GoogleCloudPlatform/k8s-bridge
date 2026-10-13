@@ -116,7 +116,8 @@ func verifyJobSetCreatedWithCustomTemplate(jobSetName, jobID, jobNameLabel strin
 		g.Expect(slurmdContainer.Resources.Requests.Cpu().String()).To(Equal("2"))
 		g.Expect(slurmdContainer.Resources.Requests.Memory().Cmp(resource.MustParse("4096Mi"))).To(Equal(0))
 
-		// Verify Slurmd container args contain --conf-server, -N $(SLURM_NODE_NAME), and --conf with unique Features
+		// Verify Slurmd container args contain --conf-server, -N $(SLURM_NODE_NAME), and --conf with the
+		// pod's resources (-c 2 --mem=4096 => CPUs=2 RealMemory=4096) and unique Features
 		g.Expect(slurmdContainer.Args).To(HaveLen(7))
 		g.Expect(slurmdContainer.Args[0]).To(Equal("--conf-server"))
 		g.Expect(slurmdContainer.Args[1]).To(Equal("slurm-controller.slurm:6817"))
@@ -124,7 +125,7 @@ func verifyJobSetCreatedWithCustomTemplate(jobSetName, jobID, jobNameLabel strin
 		g.Expect(slurmdContainer.Args[3]).To(Equal("$(SLURM_NODE_NAME)"))
 		g.Expect(slurmdContainer.Args[4]).To(Equal("-Z"))
 		g.Expect(slurmdContainer.Args[5]).To(Equal("--conf"))
-		g.Expect(slurmdContainer.Args[6]).To(MatchRegexp(`^'Features=k8s-id-[0-9a-f-]+,dynamic_kpartition'$`))
+		g.Expect(slurmdContainer.Args[6]).To(MatchRegexp(`^'CPUs=2 RealMemory=4096 Features=k8s-id-[0-9a-f-]+,dynamic_kpartition'$`))
 
 		// Verify Slurmd container has Downward API env vars for deterministic node naming
 		var slurmNodeNameEnv, jobSetNameEnv, replicatedJobNameEnv, jobIndexEnv, podIndexEnv *corev1.EnvVar
@@ -280,4 +281,111 @@ func setupJobSetTerminalStateTest() (string, string) {
 	}, jobsetTimeout, time.Second).Should(Succeed())
 
 	return jobID, jobSetName
+}
+
+// verifySlurmdResourceConf asserts that the translated JobSet requests
+// expectedCPUs CPUs and expectedMemMB MiB on the slurmd container and forwards
+// exactly those values to slurmd through `-Z --conf CPUs=… RealMemory=…`, so the
+// dynamic node registers with the pod's resources rather than with the hardware
+// of the Kubernetes node it shares a kernel with.
+func verifySlurmdResourceConf(jobSetName, expectedCPUs, expectedMemMB string) {
+	GinkgoHelper()
+
+	By(fmt.Sprintf("verifying the JobSet slurmd container requests %s CPUs / %s MiB and passes them to slurmd -Z --conf",
+		expectedCPUs, expectedMemMB))
+	Eventually(func(g Gomega) {
+		js, err := utils.JobSet(jobSetName, slurmNamespace)
+		g.Expect(err).NotTo(HaveOccurred(), "Failed to get JobSet")
+		g.Expect(js.Spec.ReplicatedJobs).To(HaveLen(1))
+
+		var slurmdContainer *corev1.Container
+		containers := js.Spec.ReplicatedJobs[0].Template.Spec.Template.Spec.Containers
+		for i := range containers {
+			if containers[i].Name == "slurmd" {
+				slurmdContainer = &containers[i]
+				break
+			}
+		}
+		g.Expect(slurmdContainer).NotTo(BeNil(), "Slurmd container not found")
+		g.Expect(slurmdContainer.Resources.Requests.Cpu().String()).To(Equal(expectedCPUs))
+		g.Expect(slurmdContainer.Resources.Requests.Memory().Cmp(resource.MustParse(expectedMemMB+"Mi"))).To(Equal(0))
+
+		conf := slurmdConfArg(slurmdContainer.Args)
+		g.Expect(conf).NotTo(BeEmpty(), fmt.Sprintf("slurmd container has no --conf argument: %v", slurmdContainer.Args))
+		g.Expect(conf).To(MatchRegexp(`\bCPUs=%s\b`, expectedCPUs),
+			"slurmd --conf does not register the pod's CPU request")
+		g.Expect(conf).To(MatchRegexp(`\bRealMemory=%s\b`, expectedMemMB),
+			"slurmd --conf does not register the pod's memory request")
+	}, jobsetTimeout, time.Second).Should(Succeed())
+}
+
+// slurmdConfArg returns the value passed to slurmd's --conf flag, or "" if absent.
+func slurmdConfArg(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--conf" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// verifyTwoNodeTaskLayout submits `sbatch -N 2 --ntasks=4 --cpus-per-task=1`
+// plus extraSbatchArgs and verifies that each of the two worker pods requests,
+// and registers its Slurm node with, the CPUs and memory of 2 tasks, and that
+// slurmctld runs 2 of the 4 tasks on each node.
+//
+// 1 CPU per task keeps the footprint at 2 pods x 2 CPUs, which fits on the
+// Kind node of CI.
+func verifyTwoNodeTaskLayout(extraSbatchArgs ...string) {
+	GinkgoHelper()
+
+	const (
+		configPath = "test/e2e/testdata/workloadmixing_template.yaml"
+		// 2 tasks x 1 CPU per pod and, with no --mem given, 2 x 2048 MiB.
+		expectedCPUs  = "2"
+		expectedMemMB = "4096"
+		doneMarker    = "E2E_TOPOLOGY_DONE"
+	)
+
+	By("applying the WorkloadMixing template CR")
+	utils.ApplyManifestWithCleanup(configPath)
+
+	By(fmt.Sprintf("submitting a 2-node, 4-task batch job with extra sbatch args %q", extraSbatchArgs))
+	jobID := utils.NewBatchJobBuilder(slurmNamespace).
+		WithPartition(defaultSlurmPartition).
+		WithNodes(2).
+		WithNtasks(4).
+		WithCpusPerTask(1).
+		// Sleep after the marker so the batch host pod, the only place the
+		// output file exists, stays alive while the output is read.
+		WithWrap(fmt.Sprintf("srun hostname; echo %s; sleep 300", doneMarker)).
+		WithArgs(extraSbatchArgs...).
+		Submit()
+	jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+	nodeName0 := fmt.Sprintf("%s-slurmd-0-0", jobSetName)
+	nodeName1 := fmt.Sprintf("%s-slurmd-1-0", jobSetName)
+
+	verifySlurmdResourceConf(jobSetName, expectedCPUs, expectedMemMB)
+
+	By("verifying both worker pods are scheduled and running")
+	utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetName, 2, 3*time.Minute)
+
+	By("verifying both dynamic nodes are allocated to the running job in Slurmctld")
+	utils.NewSlurmJobVerifier(slurmNamespace, jobID).
+		WithState("RUNNING").
+		WithNodeList(fmt.Sprintf("%s,%s", nodeName0, nodeName1)).
+		WithTimeout(3 * time.Minute).
+		Verify()
+
+	By("verifying both nodes registered with the pod's CPUs and memory, not the host's")
+	for _, nodeName := range []string{nodeName0, nodeName1} {
+		utils.VerifySlurmNodeResources(slurmNamespace, nodeName, expectedCPUs, expectedMemMB, 2*time.Minute)
+	}
+
+	By("verifying slurmctld ran 2 of the 4 tasks on each node")
+	output := utils.WaitForBatchJobOutput(slurmNamespace, jobID, doneMarker, 2*time.Minute)
+	Expect(utils.CountStepTasksPerNode(output, nodeName0, nodeName1)).To(Equal(map[string]int{
+		nodeName0: 2,
+		nodeName1: 2,
+	}), "unexpected task layout, job output:\n"+output)
 }
