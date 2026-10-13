@@ -35,6 +35,13 @@ const (
 	DefaultSlurmctldContainer = "slurmctld"
 	DefaultSlurmPartition     = "workloadmixing-partition"
 
+	// StaticSlurmNodeName, StaticSlurmPartition and StaticSlurmNodeCPUs describe the node of the
+	// static NodeSet (slurm-worker-static) in test/e2e/testdata/slurm_static_nodeset.yaml.
+	StaticSlurmNodeName        = "static-0"
+	StaticSlurmPartition       = "static"
+	StaticSlurmNodeCPUs        = 1
+	staticSlurmNodeSetManifest = "test/e2e/testdata/slurm_static_nodeset.yaml"
+
 	// LINT.IfChange(slurm_version_pair)
 	// DefaultSlinkyOperatorVersion and DefaultSlurmImageTag define the pinned,
 	// immutable Slinky operator + Slurm 26.05 daemon version pair used across E2E tests.
@@ -44,6 +51,7 @@ const (
 	//   test/e2e/testdata/slurm_operator.yaml,
 	//   test/e2e/testdata/slurm_cluster.yaml:slurm_version_pair,
 	//   test/e2e/testdata/slurm_login.yaml:slurm_version_pair,
+	//   test/e2e/testdata/slurm_static_nodeset.yaml:slurm_version_pair,
 	//   test/e2e/testdata/workloadmixing_template.yaml:slurm_version_pair,
 	//   test/e2e/testdata/workloadmixing_gpu.yaml:slurm_version_pair
 	// )
@@ -214,6 +222,39 @@ func SetupSlinkySlurm() {
 	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "slurm-restapi deployment failed to become available")
 
 	setupSlurmLoginNode()
+}
+
+// SetupStaticSlurmNode deploys the static NodeSet from slurm_static_nodeset.yaml and waits until its
+// node is IDLE in its own partition with its pinned CPU count. Call it after SetupSlinkySlurm and before
+// any job is submitted: slurmctld caches the CPU count of the largest node in the cluster the first time
+// it estimates node_count for a pending job in a partition without nodes.
+func SetupStaticSlurmNode() {
+	ginkgo.GinkgoHelper()
+
+	ginkgo.By("deploying the static Slurm NodeSet")
+	_, err := Run(exec.Command("kubectl", "apply", "--server-side", "--force-conflicts", "-f", staticSlurmNodeSetManifest))
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to deploy the static Slurm NodeSet")
+
+	WaitForSlurmNodeState(DefaultSlurmNamespace, StaticSlurmNodeName, "IDLE", 5*time.Minute)
+
+	ginkgo.By(fmt.Sprintf("verifying Slurm node %s has %d CPU(s) in partition %s",
+		StaticSlurmNodeName, StaticSlurmNodeCPUs, StaticSlurmPartition))
+	output, err := RunOnLoginNodeAsUser(DefaultSlurmNamespace, DefaultSlurmTestUser,
+		"scontrol show node "+StaticSlurmNodeName)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Slurm node "+StaticSlurmNodeName)
+	gomega.Expect(output).To(gomega.MatchRegexp(fmt.Sprintf(`\bCPUTot=%d\b`, StaticSlurmNodeCPUs)))
+	gomega.Expect(output).To(gomega.MatchRegexp(`\bPartitions=` + StaticSlurmPartition + `\b`))
+}
+
+// TeardownStaticSlurmNode deletes the static NodeSet deployed by SetupStaticSlurmNode.
+func TeardownStaticSlurmNode() {
+	ginkgo.GinkgoHelper()
+
+	ginkgo.By("deleting the static Slurm NodeSet")
+	cmd := exec.Command("kubectl", "delete", "-f", staticSlurmNodeSetManifest, "--ignore-not-found", "--wait=true")
+	if _, err := Run(cmd); err != nil {
+		WarnError(err)
+	}
 }
 
 // TeardownSlinkySlurm deletes Slurm resources and namespaces.
@@ -428,7 +469,19 @@ func SubmitBatchJob(slurmNamespace, username string, args ...string) string {
 	return jobID
 }
 
-// ReleaseSlurmJob releases an explicit hold on a Slurm job as DefaultSlurmTestUser.
+// Comments that show a held job on a workload-mixing partition was handed over to k8s-bridge:
+// job_submit.lua adds k8sBridgeAutoHoldMarker when it holds the job for the bridge, and the bridge
+// replaces it with k8sBridgeUnheldComment when it creates the JobSet and releases the hold.
+const (
+	k8sBridgeAutoHoldMarker = "k8s-bridge-auto-hold"
+	k8sBridgeUnheldComment  = "Unheld by k8s-bridge"
+)
+
+// ReleaseSlurmJob releases an explicit hold on a Slurm job as DefaultSlurmTestUser and waits until the
+// job is handed over to k8s-bridge. job_submit.lua turns the user's release into a k8s-bridge auto-hold,
+// and on its next poll the bridge creates the JobSet and releases the job, replacing the auto-hold marker
+// in the comment. The marker can therefore be gone before the first check, so the bridge's unhold comment
+// is accepted as well.
 // TODO: Restore checking for exit code == 0 on `scontrol release` once SchedMD fixes
 // the exit code 1 bug in update_job / job_limits_check when the dynamic partition
 // has 0 registered nodes (currently ESLURM_TOO_MANY_REQUESTED_CPUS is an unimplemented
@@ -438,10 +491,14 @@ func SubmitBatchJob(slurmNamespace, username string, args ...string) string {
 func ReleaseSlurmJob(slurmNamespace, jobID string) {
 	ginkgo.GinkgoHelper()
 	_, _ = RunOnLoginNodeAsUser(slurmNamespace, DefaultSlurmTestUser, "scontrol release "+jobID)
-	NewSlurmJobVerifier(slurmNamespace, jobID).
-		WithComment("k8s-bridge-auto-hold").
-		WithTimeout(30 * time.Second).
-		Verify()
+	gomega.Eventually(func(g gomega.Gomega) {
+		js, err := QuerySlurmJobState(slurmNamespace, jobID)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get Slurm job state")
+		g.Expect(js.Comment).To(gomega.Or(
+			gomega.ContainSubstring(k8sBridgeAutoHoldMarker),
+			gomega.ContainSubstring(k8sBridgeUnheldComment),
+		), "Slurm job %s was not handed over to k8s-bridge after release", jobID)
+	}, 30*time.Second, time.Second).Should(gomega.Succeed())
 }
 
 // SubmitBatchJobExpectError submits an sbatch command as the given user and

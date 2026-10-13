@@ -1,0 +1,28 @@
+# Static Slurm node in its own partition, like the NodeSet partitions that the Slinky Helm chart
+# creates next to the k8s-bridge partitions (e.g. partition "cpu" with node "cpu-0").
+# extraConf pins the node to 1 CPU so that it is smaller than the Kind nodes running the
+# k8s-bridge slurmd pods. It registers before any job is submitted, so slurmctld derives the
+# node_count estimate of pending jobs in the (empty) k8s-bridge partitions from this node:
+# slurmctld caches the CPU count of the largest node in the cluster the first time it needs it.
+apiVersion: slinky.slurm.net/v1beta1
+kind: NodeSet
+metadata:
+  name: slurm-worker-static
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+  replicas: 1
+  extraConf: Boards=1 SocketsPerBoard=1 CoresPerSocket=1 ThreadsPerCore=1 CPUs=1
+  partition:
+    enabled: true
+    config: MaxTime=UNLIMITED State=UP
+  template:
+    spec:
+      hostname: static-
+  # LINT.IfChange(slurm_version_pair)
+  slurmd:
+    image: ghcr.io/slinkyproject/slurmd:26.05-ubuntu24.04
+  logfile:
+    image: ghcr.io/slinkyproject/slurmctld:26.05-ubuntu24.04
+  # LINT.ThenChange(test/utils/slurm.go:slurm_version_pair)

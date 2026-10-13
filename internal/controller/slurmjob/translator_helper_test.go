@@ -238,6 +238,19 @@ func (b *testJobBuilder) withTasks(tasks int32) *testJobBuilder {
 	return b
 }
 
+func (b *testJobBuilder) withTasksPerNode(tasksPerNode int32) *testJobBuilder {
+	b.job.TasksPerNode = &slurmapi.V0044Uint16NoValStruct{
+		Set:    ptr.To(true),
+		Number: ptr.To(tasksPerNode),
+	}
+	return b
+}
+
+func (b *testJobBuilder) withTresReqStr(tresReqStr string) *testJobBuilder {
+	b.job.TresReqStr = ptr.To(tresReqStr)
+	return b
+}
+
 func (b *testJobBuilder) withCpusPerTask(cpus int32) *testJobBuilder {
 	b.job.CpusPerTask = &slurmapi.V0044Uint16NoValStruct{
 		Set:    ptr.To(true),
