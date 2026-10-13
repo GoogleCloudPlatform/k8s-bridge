@@ -28,10 +28,10 @@ helm install k8s-bridge . --namespace k8s-bridge-system --create-namespace
 
 ## Uninstalling the Chart
 
-To uninstall/delete the `my-release` deployment:
+To uninstall/delete the `k8s-bridge` deployment:
 
 ```console
-helm uninstall my-release --namespace k8s-bridge-system
+helm uninstall k8s-bridge --namespace k8s-bridge-system
 ```
 
 ## Configuration

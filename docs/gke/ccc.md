@@ -32,7 +32,7 @@ Custom Compute Classes define hardware provisioning priorities in GKE (e.g., pre
 ## Prerequisites
 
 - [`gcloud` CLI](https://cloud.google.com/sdk/docs/install)
-- The tools and versions listed in the [Quickstart Prerequisites & Versions](../quickstart.md#prerequisites--versions) (`kubectl`, `helm` 3.8+, `docker`, and a container registry reachable by the cluster)
+- The tools and versions listed in the [Quickstart Prerequisites & Versions](../quickstart.md#prerequisites--versions) (`kubectl` and `helm` 3.8+)
 
 ---
 

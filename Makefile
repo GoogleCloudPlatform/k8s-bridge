@@ -55,7 +55,7 @@ version: ## Show current version.
 	@echo $(VERSION)
 
 .PHONY: version-sync
-version-sync: ## Synchronize VERSION with Helm chart and Kustomize metadata.
+version-sync: ## Synchronize VERSION with Helm chart, Kustomize metadata, and documentation.
 	@if [ -z "$$(echo $(VERSION) | grep -Eo "^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$$")" ]; then \
 		echo "Error: VERSION is not valid semver: $(VERSION)" >&2; \
 		exit 1; \
@@ -66,6 +66,12 @@ version-sync: ## Synchronize VERSION with Helm chart and Kustomize metadata.
 	sed -E 's/^([[:space:]]*newTag:[[:space:]]+).+$$/\1$(VERSION)/' \
 		config/manager/kustomization.yaml > config/manager/kustomization.yaml.tmp && \
 		mv config/manager/kustomization.yaml.tmp config/manager/kustomization.yaml
+	for f in README.md helm/README.md docs/quickstart.md docs/existing-infra.md; do \
+		sed -E \
+			-e '/helm .*oci:\/\/ghcr\.io\/googlecloudplatform\/charts\/k8s-bridge/{n;s/(--version[[:space:]]+)[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?/\1$(VERSION)/;}' \
+			-e 's/^(\| k8s-bridge \| `oci:\/\/ghcr\.io\/googlecloudplatform\/charts\/k8s-bridge` \| )[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?( \|)$$/\1$(VERSION)\3/' \
+			"$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; \
+	done
 
 ##@ Development
 

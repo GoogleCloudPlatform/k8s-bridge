@@ -16,6 +16,7 @@ changelog:
   exclude:
     labels:
       - skip-changelog
+      - dependencies
   categories:
     - title: Breaking Changes
       labels:
