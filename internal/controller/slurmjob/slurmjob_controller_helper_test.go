@@ -122,6 +122,7 @@ func newTestJobSet(name string) *testJobSetBuilder {
 func newReconTestJobSet() *testJobSetBuilder {
 	return newTestJobSet("slurm-job-" + reconJobIDStr).
 		withLabels(map[string]string{
+			LabelKueueQueue:     "some-queue",
 			LabelSlurmJobID:     reconJobIDStr,
 			LabelSlurmPartition: reconPartitionName,
 		}).
@@ -320,6 +321,7 @@ func (e *reconcileTestEnv) reconcile(ctx ...context.Context) (ctrl.Result, error
 	return e.reconciler.Reconcile(c, e.req)
 }
 
+//nolint:unparam
 func (e *reconcileTestEnv) verifyJobSetCreated(wantQueue string, wantJobID string, wantOwnerName string) *jobsetv1alpha2.JobSet {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet

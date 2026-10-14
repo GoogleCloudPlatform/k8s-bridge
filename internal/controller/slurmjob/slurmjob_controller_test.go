@@ -45,6 +45,7 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/utils/slurmtypes"
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
+	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 )
@@ -200,6 +201,114 @@ func TestReconcile_MissingJobSet_NotHeld(t *testing.T) {
 	}
 
 	env.verifySlurmCancellation(ReasonJobSetMissing)
+}
+
+func TestReconcile_MissingJobSet_ReheldTranslatedJob_CancelsInsteadOfRecreating(t *testing.T) {
+	tests := []struct {
+		name       string
+		job        *slurmclienttypes.V0044JobInfo
+		wantCancel bool
+	}{
+		{
+			name: "re-held with BadConstraints and single k8s-id feature",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason("BadConstraints").
+				withTranslatedJobMarkers().
+				build(),
+			wantCancel: true,
+		},
+		{
+			name: "re-held with BadConstraints and compound features",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason("BadConstraints").
+				withTranslatedJobMarkers().
+				withFeatures("(gpu)&k8s-id-12345").
+				build(),
+			wantCancel: true,
+		},
+		{
+			name: "re-held with BadConstraints and user-overwritten comment",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason("BadConstraints").
+				withFeatures("k8s-id-12345").
+				withComment("custom-user-comment").
+				build(),
+			wantCancel: true,
+		},
+		{
+			name: "explicitly held by user after translation",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withTranslatedJobMarkers().
+				build(),
+			wantCancel: true,
+		},
+		{
+			name: "explicitly held by admin after translation",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(ReasonJobHeldAdmin).
+				withTranslatedJobMarkers().
+				build(),
+			wantCancel: true,
+		},
+		{
+			name: "untranslated job with prefix-colliding feature k8s-id-123456",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withFeatures("k8s-id-123456").
+				withComment(AutoHoldMarker).
+				build(),
+			wantCancel: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newReconcileTestEnv(t, withPendingSlurmJobs(tc.job))
+
+			initDiscovered := env.jobsDiscoveredCount()
+			initCreated := env.jobsSyncCount(metrics.StatusSuccess, metrics.ReasonJobSetCreated)
+			initFailed := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed)
+
+			res, err := env.reconcile()
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res != (ctrl.Result{}) {
+				t.Errorf("Expected empty result, got %v", res)
+			}
+
+			if tc.wantCancel {
+				env.verifyJobSetNotFound()
+				env.verifySlurmCancellation(ReasonJobSetMissing)
+
+				if got := env.jobsDiscoveredCount(); got != initDiscovered {
+					t.Errorf("Expected JobsDiscovered delta 0, got %f", got-initDiscovered)
+				}
+				if got := env.jobsSyncCount(metrics.StatusSuccess, metrics.ReasonJobSetCreated); got != initCreated {
+					t.Errorf("Expected JobsSync(created) delta 0, got %f", got-initCreated)
+				}
+				if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+1 {
+					t.Errorf("Expected JobsSync(jobset_failed) delta +1, got %f", got-initFailed)
+				}
+			} else {
+				env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+				env.verifySlurmUnhold()
+			}
+		})
+	}
 }
 
 var terminalSlurmJobStates = []struct {
@@ -726,6 +835,9 @@ func TestReconcile_ReleaseHold_PreservesExistingComment(t *testing.T) {
 }
 
 func TestReconcile_ReleaseHold_IdempotentCommentAndConstraints(t *testing.T) {
+	existingJobSet := newReconTestJobSet().
+		withSuspend(false).
+		build()
 	unheldComment := "user-comment, Unheld by k8s-bridge: Kubernetes resource slurm-job-12345 created successfully, k8s-bridge-auto-hold"
 	existingConstraints := "(user-feature)&k8s-id-12345"
 
@@ -737,7 +849,10 @@ func TestReconcile_ReleaseHold_IdempotentCommentAndConstraints(t *testing.T) {
 		withFeatures(existingConstraints).
 		build()
 
-	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+	env := newReconcileTestEnv(t,
+		withExtraObjects(existingJobSet),
+		withPendingSlurmJobs(job),
+	)
 
 	res, err := env.reconcile()
 	if err != nil {
