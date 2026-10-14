@@ -456,6 +456,101 @@ func TestReconcile_DeletingJobSet_CancelsSlurmJob(t *testing.T) {
 	}
 }
 
+func TestReconcile_InformerCacheLag_DoesNotCancelNewlyTranslatedJob(t *testing.T) {
+	tests := []struct {
+		name                 string
+		reconcile1UpdateErr  error
+		reholdAfterReconcile bool
+	}{
+		{
+			name: "cache lag after successful unhold while Hold=false (PartitionConfig)",
+		},
+		{
+			name:                "cache lag after 422 in-place update while Hold=false (PartitionConfig)",
+			reconcile1UpdateErr: newPartConfigUnavailable422Error(),
+		},
+		{
+			name:                 "cache lag after Slurm re-holds admitted job with BadConstraints (Hold=true)",
+			reholdAfterReconcile: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var simulateCacheLag bool
+			interceptors := interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+					if simulateCacheLag && key.Name == "slurm-job-"+reconJobIDStr {
+						return apierrors.NewNotFound(jobsetv1alpha2.Resource("jobsets"), key.Name)
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			}
+
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build()
+
+			env := newReconcileTestEnv(t,
+				withInterceptors(interceptors),
+				withPendingSlurmJobs(job),
+				withSlurmUpdateError(tc.reconcile1UpdateErr, true),
+			)
+
+			initDiscovered := env.jobsDiscoveredCount()
+			initFailed := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed)
+
+			res1, err1 := env.reconcile()
+			if err1 != nil {
+				t.Errorf("First reconcile returned unexpected error: %v", err1)
+			}
+			if res1 != (ctrl.Result{}) {
+				t.Errorf("First reconcile expected empty result, got %v", res1)
+			}
+
+			if tc.reholdAfterReconcile {
+				var mutatedJob slurmclienttypes.V0044JobInfo
+				if err := env.mockSlurm.Get(context.Background(), slurmclient.ObjectKey(reconJobIDStr), &mutatedJob); err != nil {
+					t.Fatalf("Failed to get job from mockSlurm: %v", err)
+				}
+				mutatedJob.Hold = ptr.To(true)
+				mutatedJob.StateReason = ptr.To("BadConstraints")
+				env.mockSlurm.SetPendingJobs(reconPartitionName, []slurmclienttypes.V0044JobInfo{mutatedJob})
+			}
+
+			simulateCacheLag = true
+			env.mockSlurm.UpdateError = nil
+
+			res2, err2 := env.reconcile()
+			if err2 != nil {
+				t.Fatalf("Second reconcile returned unexpected error: %v", err2)
+			}
+			if res2 != (ctrl.Result{}) {
+				t.Errorf("Second reconcile expected empty result, got %v", res2)
+			}
+
+			if len(env.mockSlurm.GetDeletedJobs()) != 0 {
+				t.Errorf("Expected newly translated Slurm job not to be cancelled, got deleted jobs: %v", env.mockSlurm.GetDeletedJobs())
+			}
+			if len(env.mockSlurm.GetUpdatedJobs()) != 1 {
+				t.Errorf("Expected 1 Slurm job update across both reconciles, got %d", len(env.mockSlurm.GetUpdatedJobs()))
+			}
+
+			env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+
+			if got := env.jobsDiscoveredCount(); got != initDiscovered+1 {
+				t.Errorf("Expected JobsDiscovered delta 1 across both reconciles, got %f", got-initDiscovered)
+			}
+			if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed {
+				t.Errorf("Expected JobsSync(jobset_failed) delta 0, got %f", got-initFailed)
+			}
+		})
+	}
+}
+
 var terminalSlurmJobStates = []struct {
 	name   string
 	states []slurmapi.V0044JobInfoJobState

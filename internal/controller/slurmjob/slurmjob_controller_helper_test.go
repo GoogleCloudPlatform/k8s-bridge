@@ -213,6 +213,7 @@ type reconcileTestEnv struct {
 	scheme     *runtime.Scheme
 	wm         *k8sbridgev1alpha1.WorkloadMixing
 	req        ctrl.Request
+	baseClient client.Client
 	fakeClient client.Client
 	mockSlurm  *utils.SlurmClient
 	clientMap  *clientmap.ClientMap
@@ -301,11 +302,11 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 	}
 	initObjs = append(initObjs, cfg.extraObjects...)
 
-	clientBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
+	fakeClient := client.Client(baseClient)
 	if cfg.interceptors != nil {
-		clientBuilder = clientBuilder.WithInterceptorFuncs(*cfg.interceptors)
+		fakeClient = interceptor.NewClient(baseClient, *cfg.interceptors)
 	}
-	fakeClient := clientBuilder.Build()
 
 	mockSlurm := &utils.SlurmClient{
 		UpdateError:    cfg.slurmUpdateError,
@@ -335,6 +336,7 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 		scheme:     scheme,
 		wm:         wm,
 		req:        req,
+		baseClient: baseClient,
 		fakeClient: fakeClient,
 		mockSlurm:  mockSlurm,
 		clientMap:  cMap,
@@ -356,7 +358,7 @@ func (e *reconcileTestEnv) reconcile(ctx ...context.Context) (ctrl.Result, error
 func (e *reconcileTestEnv) verifyJobSetCreated(wantQueue string, wantJobID string, wantOwnerName string) *jobsetv1alpha2.JobSet {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet
-	if err := e.fakeClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
+	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
 		e.t.Fatalf("Expected JobSet to be created, but got error: %v", err)
 		return nil
 	}
@@ -382,7 +384,7 @@ func (e *reconcileTestEnv) verifyJobSetCreated(wantQueue string, wantJobID strin
 func (e *reconcileTestEnv) verifyJobSetNotFound() {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet
-	err := e.fakeClient.Get(context.Background(), e.jobSetKey, &js)
+	err := e.baseClient.Get(context.Background(), e.jobSetKey, &js)
 	if !apierrors.IsNotFound(err) {
 		e.t.Errorf("Expected JobSet to NOT exist (NotFound), got err: %v", err)
 	}
@@ -391,7 +393,7 @@ func (e *reconcileTestEnv) verifyJobSetNotFound() {
 func (e *reconcileTestEnv) verifyJobSetSuspended(wantSuspended bool, wantSuspendedBySlurmHoldAnnotation bool) {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet
-	if err := e.fakeClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
+	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
 		e.t.Fatalf("Failed to fetch JobSet: %v", err)
 	}
 	isSuspended := js.Spec.Suspend != nil && *js.Spec.Suspend
