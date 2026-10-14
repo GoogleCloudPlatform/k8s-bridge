@@ -32,7 +32,7 @@ Custom Compute Classes define hardware provisioning priorities in GKE (e.g., pre
 ## Prerequisites
 
 - [`gcloud` CLI](https://cloud.google.com/sdk/docs/install)
-- The tools and versions listed in the [Quickstart Prerequisites & Versions](../quickstart.md#prerequisites--versions) (`kubectl`, `helm` 3.8+, `docker`, and a container registry reachable by the cluster)
+- The tools and versions listed in the [Quickstart Prerequisites & Versions](../quickstart.md#prerequisites--versions) (`kubectl` and `helm` 3.8+)
 
 ---
 
@@ -92,7 +92,7 @@ To use Custom Compute Classes, enable Node Auto-Provisioning (NAP) on your GKE c
 Complete the following steps from the [Quickstart guide](../quickstart.md) on your GKE cluster:
 
 1. [Step 1: Install prerequisites](../quickstart.md#1-install-prerequisites) (`cert-manager`, Slinky Slurm operator `1.2.2`, `JobSet` `0.12.0`, and `Kueue` `0.19.4`).
-2. [Step 4: Build and install k8s-bridge](../quickstart.md#4-build-and-install-k8s-bridge).
+2. [Step 4: Install k8s-bridge](../quickstart.md#4-install-k8s-bridge).
 
 ---
 

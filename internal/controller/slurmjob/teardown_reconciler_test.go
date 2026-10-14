@@ -835,7 +835,7 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup(t *testing.T) {
 
 	cm := clientmap.NewClientMap()
 	ctrlKey := types.NamespacedName{Namespace: testNamespace, Name: testCtrlName}
-	cm.Add(context.Background(), ctrlKey, fakeSlurm)
+	cm.Add(t.Context(), ctrlKey, fakeSlurm)
 
 	reconciler := &JobTeardownReconciler{
 		Client:    fakeClient,
@@ -931,7 +931,7 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup_NotFoundIgnored
 
 	cm := clientmap.NewClientMap()
 	ctrlKey := types.NamespacedName{Namespace: testNamespace, Name: testCtrlName}
-	cm.Add(context.Background(), ctrlKey, fakeSlurm)
+	cm.Add(t.Context(), ctrlKey, fakeSlurm)
 
 	reconciler := &JobTeardownReconciler{
 		Client:    fakeClient,
@@ -1014,7 +1014,7 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup_ErrorPropagated
 
 	cm := clientmap.NewClientMap()
 	ctrlKey := types.NamespacedName{Namespace: testNamespace, Name: testCtrlName}
-	cm.Add(context.Background(), ctrlKey, fakeSlurm)
+	cm.Add(t.Context(), ctrlKey, fakeSlurm)
 
 	reconciler := &JobTeardownReconciler{
 		Client:    fakeClient,
@@ -1098,7 +1098,7 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup_WhenAlreadyDele
 
 	cm := clientmap.NewClientMap()
 	ctrlKey := types.NamespacedName{Namespace: testNamespace, Name: testCtrlName}
-	cm.Add(context.Background(), ctrlKey, fakeSlurm)
+	cm.Add(t.Context(), ctrlKey, fakeSlurm)
 
 	reconciler := &JobTeardownReconciler{
 		Client:    fakeClient,

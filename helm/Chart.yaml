@@ -18,3 +18,6 @@ description: A Helm chart for the k8s-bridge custom controller enabling Workload
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
+home: https://github.com/GoogleCloudPlatform/k8s-bridge
+sources:
+  - https://github.com/GoogleCloudPlatform/k8s-bridge

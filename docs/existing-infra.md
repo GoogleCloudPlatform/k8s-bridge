@@ -25,11 +25,7 @@ Add dynamic workload mixing to an existing Slinky Slurm cluster and Kueue deploy
 - `Kueue` (0.19.4+)
 - An existing Slinky Slurm installation.
 
-Ensure you clone the `k8s-bridge` repository and navigate to its root directory. Set `REGISTRY` to your container registry:
-
-```bash
-export REGISTRY=<your-container-registry>
-```
+Ensure you clone the `k8s-bridge` repository and navigate to its root directory.
 
 ---
 
@@ -94,18 +90,14 @@ helm upgrade slurm oci://ghcr.io/slinkyproject/charts/slurm \
 
 ---
 
-## 4. Build and install k8s-bridge
+## 4. Install k8s-bridge
 
-Build and push the controller image, then install the local Helm chart in `./helm`:
+Install the `k8s-bridge` controller from the published OCI Helm chart:
 
 ```bash
-export IMG=${REGISTRY}/k8s-bridge:v0.1.0
-make docker-build docker-push IMG=$IMG
-
-helm install k8s-bridge ./helm \
+helm install k8s-bridge oci://ghcr.io/googlecloudplatform/charts/k8s-bridge \
+  --version 0.1.0 \
   --namespace k8s-bridge-system --create-namespace \
-  --set image.repository=${IMG%:*} \
-  --set image.tag=${IMG##*:} \
   --wait
 ```
 
