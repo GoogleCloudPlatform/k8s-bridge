@@ -230,9 +230,7 @@ func TestClientMap_Add(t *testing.T) {
 			if got := c.Add(context.TODO(), tt.args.name, tt.args.client); got != tt.want {
 				t.Errorf("ClientMap.Add() = %v, want %v", got, tt.want)
 			}
-			// Compare identity with !=. reflect.DeepEqual and %v can read the
-			// ctx and cancel fields of a started fake client while its Start
-			// goroutine writes them without a lock.
+
 			if got := c.Get(tt.args.name); got != tt.args.client {
 				t.Errorf("ClientMap.Get() after Add() = %p, want %p", got, tt.args.client)
 			}
