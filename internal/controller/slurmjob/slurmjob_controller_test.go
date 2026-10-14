@@ -311,6 +311,149 @@ func TestReconcile_MissingJobSet_ReheldTranslatedJob_CancelsInsteadOfRecreating(
 	}
 }
 
+func TestReconcile_DeletingJobSet_CancelsSlurmJob(t *testing.T) {
+	tests := []struct {
+		name               string
+		existingJobSet     *jobsetv1alpha2.JobSet
+		job                *slurmclienttypes.V0044JobInfo
+		wantCancelReason   string
+		wantNoSlurmUpdates bool
+		wantFailedDelta    float64
+	}{
+		{
+			name: "deleting unsuspended JobSet with re-held PENDING job (BadConstraints)",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(false).
+				withDeletionTimestamp().
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason("BadConstraints").
+				withTranslatedJobMarkers().
+				build(),
+			wantCancelReason: ReasonJobSetMissing,
+			wantFailedDelta:  1,
+		},
+		{
+			name: "deleting suspended JobSet with re-held PENDING job (BadConstraints)",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(true).
+				withDeletionTimestamp().
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason("BadConstraints").
+				withTranslatedJobMarkers().
+				build(),
+			wantCancelReason: ReasonJobSetMissing,
+			wantFailedDelta:  1,
+		},
+		{
+			name: "deleting unsuspended JobSet with explicitly held PENDING job (JobHeldUser)",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(false).
+				withDeletionTimestamp().
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withTranslatedJobMarkers().
+				build(),
+			wantCancelReason: ReasonJobSetMissing,
+			wantFailedDelta:  1,
+		},
+		{
+			name: "deleting unsuspended JobSet with RUNNING job",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(false).
+				withDeletionTimestamp().
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build(),
+			wantCancelReason: ReasonJobSetMissing,
+			wantFailedDelta:  1,
+		},
+		{
+			name: "deleting unsuspended JobSet when Slurm job is CANCELLED with Hold=true",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(false).
+				withDeletionTimestamp().
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStateCANCELLED).
+				withHold(true).
+				withTranslatedJobMarkers().
+				build(),
+			wantNoSlurmUpdates: true,
+			wantFailedDelta:    0,
+		},
+		{
+			name: "deleting JobSet when Slurm job is already COMPLETED",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(false).
+				withDeletionTimestamp().
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStateCOMPLETED).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build(),
+			wantNoSlurmUpdates: true,
+			wantFailedDelta:    0,
+		},
+		{
+			name: "deleting JobSet that already has JobSetCompleted=True condition",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(false).
+				withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+				withDeletionTimestamp().
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build(),
+			wantCancelReason: ReasonJobSetCompleted,
+			wantFailedDelta:  0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newReconcileTestEnv(t,
+				withExtraObjects(tc.existingJobSet),
+				withPendingSlurmJobs(tc.job),
+			)
+
+			initFailed := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed)
+
+			res, err := env.reconcile()
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res != (ctrl.Result{}) {
+				t.Errorf("Expected empty result, got %v", res)
+			}
+
+			if tc.wantNoSlurmUpdates {
+				env.verifyNoSlurmUpdates()
+			} else {
+				env.verifySlurmCancellation(tc.wantCancelReason)
+			}
+
+			if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+tc.wantFailedDelta {
+				t.Errorf("Expected JobsSync(jobset_failed) delta %f, got %f", tc.wantFailedDelta, got-initFailed)
+			}
+		})
+	}
+}
+
 var terminalSlurmJobStates = []struct {
 	name   string
 	states []slurmapi.V0044JobInfoJobState

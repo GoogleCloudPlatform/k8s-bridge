@@ -176,6 +176,15 @@ func (b *testJobSetBuilder) withSuspend(suspend bool) *testJobSetBuilder {
 	return b
 }
 
+func (b *testJobSetBuilder) withDeletionTimestamp() *testJobSetBuilder {
+	now := metav1.Now()
+	b.jobSet.DeletionTimestamp = &now
+	if len(b.jobSet.Finalizers) == 0 {
+		b.jobSet.Finalizers = []string{testFinalizer}
+	}
+	return b
+}
+
 //nolint:unparam
 func (b *testJobSetBuilder) withCondition(conditionType string, status metav1.ConditionStatus) *testJobSetBuilder {
 	b.jobSet.Status.Conditions = append(b.jobSet.Status.Conditions, metav1.Condition{
