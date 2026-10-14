@@ -202,6 +202,103 @@ func TestReconcile_MissingJobSet_NotHeld(t *testing.T) {
 	env.verifySlurmCancellation(ReasonJobSetMissing)
 }
 
+var terminalSlurmJobStates = []struct {
+	name   string
+	states []slurmapi.V0044JobInfoJobState
+}{
+	{name: "COMPLETED", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateCOMPLETED}},
+	{name: "CANCELLED", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateCANCELLED}},
+	{name: "FAILED", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateFAILED}},
+	{name: "TIMEOUT", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateTIMEOUT}},
+	{name: "NODEFAIL", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateNODEFAIL}},
+	{name: "PREEMPTED", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePREEMPTED}},
+	{name: "BOOTFAIL", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateBOOTFAIL}},
+	{name: "DEADLINE", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateDEADLINE}},
+	{name: "OUTOFMEMORY", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateOUTOFMEMORY}},
+	{name: "LAUNCHFAILED", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateLAUNCHFAILED}},
+	{name: "RECONFIGFAIL", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateRECONFIGFAIL}},
+	{name: "REVOKED", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateREVOKED}},
+	{name: "SPECIALEXIT", states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateSPECIALEXIT}},
+	{
+		name: "COMPLETED+COMPLETING",
+		states: []slurmapi.V0044JobInfoJobState{
+			slurmapi.V0044JobInfoJobStateCOMPLETED,
+			slurmapi.V0044JobInfoJobStateCOMPLETING,
+		},
+	},
+	{
+		name: "CANCELLED+COMPLETING",
+		states: []slurmapi.V0044JobInfoJobState{
+			slurmapi.V0044JobInfoJobStateCANCELLED,
+			slurmapi.V0044JobInfoJobStateCOMPLETING,
+		},
+	},
+	{
+		name: "FAILED+COMPLETING",
+		states: []slurmapi.V0044JobInfoJobState{
+			slurmapi.V0044JobInfoJobStateFAILED,
+			slurmapi.V0044JobInfoJobStateCOMPLETING,
+		},
+	},
+	{
+		name: "TIMEOUT+COMPLETING",
+		states: []slurmapi.V0044JobInfoJobState{
+			slurmapi.V0044JobInfoJobStateTIMEOUT,
+			slurmapi.V0044JobInfoJobStateCOMPLETING,
+		},
+	},
+}
+
+func TestReconcile_MissingJobSet_TerminalSlurmJob_Ignored(t *testing.T) {
+	type testCase struct {
+		name   string
+		states []slurmapi.V0044JobInfoJobState
+		hold   bool
+	}
+	tests := make([]testCase, 0, len(terminalSlurmJobStates)+1)
+	for _, s := range terminalSlurmJobStates {
+		tests = append(tests, testCase{name: s.name, states: s.states})
+	}
+	tests = append(tests, testCase{
+		name:   "CANCELLED with Hold=true",
+		states: []slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateCANCELLED},
+		hold:   true,
+	})
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := newReconTestJob().
+				withJobState(tc.states...).
+				withHold(tc.hold).
+				withTranslatedJobMarkers().
+				build()
+
+			env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+			initDiscovered := env.jobsDiscoveredCount()
+			initFailed := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed)
+
+			res, err := env.reconcile()
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res != (ctrl.Result{}) {
+				t.Errorf("Expected empty result, got %v", res)
+			}
+
+			env.verifyNoSlurmUpdates()
+			env.verifyJobSetNotFound()
+
+			if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed {
+				t.Errorf("Expected JobsSync(jobset_failed) delta 0, got %f", got-initFailed)
+			}
+			if got := env.jobsDiscoveredCount(); got != initDiscovered {
+				t.Errorf("Expected JobsDiscovered delta 0, got %f", got-initDiscovered)
+			}
+		})
+	}
+}
+
 func TestReconcile_Cancelled_MultiPartition(t *testing.T) {
 	multiPart := fmt.Sprintf("%s,unmapped-partition", reconPartitionName)
 	job := newReconTestJob().
@@ -435,23 +532,26 @@ func TestReconcile_JobSetFailed(t *testing.T) {
 }
 
 func TestCancelJobWithComment_Idempotent(t *testing.T) {
-	mockSlurm := &utils.SlurmClient{}
-	jobInfo := newTestJob().
-		withJobState(slurmapi.V0044JobInfoJobStateCANCELLED).
-		build()
+	for _, tc := range terminalSlurmJobStates {
+		t.Run(tc.name, func(t *testing.T) {
+			mockSlurm := &utils.SlurmClient{}
+			jobInfo := newTestJob().
+				withJobState(tc.states...).
+				build()
 
-	r := &SlurmJobReconciler{}
+			r := &SlurmJobReconciler{}
 
-	// Test: Job already in terminal state
-	err := r.cancelJobWithComment(context.Background(), mockSlurm, jobInfo, "test comment")
-	if err != nil {
-		t.Errorf("Expected nil error for already cancelled job, got %v", err)
-	}
-	if len(mockSlurm.GetUpdatedJobs()) != 0 {
-		t.Errorf("Expected 0 updates, got %d", len(mockSlurm.GetUpdatedJobs()))
-	}
-	if len(mockSlurm.GetDeletedJobs()) != 0 {
-		t.Errorf("Expected 0 deletes, got %d", len(mockSlurm.GetDeletedJobs()))
+			err := r.cancelJobWithComment(context.Background(), mockSlurm, jobInfo, "test comment")
+			if err != nil {
+				t.Errorf("Expected nil error for terminal job, got %v", err)
+			}
+			if len(mockSlurm.GetUpdatedJobs()) != 0 {
+				t.Errorf("Expected 0 updates, got %d", len(mockSlurm.GetUpdatedJobs()))
+			}
+			if len(mockSlurm.GetDeletedJobs()) != 0 {
+				t.Errorf("Expected 0 deletes, got %d", len(mockSlurm.GetDeletedJobs()))
+			}
+		})
 	}
 }
 

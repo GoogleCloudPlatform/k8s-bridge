@@ -19,6 +19,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/SlinkyProject/slurm-client/pkg/client"
@@ -161,17 +162,17 @@ func (s *SlurmClient) SetPendingJobs(partition string, jobs []slurmclienttypes.V
 	if s.jobs == nil {
 		s.jobs = make(map[string][]slurmclienttypes.V0044JobInfo)
 	}
-	s.jobs[partition] = jobs
+	s.jobs[partition] = slices.Clone(jobs)
 }
 
 func (s *SlurmClient) GetDeletedJobs() []int32 {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
-	return s.deletedJobs
+	return slices.Clone(s.deletedJobs)
 }
 
 func (s *SlurmClient) GetUpdatedJobs() []JobUpdate {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
-	return s.updatedJobs
+	return slices.Clone(s.updatedJobs)
 }

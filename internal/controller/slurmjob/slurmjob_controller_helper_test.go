@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +37,7 @@ import (
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
+	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
@@ -134,6 +136,13 @@ func (b *testJobBuilder) withDefaultReconFields() *testJobBuilder {
 		withJobID(reconJobID).
 		withPartition(reconPartitionName).
 		withNodes(testDefaultNodeCount)
+}
+
+func (b *testJobBuilder) withTranslatedJobMarkers() *testJobBuilder {
+	jobID := ptr.Deref(b.job.JobId, reconJobID)
+	return b.
+		withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)).
+		withComment(fmt.Sprintf("Unheld by k8s-bridge: Kubernetes resource slurm-job-%d created successfully", jobID))
 }
 
 func newReconTestJob() *testJobBuilder {
@@ -420,4 +429,12 @@ func (e *reconcileTestEnv) verifyNoSlurmUpdates() {
 	if len(e.mockSlurm.GetDeletedJobs()) != 0 {
 		e.t.Errorf("Expected no job deletions, got %v", e.mockSlurm.GetDeletedJobs())
 	}
+}
+
+func (e *reconcileTestEnv) jobsDiscoveredCount() float64 {
+	return testutil.ToFloat64(metrics.JobsDiscovered.WithLabelValues(reconWmName, reconPartitionName))
+}
+
+func (e *reconcileTestEnv) jobsSyncCount(status, reason string) float64 {
+	return testutil.ToFloat64(metrics.JobsSync.WithLabelValues(status, reason, reconWmName, reconPartitionName))
 }
