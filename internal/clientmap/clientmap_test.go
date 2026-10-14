@@ -155,7 +155,7 @@ func TestClientMap_add(t *testing.T) {
 					Name:      testBarName,
 					Namespace: testNamespace,
 				},
-				client: testClient,
+				client: fake.NewFakeClient(),
 			},
 			want: true,
 		},
@@ -201,7 +201,7 @@ func TestClientMap_Add(t *testing.T) {
 					Name:      testFooName,
 					Namespace: testNamespace,
 				},
-				client: testClient,
+				client: fake.NewFakeClient(),
 			},
 			want: true,
 		},
@@ -215,7 +215,7 @@ func TestClientMap_Add(t *testing.T) {
 					Name:      testBarName,
 					Namespace: testNamespace,
 				},
-				client: testClient,
+				client: fake.NewFakeClient(),
 			},
 			want: true,
 		},
@@ -228,6 +228,10 @@ func TestClientMap_Add(t *testing.T) {
 			}
 			if got := c.Add(t.Context(), tt.args.name, tt.args.client); got != tt.want {
 				t.Errorf("ClientMap.Add() = %v, want %v", got, tt.want)
+			}
+
+			if got := c.Get(tt.args.name); got != tt.args.client {
+				t.Errorf("ClientMap.Get() after Add() = %p, want %p", got, tt.args.client)
 			}
 		})
 	}
