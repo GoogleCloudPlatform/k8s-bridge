@@ -289,7 +289,7 @@ var _ = Describe("Manager", func() {
 		It("should execute a multi-node batch job across two dynamic worker pods "+
 			"without liveness probe failure", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
-			const jobSleepSeconds = 4*slurmjob.SlurmdProbePeriodSeconds + slurmjob.SlurmdProbeTimeoutSeconds
+			const jobSleepSeconds = 6*slurmjob.SlurmdProbePeriodSeconds + slurmjob.SlurmdProbeTimeoutSeconds
 
 			By("applying the WorkloadMixing template CR")
 			utils.ApplyManifestWithCleanup(configPath)
