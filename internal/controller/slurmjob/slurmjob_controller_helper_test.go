@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -191,6 +192,16 @@ func (b *testJobSetBuilder) withDeletionTimestamp() *testJobSetBuilder {
 	b.jobSet.DeletionTimestamp = &now
 	if len(b.jobSet.Finalizers) == 0 {
 		b.jobSet.Finalizers = []string{testFinalizer}
+	}
+	return b
+}
+
+func (b *testJobSetBuilder) withSlurmdReplicas(replicas int32) *testJobSetBuilder {
+	b.jobSet.Spec.ReplicatedJobs = []jobsetv1alpha2.ReplicatedJob{
+		{
+			Name:     ContainerSlurmd,
+			Replicas: replicas,
+		},
 	}
 	return b
 }
@@ -457,6 +468,13 @@ func (e *reconcileTestEnv) verifySlurmCancellation(wantCommentSubstr string) {
 	}
 }
 
+func (e *reconcileTestEnv) verifySlurmNodesDeleted(wantNodes ...string) {
+	e.t.Helper()
+	if gotNodes := e.mockSlurm.GetDeletedNodes(); !slices.Equal(gotNodes, wantNodes) {
+		e.t.Errorf("Deleted Slurm nodes = %v, want %v", gotNodes, wantNodes)
+	}
+}
+
 func (e *reconcileTestEnv) verifyNoSlurmUpdates() {
 	e.t.Helper()
 	if len(e.mockSlurm.GetUpdatedJobs()) != 0 {
@@ -464,6 +482,9 @@ func (e *reconcileTestEnv) verifyNoSlurmUpdates() {
 	}
 	if len(e.mockSlurm.GetDeletedJobs()) != 0 {
 		e.t.Errorf("Expected no job deletions, got %v", e.mockSlurm.GetDeletedJobs())
+	}
+	if len(e.mockSlurm.GetDeletedNodes()) != 0 {
+		e.t.Errorf("Expected no node deletions, got %v", e.mockSlurm.GetDeletedNodes())
 	}
 }
 

@@ -38,15 +38,17 @@ type JobUpdate struct {
 }
 
 type SlurmClient struct {
-	lock           sync.RWMutex
-	server         string
-	token          string
-	jobs           map[string][]slurmclienttypes.V0044JobInfo
-	deletedJobs    []int32
-	updatedJobs    []JobUpdate
-	GetError       error
-	UpdateError    error
-	MutateOnUpdate bool
+	lock            sync.RWMutex
+	server          string
+	token           string
+	jobs            map[string][]slurmclienttypes.V0044JobInfo
+	deletedJobs     []int32
+	deletedNodes    []string
+	updatedJobs     []JobUpdate
+	GetError        error
+	UpdateError     error
+	DeleteNodeError error
+	MutateOnUpdate  bool
 }
 
 func (s *SlurmClient) Start(ctx context.Context) {
@@ -179,6 +181,13 @@ func (s *SlurmClient) Delete(ctx context.Context, obj object.Object, opts ...cli
 		}
 		return nil
 	}
+	if node, ok := obj.(*slurmclienttypes.V0044Node); ok {
+		s.deletedNodes = append(s.deletedNodes, ptr.Deref(node.Name, ""))
+		if s.DeleteNodeError != nil {
+			return s.DeleteNodeError
+		}
+		return nil
+	}
 	return fmt.Errorf("unsupported object type: %T", obj)
 }
 
@@ -195,6 +204,12 @@ func (s *SlurmClient) GetDeletedJobs() []int32 {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
 	return slices.Clone(s.deletedJobs)
+}
+
+func (s *SlurmClient) GetDeletedNodes() []string {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return slices.Clone(s.deletedNodes)
 }
 
 func (s *SlurmClient) GetUpdatedJobs() []JobUpdate {

@@ -880,6 +880,93 @@ func TestReconcile_JobSetFailed(t *testing.T) {
 	env.verifyJobSetNotFound()
 }
 
+func TestReconcile_JobSetTerminal_CleansUpDynamicNodes(t *testing.T) {
+	const (
+		dynamicNode0 = "slurm-job-12345-slurmd-0-0"
+		dynamicNode1 = "slurm-job-12345-slurmd-1-0"
+	)
+	tests := []struct {
+		name            string
+		conditionType   string
+		replicas        int32
+		deleteNodeError error
+		wantReason      string
+		wantDeletedNode []string
+		wantErr         bool
+	}{
+		{
+			name:            "JobSetCompleted cleans up dynamic nodes and deletes JobSet",
+			conditionType:   string(jobsetv1alpha2.JobSetCompleted),
+			replicas:        2,
+			wantReason:      ReasonJobSetCompleted,
+			wantDeletedNode: []string{dynamicNode0, dynamicNode1},
+		},
+		{
+			name:            "JobSetFailed cleans up dynamic nodes and deletes JobSet",
+			conditionType:   string(jobsetv1alpha2.JobSetFailed),
+			replicas:        2,
+			wantReason:      ReasonJobSetFailed,
+			wantDeletedNode: []string{dynamicNode0, dynamicNode1},
+		},
+		{
+			name:            "already-deleted dynamic node (NotFound) is ignored and JobSet is deleted",
+			conditionType:   string(jobsetv1alpha2.JobSetCompleted),
+			replicas:        1,
+			deleteNodeError: errors.New("[Not Found, Invalid node name specified]"),
+			wantReason:      ReasonJobSetCompleted,
+			wantDeletedNode: []string{dynamicNode0},
+		},
+		{
+			name:            "transient dynamic node deletion error retains JobSet for retry",
+			conditionType:   string(jobsetv1alpha2.JobSetFailed),
+			replicas:        1,
+			deleteNodeError: errors.New("Nodes busy"),
+			wantErr:         true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			terminalJobSet := newReconTestJobSet().
+				withSlurmdReplicas(tc.replicas).
+				withCondition(tc.conditionType, metav1.ConditionTrue).
+				build()
+
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build()
+
+			env := newReconcileTestEnv(t,
+				withExtraObjects(terminalJobSet),
+				withPendingSlurmJobs(job),
+			)
+			env.mockSlurm.DeleteNodeError = tc.deleteNodeError
+
+			res, err := env.reconcile()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Expected error when dynamic node deletion fails, got nil")
+				}
+				env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res != (ctrl.Result{}) {
+				t.Errorf("Expected empty result, got %v", res)
+			}
+
+			env.verifySlurmNodesDeleted(tc.wantDeletedNode...)
+			env.verifySlurmCancellation(tc.wantReason)
+			env.verifyJobSetNotFound()
+		})
+	}
+}
+
 func TestCancelJobWithComment_Idempotent(t *testing.T) {
 	for _, tc := range terminalSlurmJobStates {
 		t.Run(tc.name, func(t *testing.T) {
