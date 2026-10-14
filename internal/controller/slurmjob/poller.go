@@ -140,7 +140,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 		}
 
 		start := time.Now()
-		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		timeoutCtx, cancel := context.WithTimeout(ctx, defaultSlurmCallTimeout)
 		var jobList slurmclienttypes.V0044JobInfoList
 		err := cli.List(timeoutCtx, &jobList)
 		duration := time.Since(start)

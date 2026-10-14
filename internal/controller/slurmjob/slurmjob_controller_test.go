@@ -21,6 +21,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +49,8 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
+	slurmclientinterceptor "github.com/SlinkyProject/slurm-client/pkg/client/interceptor"
+	"github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	uberzap "go.uber.org/zap"
@@ -1969,4 +1973,287 @@ func TestReconcile_EmptyWMName_SkipsWithoutNewJobLog(t *testing.T) {
 	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 0 {
 		t.Errorf("Did not expect 'New Slurm job appeared' when WorkloadMixing name is empty, got %d", got)
 	}
+}
+
+func assertContextBoundedBySlurmTimeout(t *testing.T, ctx context.Context, op string) {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Errorf("Expected context passed to %s to have a deadline", op)
+		return
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > defaultSlurmCallTimeout {
+		t.Errorf("Expected %s context deadline within (0, %v], got %v", op, defaultSlurmCallTimeout, remaining)
+	}
+}
+
+func TestReconcile_SlurmCallContextDeadlines(t *testing.T) {
+	t.Run("fetchState Get and releaseHold Update set per-call timeout", func(t *testing.T) {
+		job := newReconTestJob().
+			withNodes(2).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+		var getCalled, updateCalled bool
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Get: func(ctx context.Context, key object.ObjectKey, obj object.Object, opts ...slurmclient.GetOption) error {
+				getCalled = true
+				assertContextBoundedBySlurmTimeout(t, ctx, "Get")
+				return env.mockSlurm.Get(ctx, key, obj, opts...)
+			},
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				updateCalled = true
+				assertContextBoundedBySlurmTimeout(t, ctx, "releaseHold Update")
+				return env.mockSlurm.Update(ctx, obj, req, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !getCalled {
+			t.Error("Expected Slurm Get to be called")
+		}
+		if !updateCalled {
+			t.Error("Expected Slurm Update to be called for releaseHold")
+		}
+	})
+
+	t.Run("cancelJobWithComment Update and Delete set independent per-call timeouts", func(t *testing.T) {
+		completedJobSet := newReconTestJobSet().
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+
+		var updateCalled, deleteCalled bool
+		var updateCtxCaptured context.Context
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				updateCalled = true
+				updateCtxCaptured = ctx
+				assertContextBoundedBySlurmTimeout(t, ctx, "cancelJobWithComment Update")
+				return env.mockSlurm.Update(ctx, obj, req, opts...)
+			},
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				deleteCalled = true
+				if updateCtxCaptured == nil || updateCtxCaptured.Err() == nil {
+					t.Error("Expected Update context to be cancelled before Delete is invoked")
+				}
+				assertContextBoundedBySlurmTimeout(t, ctx, "cancelJobWithComment Delete")
+				return env.mockSlurm.Delete(ctx, obj, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !updateCalled {
+			t.Error("Expected Slurm Update to be called for comment")
+		}
+		if !deleteCalled {
+			t.Error("Expected Slurm Delete to be called for job cancellation")
+		}
+	})
+}
+
+func TestReconcile_SlurmCallTimeout_BlockedCallsAbort(t *testing.T) {
+	const testCallTimeout = 10 * time.Millisecond
+
+	t.Run("fetchState Get aborts with DeadlineExceeded when server hangs", func(t *testing.T) {
+		env := newReconcileTestEnv(t)
+		env.reconciler.slurmCallTimeout = testCallTimeout
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Get: func(ctx context.Context, key object.ObjectKey, obj object.Object, opts ...slurmclient.GetOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("releaseHold Update aborts with DeadlineExceeded when server hangs", func(t *testing.T) {
+		job := newReconTestJob().
+			withNodes(1).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+		env.reconciler.slurmCallTimeout = testCallTimeout
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("cancelJobWithComment Update timeout still allows Delete to succeed", func(t *testing.T) {
+		completedJobSet := newReconTestJobSet().
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+		env.reconciler.slurmCallTimeout = testCallTimeout
+
+		var deleteCalled bool
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				deleteCalled = true
+				deadline, ok := ctx.Deadline()
+				if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > testCallTimeout {
+					t.Errorf("Expected Delete context to have fresh deadline within (0, %v]", testCallTimeout)
+				}
+				return env.mockSlurm.Delete(ctx, obj, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected Reconcile to succeed when only comment Update times out, got: %v", err)
+		}
+		if !deleteCalled {
+			t.Fatal("Expected Delete to be called after Update timed out")
+		}
+	})
+
+	t.Run("cancelJobWithComment Delete aborts with DeadlineExceeded when server hangs", func(t *testing.T) {
+		completedJobSet := newReconTestJobSet().
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+		env.reconciler.slurmCallTimeout = testCallTimeout
+
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("real slurmclient aborts over HTTP when server hangs", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		}))
+		defer srv.Close()
+
+		realClient, err := slurmclient.NewClient(&slurmclient.Config{
+			Server:    srv.URL,
+			AuthToken: "test-token",
+		}, &slurmclient.ClientOptions{
+			DisableFor: []object.Object{
+				&slurmclienttypes.V0044JobInfo{},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Failed to create real slurmclient: %v", err)
+		}
+
+		env := newReconcileTestEnv(t)
+		env.reconciler.slurmCallTimeout = 50 * time.Millisecond
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, realClient)
+
+		_, err = env.reconcile()
+		if err == nil {
+			t.Fatal("Expected Reconcile to fail when HTTP server hangs, got nil")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("reconciliationTimeout short-circuits multi-node cleanupDynamicNodes when server hangs", func(t *testing.T) {
+		const totalNodes = 20
+		completedJobSet := newReconTestJobSet().
+			withSlurmdReplicas(totalNodes).
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+			withHold(false).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+		env.reconciler.slurmCallTimeout = 15 * time.Millisecond
+		env.reconciler.reconciliationTimeout = 35 * time.Millisecond
+
+		var nodeDeleteAttempts int
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				if _, ok := obj.(*slurmclienttypes.V0044Node); ok {
+					nodeDeleteAttempts++
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return env.mockSlurm.Delete(ctx, obj, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+		if nodeDeleteAttempts == 0 || nodeDeleteAttempts >= totalNodes {
+			t.Errorf("Expected reconciliationTimeout to short-circuit node cleanup before all %d nodes were attempted, got %d attempts", totalNodes, nodeDeleteAttempts)
+		}
+	})
 }

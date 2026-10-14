@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
@@ -31,6 +32,8 @@ import (
 )
 
 const (
+	defaultSlurmCallTimeout          = 5 * time.Second
+	defaultReconciliationTimeout     = 30 * time.Second
 	slurmErrMsgInvalidJobID          = "Invalid job id specified"
 	slurmErrMsgInvalidNodeName       = "Invalid node name specified"
 	slurmErrMsgNodeNotFound          = "Node not found"

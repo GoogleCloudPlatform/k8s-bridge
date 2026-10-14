@@ -363,6 +363,11 @@ func (e *reconcileTestEnv) reconcile(ctx ...context.Context) (ctrl.Result, error
 	if len(ctx) > 0 && ctx[0] != nil {
 		c = ctx[0]
 	}
+	if _, hasDeadline := c.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		c, cancel = context.WithTimeout(c, e.reconciler.getReconciliationTimeout())
+		defer cancel()
+	}
 	return e.reconciler.Reconcile(c, e.req)
 }
 

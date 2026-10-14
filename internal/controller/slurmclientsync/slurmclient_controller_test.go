@@ -19,10 +19,14 @@ package slurmclientsync
 import (
 	"context"
 	"crypto/rand"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
+	slurmobject "github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmtypes "github.com/SlinkyProject/slurm-client/pkg/types"
 	slinkyv1beta1 "github.com/SlinkyProject/slurm-operator/api/v1beta1"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -93,12 +97,14 @@ func TestSlurmClientReconciler_Reconcile_NewController(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(controllerObj, secretObj, restapiObj).Build()
 	cMap := clientmap.NewClientMap()
 
+	var capturedConfig *slurmclient.Config
 	var capturedOpts []slurmclient.ClientOption
 	reconciler := &SlurmClientReconciler{
 		Client:    fakeClient,
 		Scheme:    scheme,
 		ClientMap: cMap,
 		NewClient: func(config *slurmclient.Config, opts ...slurmclient.ClientOption) (slurmclient.Client, error) {
+			capturedConfig = config
 			capturedOpts = opts
 			mock := &utils.SlurmClient{}
 			mock.SetToken(config.AuthToken)
@@ -137,6 +143,16 @@ func TestSlurmClientReconciler_Reconcile_NewController(t *testing.T) {
 
 	if status := testutil.ToFloat64(metrics.SlurmClientStatus.WithLabelValues(testCtrlName)); status != 1.0 {
 		t.Errorf("Expected SlurmClientStatus 1.0, got %f", status)
+	}
+
+	if capturedConfig == nil {
+		t.Fatal("Expected Config to be passed to NewClient")
+	}
+	if capturedConfig.HTTPClient == nil {
+		t.Fatal("Expected Config.HTTPClient to be non-nil")
+	}
+	if capturedConfig.HTTPClient.Timeout != DefaultHTTPClientTimeout {
+		t.Errorf("Config.HTTPClient.Timeout = %v, want %v", capturedConfig.HTTPClient.Timeout, DefaultHTTPClientTimeout)
 	}
 
 	var clientOptions *slurmclient.ClientOptions
@@ -854,5 +870,33 @@ func TestSlurmClientReconciler_Reconcile_InvalidToken_ImmediateRegeneration(t *t
 
 	if res.RequeueAfter != 12*time.Minute {
 		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, 12*time.Minute)
+	}
+}
+
+func TestSlurmClient_HTTPClientTimeout_AbortsHungServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	cli, err := slurmclient.NewClient(&slurmclient.Config{
+		Server:    srv.URL,
+		AuthToken: "test-token",
+		HTTPClient: &http.Client{
+			Timeout: 50 * time.Millisecond,
+		},
+	}, &slurmclient.ClientOptions{
+		DisableFor: []slurmobject.Object{
+			&slurmtypes.V0044JobInfo{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	var jobInfo slurmtypes.V0044JobInfo
+	err = cli.Get(context.Background(), slurmobject.ObjectKey("12345"), &jobInfo)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Expected Get to fail with context.DeadlineExceeded when server hangs beyond HTTPClient.Timeout, got: %v", err)
 	}
 }

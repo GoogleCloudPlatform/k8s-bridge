@@ -67,13 +67,29 @@ const (
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
 type SlurmJobReconciler struct {
 	client.Client
-	APIReader           client.Reader
-	Scheme              *runtime.Scheme
-	Recorder            record.EventRecorder
-	AdmissionEventsChan <-chan slurmtypes.SlurmJobAdmissionEvent
-	genericEvents       chan event.GenericEvent
-	ClientMap           *clientmap.ClientMap
-	Translator          JobTranslator
+	APIReader             client.Reader
+	Scheme                *runtime.Scheme
+	Recorder              record.EventRecorder
+	AdmissionEventsChan   <-chan slurmtypes.SlurmJobAdmissionEvent
+	genericEvents         chan event.GenericEvent
+	ClientMap             *clientmap.ClientMap
+	Translator            JobTranslator
+	slurmCallTimeout      time.Duration
+	reconciliationTimeout time.Duration
+}
+
+func (r *SlurmJobReconciler) getSlurmCallTimeout() time.Duration {
+	if r.slurmCallTimeout > 0 {
+		return r.slurmCallTimeout
+	}
+	return defaultSlurmCallTimeout
+}
+
+func (r *SlurmJobReconciler) getReconciliationTimeout() time.Duration {
+	if r.reconciliationTimeout > 0 {
+		return r.reconciliationTimeout
+	}
+	return defaultReconciliationTimeout
 }
 
 // NeedLeaderElection implements the manager.LeaderElectionRunnable interface.
@@ -136,7 +152,8 @@ func (r *SlurmJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	c, err := controller.New("slurmjob-controller", mgr, controller.Options{
-		Reconciler: r,
+		Reconciler:            r,
+		ReconciliationTimeout: r.getReconciliationTimeout(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create controller: %w", err)
@@ -275,7 +292,9 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 	}
 
 	var jobInfo slurmclienttypes.V0044JobInfo
-	if err := slurmClient.Get(ctx, object.ObjectKey(jobID), &jobInfo); err != nil {
+	callCtx, cancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
+	defer cancel()
+	if err := slurmClient.Get(callCtx, object.ObjectKey(jobID), &jobInfo); err != nil {
 		if isSlurmNotFound(err) {
 			// A job may no longer exist in Slurmctld if it reached a terminal state and was
 			// purged after MinJobAge, while watch events on the associated JobSet still arrive.
@@ -517,7 +536,7 @@ func (r *SlurmJobReconciler) handleTerminalJobSet(
 	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, reason); cancelErr != nil {
 		return ReconciliationDone, ctrl.Result{}, cancelErr
 	}
-	if err := cleanupDynamicNodes(ctx, slurmClient, existingJS); err != nil {
+	if err := cleanupDynamicNodes(ctx, slurmClient, existingJS, r.getSlurmCallTimeout()); err != nil {
 		return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", existingJS.Name, err)
 	}
 	if errDelete := r.deleteJobSet(ctx, existingJS, reason); errDelete != nil {
@@ -726,7 +745,10 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 	commentReq := slurmapi.V0044JobDescMsg{
 		Comment: ptr.To(comment),
 	}
-	if err := slurmClient.Update(ctx, jobInfo, commentReq); err != nil {
+	updateCtx, updateCancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
+	err := slurmClient.Update(updateCtx, jobInfo, commentReq)
+	updateCancel()
+	if err != nil {
 		if isSlurmPartConfigUnavailable(err) {
 			logger.V(1).Info("Slurm returned partition configuration unavailable when setting failure comment, proceeding with job cancellation", "jobID", jobID, "error", err)
 		} else {
@@ -735,7 +757,9 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 	}
 
 	// 2. Cancel the job in Slurm
-	if err := slurmClient.Delete(ctx, jobInfo); err != nil {
+	deleteCtx, deleteCancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
+	defer deleteCancel()
+	if err := slurmClient.Delete(deleteCtx, jobInfo); err != nil {
 		logger.Error(err, "Failed to cancel Slurm job", "jobID", jobID)
 		return fmt.Errorf("failed to cancel Slurm job: %w", err)
 	}
@@ -771,7 +795,9 @@ func (r *SlurmJobReconciler) releaseHold(ctx context.Context, slurmClient slurmc
 		Comment:     ptr.To(newComment),
 		Constraints: ptr.To(newFeatures),
 	}
-	if err := slurmClient.Update(ctx, jobInfo, updateReq); err != nil {
+	callCtx, cancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
+	defer cancel()
+	if err := slurmClient.Update(callCtx, jobInfo, updateReq); err != nil {
 		if isSlurmPartConfigUnavailable(err) {
 			logger.V(1).Info("Slurm returned partition configuration unavailable after unholding job", "jobID", jobID, "error", err)
 			return nil
