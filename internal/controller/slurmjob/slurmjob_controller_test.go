@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -45,6 +46,7 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/utils/slurmtypes"
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
+	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
@@ -807,6 +809,58 @@ func TestCancelJobWithComment_Idempotent(t *testing.T) {
 	}
 }
 
+func TestCancelJobWithComment_PartConfigUnavailable422_DoesNotLogError(t *testing.T) {
+	tests := []struct {
+		name           string
+		updateErr      error
+		mutateOnUpdate bool
+		wantErrorLog   bool
+	}{
+		{
+			name:           "tolerated 422 on comment update does not log ERROR and deletes job",
+			updateErr:      newPartConfigUnavailable422Error(),
+			mutateOnUpdate: true,
+			wantErrorLog:   false,
+		},
+		{
+			name:           "genuine Update error logs ERROR and deletes job",
+			updateErr:      errors.New("connection reset by peer"),
+			mutateOnUpdate: false,
+			wantErrorLog:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			jobInfo := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				build()
+
+			env := newReconcileTestEnv(t,
+				withPendingSlurmJobs(jobInfo),
+				withSlurmUpdateError(tc.updateErr, tc.mutateOnUpdate),
+			)
+
+			var buf bytes.Buffer
+			testLogger := zap.New(zap.WriteTo(&buf), zap.UseDevMode(true))
+			ctx := logf.IntoContext(context.Background(), testLogger)
+
+			err := env.reconciler.cancelJobWithComment(ctx, env.mockSlurm, jobInfo, ReasonJobSetCompleted)
+			if err != nil {
+				t.Fatalf("Expected nil error from cancelJobWithComment, got %v", err)
+			}
+
+			env.verifySlurmCancellation(ReasonJobSetCompleted)
+
+			hasErrLog := strings.Contains(buf.String(), "Failed to set failure comment on Slurm job")
+			if hasErrLog != tc.wantErrorLog {
+				t.Errorf("Error log presence = %v, want %v (logs: %s)", hasErrLog, tc.wantErrorLog, buf.String())
+			}
+		})
+	}
+}
+
 func TestReconcile_ExplicitHold_SuspendsExistingJobSet(t *testing.T) {
 	js := newReconTestJobSet().
 		withSuspend(false).
@@ -1030,6 +1084,107 @@ func TestReconcile_ReleaseHold_IdempotentCommentAndConstraints(t *testing.T) {
 	}
 	if *reqMsg.Constraints != existingConstraints {
 		t.Errorf("Constraints = %q, want %q", *reqMsg.Constraints, existingConstraints)
+	}
+}
+
+func TestReconcile_ReleaseHold_PartConfigUnavailable422_AppliedInPlace(t *testing.T) {
+	tests := []struct {
+		name              string
+		existingJobSet    *jobsetv1alpha2.JobSet
+		job               *slurmclienttypes.V0044JobInfo
+		updateErr         error
+		mutateOnUpdate    bool
+		wantErr           bool
+		wantErrMetricIncr float64
+	}{
+		{
+			name: "reconcileNewJob tolerates 422 aggregate error when mutation applied in-place",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			updateErr:      newPartConfigUnavailable422Error(),
+			mutateOnUpdate: true,
+		},
+		{
+			name: "reconcileActiveJob StatusShouldUnhold tolerates 422 string error when mutation applied in-place",
+			existingJobSet: newReconTestJobSet().
+				withSuspend(false).
+				build(),
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason("BadConstraints").
+				withTranslatedJobMarkers().
+				build(),
+			updateErr:      errors.New("[Unprocessable Entity, Requested partition configuration not available now]"),
+			mutateOnUpdate: true,
+		},
+		{
+			name: "422 Invalid feature specification without in-place mutation fails",
+			job: newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			updateErr:         errors.New("[Unprocessable Entity, Invalid feature specification]"),
+			mutateOnUpdate:    false,
+			wantErr:           true,
+			wantErrMetricIncr: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts []reconcileEnvOpt
+			if tc.existingJobSet != nil {
+				opts = append(opts, withExtraObjects(tc.existingJobSet))
+			}
+			opts = append(opts,
+				withPendingSlurmJobs(tc.job),
+				withSlurmUpdateError(tc.updateErr, tc.mutateOnUpdate),
+			)
+			env := newReconcileTestEnv(t, opts...)
+
+			initUpdateErr := env.jobsSyncCount(metrics.StatusError, metrics.ReasonSlurmUpdateError)
+
+			res, err := env.reconcile()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Reconcile error = %v, wantErr %v", err, tc.wantErr)
+			}
+
+			if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonSlurmUpdateError); got != initUpdateErr+tc.wantErrMetricIncr {
+				t.Errorf("Expected JobsSync(slurm_update_error) delta %f, got %f", tc.wantErrMetricIncr, got-initUpdateErr)
+			}
+
+			if !tc.wantErr {
+				if res != (ctrl.Result{}) {
+					t.Errorf("Expected empty result, got %v", res)
+				}
+				env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+				env.verifySlurmUnhold()
+
+				var updatedJob slurmclienttypes.V0044JobInfo
+				if err := env.mockSlurm.Get(context.Background(), slurmclient.ObjectKey(reconJobIDStr), &updatedJob); err != nil {
+					t.Fatalf("Failed to get job from mockSlurm: %v", err)
+				}
+				if ptr.Deref(updatedJob.Hold, true) {
+					t.Errorf("Expected Slurm job Hold to be false after in-place update")
+				}
+				if !strings.Contains(ptr.Deref(updatedJob.Features, ""), "k8s-id-12345") {
+					t.Errorf("Expected Slurm job Features to contain k8s-id-12345, got %q", ptr.Deref(updatedJob.Features, ""))
+				}
+				if strings.Contains(ptr.Deref(updatedJob.Comment, ""), AutoHoldMarker) {
+					t.Errorf("Expected Slurm job Comment to strip %q, got %q", AutoHoldMarker, ptr.Deref(updatedJob.Comment, ""))
+				}
+				if len(env.mockSlurm.GetDeletedJobs()) != 0 {
+					t.Errorf("Expected 0 deleted jobs, got %v", env.mockSlurm.GetDeletedJobs())
+				}
+			}
+		})
 	}
 }
 

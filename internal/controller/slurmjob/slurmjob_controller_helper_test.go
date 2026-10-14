@@ -18,8 +18,10 @@ package slurmjob
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -29,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,6 +57,13 @@ const (
 	reconJobIDStr        = "12345"
 	reconSlurmAuthSecret = "slurm-auth-slurm"
 )
+
+func newPartConfigUnavailable422Error() error {
+	return utilerrors.NewAggregate([]error{
+		errors.New(http.StatusText(http.StatusUnprocessableEntity)),
+		errors.New("Requested partition configuration not available now"),
+	})
+}
 
 func getReconTestController() *slinkyv1beta1.Controller {
 	return &slinkyv1beta1.Controller{
@@ -220,6 +230,8 @@ type reconcileEnvConfig struct {
 	interceptors           *interceptor.Funcs
 	pendingJobs            []slurmclienttypes.V0044JobInfo
 	partition              string
+	slurmUpdateError       error
+	slurmMutateOnUpdate    bool
 }
 
 func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
@@ -262,6 +274,13 @@ func withPendingSlurmJobs(jobs ...*slurmclienttypes.V0044JobInfo) reconcileEnvOp
 	}
 }
 
+func withSlurmUpdateError(err error, mutateOnUpdate bool) reconcileEnvOpt {
+	return func(c *reconcileEnvConfig) {
+		c.slurmUpdateError = err
+		c.slurmMutateOnUpdate = mutateOnUpdate
+	}
+}
+
 func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEnv {
 	t.Helper()
 	var cfg reconcileEnvConfig
@@ -288,7 +307,10 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 	}
 	fakeClient := clientBuilder.Build()
 
-	mockSlurm := &utils.SlurmClient{}
+	mockSlurm := &utils.SlurmClient{
+		UpdateError:    cfg.slurmUpdateError,
+		MutateOnUpdate: cfg.slurmMutateOnUpdate,
+	}
 	if len(cfg.pendingJobs) > 0 {
 		mockSlurm.SetPendingJobs(cfg.partition, cfg.pendingJobs)
 	}
