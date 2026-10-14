@@ -224,8 +224,6 @@ var _ = Describe("Manager", func() {
 			By("verifying batch job execution and transition to COMPLETED in Slurm")
 			utils.WaitForSlurmJobCompletion(slurmNamespace, jobID, 3*time.Minute)
 
-			// The job has ended, so the slurmd livenessProbe can fail by design
-			// until the pod is deleted. Only restarts and kills count here.
 			By("verifying slurmd probes did not restart or kill the worker pod")
 			utils.VerifySlurmdNotKilledByProbes(slurmNamespace, workerPodName)
 
@@ -237,9 +235,6 @@ var _ = Describe("Manager", func() {
 		It("should execute a multi-node batch job across two dynamic worker pods "+
 			"without liveness probe failure", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
-			// The job must hold both nodes for longer than VerifySlurmdProbesStayHealthy
-			// needs: up to one probe period for the startupProbe to pass and two periods
-			// of observation. One more period and the probe timeout are the margin.
 			const jobSleepSeconds = 4*slurmjob.SlurmdProbePeriodSeconds + slurmjob.SlurmdProbeTimeoutSeconds
 
 			By("applying the WorkloadMixing template CR")
@@ -273,8 +268,6 @@ var _ = Describe("Manager", func() {
 			By("verifying multi-node batch job execution and transition to COMPLETED in Slurm")
 			utils.WaitForSlurmJobCompletion(slurmNamespace, jobID, 3*time.Minute)
 
-			// The job has ended, so the slurmd livenessProbe can fail by design
-			// until the pods are deleted. Only restarts and kills count here.
 			By("verifying slurmd probes did not restart or kill either worker pod")
 			for _, podName := range workerPodNames {
 				utils.VerifySlurmdNotKilledByProbes(slurmNamespace, podName)

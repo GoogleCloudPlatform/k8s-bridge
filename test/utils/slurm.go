@@ -862,28 +862,12 @@ func GetSlurmJobOutput(slurmNamespace, jobID string) (string, error) {
 	return RunOnLoginNodeAsUser(slurmNamespace, DefaultSlurmTestUser, cmd)
 }
 
-// VerifySlurmdNotKilledByProbes asserts that the slurmd container of podName did
-// not restart, and that the kubelet did not kill it because a startupProbe or a
-// livenessProbe failed.
-//
-// The function ignores Unhealthy events, so it is safe to call after the job
-// ends. The slurmd probe fails by design when its node has no job. After the job
-// ends, the livenessProbe can fail until the pod is deleted. The kubelet kills
-// the container only when the failures reach the livenessProbe failure threshold.
 func VerifySlurmdNotKilledByProbes(slurmNamespace, podName string) {
 	ginkgo.GinkgoHelper()
 	ginkgo.By(fmt.Sprintf("verifying slurmd probes did not restart or kill the container on pod %s", podName))
 	expectSlurmdNotKilledByProbes(gomega.Default, readSlurmdProbeEvidence(slurmNamespace, podName))
 }
 
-// VerifySlurmdProbesStayHealthy waits until the slurmd startupProbe passes on
-// every pod in podNames. Then, for two probe periods, it checks that no slurmd
-// container restarts or reports a failed livenessProbe.
-//
-// The slurmd probe fails by design when its node has no job. So each check also
-// requires Slurm job jobID to be RUNNING after the probe events are read. The
-// job must hold the nodes for about three probe periods after it starts: up to
-// one period for the startupProbe to pass and two periods of observation.
 func VerifySlurmdProbesStayHealthy(slurmNamespace, jobID string, probePeriod time.Duration, podNames ...string) {
 	ginkgo.GinkgoHelper()
 
@@ -909,10 +893,7 @@ func VerifySlurmdProbesStayHealthy(slurmNamespace, jobID string, probePeriod tim
 		for _, podName := range podNames {
 			evidence = append(evidence, readSlurmdProbeEvidence(slurmNamespace, podName))
 		}
-		// Read the job state after the probe events. The livenessProbe starts
-		// only after the startupProbe passes, which needs the job on the node.
-		// So if the job is still RUNNING, it held the nodes when the kubelet
-		// recorded each event, and a failed livenessProbe is a real failure.
+
 		js, err := QuerySlurmJobState(slurmNamespace, jobID)
 		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Slurm job state for job "+jobID)
 		g.Expect(js.JobState).To(gomega.Equal("RUNNING"), fmt.Sprintf(
