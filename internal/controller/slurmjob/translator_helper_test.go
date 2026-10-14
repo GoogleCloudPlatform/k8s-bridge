@@ -314,11 +314,12 @@ func (b *testJobBuilder) withNodeCountSet(set bool) *testJobBuilder {
 	return b
 }
 
+// withInfiniteNodeCount sets NodeCount to the value that slurmrestd sends for an infinite node count.
 func (b *testJobBuilder) withInfiniteNodeCount() *testJobBuilder {
-	if b.job.NodeCount != nil {
-		b.job.NodeCount.Infinite = ptr.To(true)
-	} else {
-		b.job.NodeCount = &slurmapi.V0044Uint32NoValStruct{Set: ptr.To(true), Infinite: ptr.To(true)}
+	b.job.NodeCount = &slurmapi.V0044Uint32NoValStruct{
+		Set:      ptr.To(false),
+		Infinite: ptr.To(true),
+		Number:   ptr.To(int32(0)),
 	}
 	return b
 }

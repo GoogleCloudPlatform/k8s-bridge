@@ -129,6 +129,14 @@ func TestTranslateSlurmJobToJobSet_Validation(t *testing.T) {
 			wantErr: "infinite NodeCount is not supported",
 		},
 		{
+			name: "Failure - Infinite NodeCount with Set",
+			job: newTestJob().
+				withInfiniteNodeCount().
+				withNodeCountSet(true).
+				build(),
+			wantErr: "infinite NodeCount is not supported",
+		},
+		{
 			name: "Failure - Zero Job ID",
 			job: newTestJob().
 				withJobID(0).

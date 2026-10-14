@@ -454,12 +454,14 @@ func SubmitBatchJob(slurmNamespace, username string, args ...string) string {
 	return jobID
 }
 
-// ReleaseSlurmJob releases an explicit hold on a Slurm job as DefaultSlurmTestUser.
+// Slurm job comment markers. job_submit.lua adds k8sBridgeAutoHoldMarker when it holds a job.
+// The k8s-bridge controller replaces the marker with k8sBridgeUnheldComment when it releases the hold.
 const (
 	k8sBridgeAutoHoldMarker = "k8s-bridge-auto-hold"
 	k8sBridgeUnheldComment  = "Unheld by k8s-bridge"
 )
 
+// ReleaseSlurmJob releases an explicit hold on a Slurm job as DefaultSlurmTestUser.
 // TODO: Restore checking for exit code == 0 on `scontrol release` once SchedMD fixes
 // the exit code 1 bug in update_job / job_limits_check when the dynamic partition
 // has 0 registered nodes (currently ESLURM_TOO_MANY_REQUESTED_CPUS is an unimplemented
