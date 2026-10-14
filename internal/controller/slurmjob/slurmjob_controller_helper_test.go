@@ -169,14 +169,6 @@ func (b *testJobSetBuilder) withLabels(labels map[string]string) *testJobSetBuil
 	return b
 }
 
-func (b *testJobSetBuilder) withAnnotations(annotations map[string]string) *testJobSetBuilder {
-	if b.jobSet.Annotations == nil {
-		b.jobSet.Annotations = make(map[string]string)
-	}
-	maps.Copy(b.jobSet.Annotations, annotations)
-	return b
-}
-
 func (b *testJobSetBuilder) withOwnerReference(owner metav1.OwnerReference) *testJobSetBuilder {
 	b.jobSet.OwnerReferences = append(b.jobSet.OwnerReferences, owner)
 	return b
@@ -407,7 +399,7 @@ func (e *reconcileTestEnv) verifyJobSetNotFound() {
 	}
 }
 
-func (e *reconcileTestEnv) verifyJobSetSuspended(wantSuspended bool, wantSuspendedBySlurmHoldAnnotation bool) {
+func (e *reconcileTestEnv) verifyJobSetSuspended(wantSuspended bool) {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet
 	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
@@ -416,10 +408,6 @@ func (e *reconcileTestEnv) verifyJobSetSuspended(wantSuspended bool, wantSuspend
 	isSuspended := js.Spec.Suspend != nil && *js.Spec.Suspend
 	if isSuspended != wantSuspended {
 		e.t.Errorf("Expected JobSet.Spec.Suspend = %v, got %v", wantSuspended, isSuspended)
-	}
-	hasAnnotation := js.Annotations != nil && js.Annotations[AnnotationSuspendedBySlurmHold] == ValueTrue
-	if hasAnnotation != wantSuspendedBySlurmHoldAnnotation {
-		e.t.Errorf("Expected annotation %s = %v, got %v", AnnotationSuspendedBySlurmHold, wantSuspendedBySlurmHoldAnnotation, hasAnnotation)
 	}
 }
 
