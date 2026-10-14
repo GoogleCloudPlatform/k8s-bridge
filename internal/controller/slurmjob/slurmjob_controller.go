@@ -243,10 +243,10 @@ func parseRequestName(name string) (string, string, error) {
 func (r *SlurmJobReconciler) verifyWMName(ctx context.Context, namespace, wmName, jobID string) ReconciliationStatus {
 	logger := log.FromContext(ctx)
 	if wmName == "" {
-		logger.Info("New Slurm job appeared", "jobID", jobID, "reason", "WorkloadMixing name is empty, skipping reconciliation")
+		logger.Info("Skipping Slurm job reconciliation", "jobID", jobID, "reason", "WorkloadMixing name is empty")
 		return ReconciliationDone
 	}
-	logger.Info("New Slurm job appeared", "jobID", jobID, "workloadMixing", fmt.Sprintf("%s/%s", namespace, wmName))
+	logger.V(1).Info("Reconciling Slurm job", "jobID", jobID, "workloadMixing", types.NamespacedName{Namespace: namespace, Name: wmName})
 	return ReconciliationContinue
 }
 
@@ -566,12 +566,19 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 		return ctrl.Result{}, nil
 	}
 
-	metrics.RecordJobDiscovered(wm.Name, partition)
-
 	done, err := r.newJobCheckMultiPartition(ctx, wm, slurmClient, jobInfo, jobID, partition)
 	if done || err != nil {
 		return ctrl.Result{}, err
 	}
+
+	if isJobExplicitlyHeld(jobInfo) {
+		logger.V(1).Info("Job is explicitly held by user or admin, deferring reconciliation", "jobID", jobID)
+		return ctrl.Result{}, nil
+	}
+
+	logger.Info("New Slurm job appeared", "jobID", jobID, "workloadMixing", types.NamespacedName{Namespace: wm.Namespace, Name: wm.Name})
+
+	metrics.RecordJobDiscovered(wm.Name, partition)
 
 	obj, done, err := r.translateSlurmJobToJobset(ctx, wm, slurmClient, jobInfo, jobID, partition)
 	if done || err != nil {
