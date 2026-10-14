@@ -224,10 +224,6 @@ func SetupSlinkySlurm() {
 	setupSlurmLoginNode()
 }
 
-// SetupStaticSlurmNode deploys the static NodeSet from slurm_static_nodeset.yaml and waits until its
-// node is IDLE in its own partition with its pinned CPU count. Call it after SetupSlinkySlurm and before
-// any job is submitted: slurmctld caches the CPU count of the largest node in the cluster the first time
-// it estimates node_count for a pending job in a partition without nodes.
 func SetupStaticSlurmNode() {
 	ginkgo.GinkgoHelper()
 
@@ -311,17 +307,6 @@ const jobSetPodSelector = "jobset.sigs.k8s.io/jobset-name"
 
 const resetDeleteTimeout = "--timeout=2m"
 
-// resetPodGracePeriod bounds how long a leftover JobSet pod may take to shut
-// down during reset. Pods are deliberately NOT force-deleted: --force removes
-// the Pod object immediately while the kubelet is still killing the containers,
-// and a slurmd that was still starting up keeps running for a few more seconds
-// -- long enough to register its dynamic node AFTER slurmResetScript has
-// already deleted the dynamic nodes. That stale node outlives the reset and
-// poisons the next spec (Slurm then re-holds the next job with BadConstraints).
-// A graceful delete with --wait only returns once the kubelet has confirmed
-// that every container is dead and removed the Pod object. The period is short
-// because the reset does not rely on the slurmd preStop hook (slurmResetScript
-// removes the nodes itself); it only needs the containers gone.
 const resetPodGracePeriod = "--grace-period=5"
 
 const slurmResetScript = `set -eu
@@ -469,19 +454,12 @@ func SubmitBatchJob(slurmNamespace, username string, args ...string) string {
 	return jobID
 }
 
-// Comments that show a held job on a workload-mixing partition was handed over to k8s-bridge:
-// job_submit.lua adds k8sBridgeAutoHoldMarker when it holds the job for the bridge, and the bridge
-// replaces it with k8sBridgeUnheldComment when it creates the JobSet and releases the hold.
+// ReleaseSlurmJob releases an explicit hold on a Slurm job as DefaultSlurmTestUser.
 const (
 	k8sBridgeAutoHoldMarker = "k8s-bridge-auto-hold"
 	k8sBridgeUnheldComment  = "Unheld by k8s-bridge"
 )
 
-// ReleaseSlurmJob releases an explicit hold on a Slurm job as DefaultSlurmTestUser and waits until the
-// job is handed over to k8s-bridge. job_submit.lua turns the user's release into a k8s-bridge auto-hold,
-// and on its next poll the bridge creates the JobSet and releases the job, replacing the auto-hold marker
-// in the comment. The marker can therefore be gone before the first check, so the bridge's unhold comment
-// is accepted as well.
 // TODO: Restore checking for exit code == 0 on `scontrol release` once SchedMD fixes
 // the exit code 1 bug in update_job / job_limits_check when the dynamic partition
 // has 0 registered nodes (currently ESLURM_TOO_MANY_REQUESTED_CPUS is an unimplemented

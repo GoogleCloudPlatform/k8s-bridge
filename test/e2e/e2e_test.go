@@ -116,11 +116,6 @@ var _ = Describe("Manager", func() {
 			By("applying the WorkloadMixing template CR")
 			utils.ApplyManifestWithCleanup(configPath)
 
-			// slurmrestd reports node_count for a PENDING job as an estimate rather than the requested
-			// node count. While the k8s-bridge partition has no nodes, slurmctld estimates it from the
-			// largest node in the cluster, which is the suite's 1-CPU static node (see
-			// slurm_static_nodeset.yaml): "-N 2 -n 4" is reported as max(ceil(4/1), 2) = 4 nodes, which
-			// used to produce a JobSet with 4 replicas of which Slurm used only 2.
 			By("submitting a 2-node batch job with 4 tasks")
 			jobID := utils.NewBatchJobBuilder(slurmNamespace).
 				WithPartition(defaultSlurmPartition).

@@ -608,18 +608,8 @@ type gresRequest struct {
 
 // resolveReplicas returns the number of slurmd pods (dynamic Slurm nodes) to create for the job.
 //
-// It uses the node count from the job's requested TRES (tres_req_str, e.g. "cpu=32,node=2,billing=32"),
-// which slurmctld derives from the job's minimum node count (-N/--nodes, raised to satisfy
-// --ntasks-per-node).
-//
-// node_count is not used when tres_req_str carries a node count: for a PENDING job slurmctld fills it
-// with an estimate computed at query time from the CPU count of the largest node in the job's partition
-// or, while the partition has no nodes (always the case for a k8s-bridge partition before the slurmd pods
-// register), of the largest node in the whole cluster. For example, "-N 2 -n 32" is reported as 4 nodes
-// when the largest node in the cluster has 8 CPUs, and as 2 nodes once a 32-CPU dynamic node registers.
-// node_count is only used as a fallback when tres_req_str does not contain a valid node count.
-//
-// Reference: _pack_node_cnt() in src/slurmctld/job_mgr.c.
+// Reference: _pack_node_cnt() in src/slurmctld/job_mgr.c
+// https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/slurmctld/job_mgr.c#L11133-L11198
 func resolveReplicas(job *slurmclienttypes.V0044JobInfo) (int32, error) {
 	if nodes, ok := requestedNodeCount(job); ok {
 		return nodes, nil
