@@ -35,6 +35,13 @@ const (
 	DefaultSlurmctldContainer = "slurmctld"
 	DefaultSlurmPartition     = "workloadmixing-partition"
 
+	// StaticSlurmNodeName, StaticSlurmPartition and StaticSlurmNodeCPUs describe the node of the
+	// static NodeSet (slurm-worker-static) in test/e2e/testdata/slurm_static_nodeset.yaml.
+	StaticSlurmNodeName        = "static-0"
+	StaticSlurmPartition       = "static"
+	StaticSlurmNodeCPUs        = 1
+	staticSlurmNodeSetManifest = "test/e2e/testdata/slurm_static_nodeset.yaml"
+
 	// LINT.IfChange(slurm_version_pair)
 	// DefaultSlinkyOperatorVersion and DefaultSlurmImageTag define the pinned,
 	// immutable Slinky operator + Slurm 26.05 daemon version pair used across E2E tests.
@@ -44,6 +51,7 @@ const (
 	//   test/e2e/testdata/slurm_operator.yaml,
 	//   test/e2e/testdata/slurm_cluster.yaml:slurm_version_pair,
 	//   test/e2e/testdata/slurm_login.yaml:slurm_version_pair,
+	//   test/e2e/testdata/slurm_static_nodeset.yaml:slurm_version_pair,
 	//   test/e2e/testdata/workloadmixing_template.yaml:slurm_version_pair,
 	//   test/e2e/testdata/workloadmixing_gpu.yaml:slurm_version_pair
 	// )
@@ -216,6 +224,35 @@ func SetupSlinkySlurm() {
 	setupSlurmLoginNode()
 }
 
+func SetupStaticSlurmNode() {
+	ginkgo.GinkgoHelper()
+
+	ginkgo.By("deploying the static Slurm NodeSet")
+	_, err := Run(exec.Command("kubectl", "apply", "--server-side", "--force-conflicts", "-f", staticSlurmNodeSetManifest))
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to deploy the static Slurm NodeSet")
+
+	WaitForSlurmNodeState(DefaultSlurmNamespace, StaticSlurmNodeName, "IDLE", 5*time.Minute)
+
+	ginkgo.By(fmt.Sprintf("verifying Slurm node %s has %d CPU(s) in partition %s",
+		StaticSlurmNodeName, StaticSlurmNodeCPUs, StaticSlurmPartition))
+	output, err := RunOnLoginNodeAsUser(DefaultSlurmNamespace, DefaultSlurmTestUser,
+		"scontrol show node "+StaticSlurmNodeName)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Slurm node "+StaticSlurmNodeName)
+	gomega.Expect(output).To(gomega.MatchRegexp(fmt.Sprintf(`\bCPUTot=%d\b`, StaticSlurmNodeCPUs)))
+	gomega.Expect(output).To(gomega.MatchRegexp(`\bPartitions=` + StaticSlurmPartition + `\b`))
+}
+
+// TeardownStaticSlurmNode deletes the static NodeSet deployed by SetupStaticSlurmNode.
+func TeardownStaticSlurmNode() {
+	ginkgo.GinkgoHelper()
+
+	ginkgo.By("deleting the static Slurm NodeSet")
+	cmd := exec.Command("kubectl", "delete", "-f", staticSlurmNodeSetManifest, "--ignore-not-found", "--wait=true")
+	if _, err := Run(cmd); err != nil {
+		WarnError(err)
+	}
+}
+
 // TeardownSlinkySlurm deletes Slurm resources and namespaces.
 func TeardownSlinkySlurm() {
 	ginkgo.GinkgoHelper()
@@ -270,17 +307,6 @@ const jobSetPodSelector = "jobset.sigs.k8s.io/jobset-name"
 
 const resetDeleteTimeout = "--timeout=2m"
 
-// resetPodGracePeriod bounds how long a leftover JobSet pod may take to shut
-// down during reset. Pods are deliberately NOT force-deleted: --force removes
-// the Pod object immediately while the kubelet is still killing the containers,
-// and a slurmd that was still starting up keeps running for a few more seconds
-// -- long enough to register its dynamic node AFTER slurmResetScript has
-// already deleted the dynamic nodes. That stale node outlives the reset and
-// poisons the next spec (Slurm then re-holds the next job with BadConstraints).
-// A graceful delete with --wait only returns once the kubelet has confirmed
-// that every container is dead and removed the Pod object. The period is short
-// because the reset does not rely on the slurmd preStop hook (slurmResetScript
-// removes the nodes itself); it only needs the containers gone.
 const resetPodGracePeriod = "--grace-period=5"
 
 const slurmResetScript = `set -eu
@@ -428,6 +454,13 @@ func SubmitBatchJob(slurmNamespace, username string, args ...string) string {
 	return jobID
 }
 
+// Slurm job comment markers. job_submit.lua adds k8sBridgeAutoHoldMarker when it holds a job.
+// The k8s-bridge controller replaces the marker with k8sBridgeUnheldComment when it releases the hold.
+const (
+	k8sBridgeAutoHoldMarker = "k8s-bridge-auto-hold"
+	k8sBridgeUnheldComment  = "Unheld by k8s-bridge"
+)
+
 // ReleaseSlurmJob releases an explicit hold on a Slurm job as DefaultSlurmTestUser.
 // TODO: Restore checking for exit code == 0 on `scontrol release` once SchedMD fixes
 // the exit code 1 bug in update_job / job_limits_check when the dynamic partition
@@ -438,10 +471,14 @@ func SubmitBatchJob(slurmNamespace, username string, args ...string) string {
 func ReleaseSlurmJob(slurmNamespace, jobID string) {
 	ginkgo.GinkgoHelper()
 	_, _ = RunOnLoginNodeAsUser(slurmNamespace, DefaultSlurmTestUser, "scontrol release "+jobID)
-	NewSlurmJobVerifier(slurmNamespace, jobID).
-		WithComment("k8s-bridge-auto-hold").
-		WithTimeout(30 * time.Second).
-		Verify()
+	gomega.Eventually(func(g gomega.Gomega) {
+		js, err := QuerySlurmJobState(slurmNamespace, jobID)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get Slurm job state")
+		g.Expect(js.Comment).To(gomega.Or(
+			gomega.ContainSubstring(k8sBridgeAutoHoldMarker),
+			gomega.ContainSubstring(k8sBridgeUnheldComment),
+		), "Slurm job %s was not handed over to k8s-bridge after release", jobID)
+	}, 30*time.Second, time.Second).Should(gomega.Succeed())
 }
 
 // SubmitBatchJobExpectError submits an sbatch command as the given user and

@@ -111,6 +111,60 @@ var _ = Describe("Manager", func() {
 			verifyJobSetCreatedWithCustomTemplate(jobSetName, jobID, "e2e_custom-template.job")
 		})
 
+		It("should size the JobSet from the requested node count when a smaller node is in a static partition", func() {
+			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
+
+			By("applying the WorkloadMixing template CR")
+			utils.ApplyManifestWithCleanup(configPath)
+
+			By("submitting a 2-node batch job with 4 tasks")
+			jobID := utils.NewBatchJobBuilder(slurmNamespace).
+				WithPartition(defaultSlurmPartition).
+				WithNodes(2).
+				WithWrap("srun hostname").
+				WithArgs("--ntasks=4").
+				Submit()
+			jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+			logSlurmJobNodeFields(jobID)
+
+			By("verifying the JobSet has one replica per requested node, each sized for 2 tasks")
+			// CPU: 1 CPU per task * 2 tasks per node; memory: 2048MB fallback per CPU.
+			verifyJobSetSizing(jobSetName, 2, "2", "4096Mi")
+
+			By("verifying Slurm ran the job on both slurmd pods")
+			utils.NewSlurmJobVerifier(slurmNamespace, jobID).
+				WithState("COMPLETED").
+				WithNodeList(fmt.Sprintf("%s-slurmd-0-0,%s-slurmd-1-0", jobSetName, jobSetName)).
+				WithTimeout(5 * time.Minute).
+				Verify()
+		})
+
+		It("should size the JobSet from the requested node count when --cpus-per-task inflates node_count", func() {
+			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
+
+			By("applying the WorkloadMixing template CR")
+			utils.ApplyManifestWithCleanup(configPath)
+
+			// For --cpus-per-task > 1, slurmctld estimates node_count of a PENDING job in a partition
+			// without nodes as ntasks / max(largest node CPUs / cpus-per-task, 1). With the suite's
+			// 1-CPU static node that is one node per task, i.e. 4 nodes for "-N 2 -n 4 -c 2", which
+			// used to produce a JobSet with 4 replicas.
+			By("submitting a 2-node batch job with 4 tasks of 2 CPUs each")
+			jobID := utils.NewBatchJobBuilder(slurmNamespace).
+				WithPartition(defaultSlurmPartition).
+				WithNodes(2).
+				WithCpusPerTask(2).
+				WithWrap("sleep 300").
+				WithArgs("--ntasks=4").
+				Submit()
+			jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+			logSlurmJobNodeFields(jobID)
+
+			By("verifying the JobSet has one replica per requested node, each sized for 2 tasks")
+			// CPU: 2 CPUs per task * 2 tasks per node; memory: 2048MB fallback per CPU.
+			verifyJobSetSizing(jobSetName, 2, "4", "8192Mi")
+		})
+
 		It("should cancel Slurm job if translation fails due to unmapped GRES", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
 

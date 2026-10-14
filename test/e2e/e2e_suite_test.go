@@ -80,6 +80,9 @@ var _ = BeforeSuite(func() {
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
 	utils.SetupSlinkySlurm()
+	// A small static node in its own partition, like the Slinky NodeSet partitions next to the
+	// k8s-bridge partitions in real clusters. It must register before any spec submits a job.
+	utils.SetupStaticSlurmNode()
 
 	By("deploying Kueue resources (ResourceFlavor, ClusterQueue, LocalQueue)")
 	cmd = exec.Command("kubectl", "apply", "-f", "test/e2e/testdata/kueue_resources.yaml")
@@ -98,6 +101,7 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
+	utils.TeardownStaticSlurmNode()
 	utils.TeardownSlinkySlurm()
 
 	By("deleting Kueue resources")

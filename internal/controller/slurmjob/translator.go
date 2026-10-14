@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net"
 	"regexp"
 	"strconv"
@@ -47,6 +48,7 @@ const (
 	LabelKueueQueue                = "kueue.x-k8s.io/queue-name"
 	LabelKueuePriorityClass        = "kueue.x-k8s.io/priority-class"
 	GRESGPU                        = "gpu"
+	tresNode                       = "node"
 	ContainerSlurmd                = "slurmd"
 	DefaultSlurmdImage             = "placeholder-image"
 	defaultMemoryPerCPUMB          = 2048
@@ -155,16 +157,10 @@ func (t *JobSetTranslator) Translate(
 		return nil, nil // Skip
 	}
 
-	// 2. Resolve Replicas (NodeCount)
-	if job.NodeCount == nil || !ptr.Deref(job.NodeCount.Set, false) {
-		return nil, errors.New("job NodeCount is unset")
-	}
-	replicas := ptr.Deref(job.NodeCount.Number, 0)
-	if replicas <= 0 {
-		return nil, fmt.Errorf("invalid NodeCount: %d", replicas)
-	}
-	if ptr.Deref(job.NodeCount.Infinite, false) {
-		return nil, errors.New("infinite NodeCount is not supported")
+	// 2. Resolve Replicas (requested node count)
+	replicas, err := resolveReplicas(job)
+	if err != nil {
+		return nil, err
 	}
 
 	// 3. Resource Calculation
@@ -608,6 +604,42 @@ type gresRequest struct {
 	name         string
 	resourceType string
 	count        int64
+}
+
+// resolveReplicas returns the number of slurmd pods (dynamic Slurm nodes) to create for the job.
+//
+// Reference: _pack_node_cnt() in src/slurmctld/job_mgr.c
+// https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/slurmctld/job_mgr.c#L11133-L11198
+func resolveReplicas(job *slurmclienttypes.V0044JobInfo) (int32, error) {
+	if nodes, ok := requestedNodeCount(job); ok {
+		return nodes, nil
+	}
+
+	log.Log.WithName("translator").Info("Could not determine requested node count from TresReqStr, falling back to NodeCount",
+		"jobID", ptr.Deref(job.JobId, 0), "tresReqStr", ptr.Deref(job.TresReqStr, ""))
+	// Check Infinite before Set. slurmrestd sends an infinite value with set=false and number=0.
+	// Reference: DUMP_FUNC(UINT32_NO_VAL) in src/plugins/data_parser/v0.0.44/parsers.c
+	// https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/plugins/data_parser/v0.0.44/parsers.c#L3106-L3132
+	if job.NodeCount != nil && ptr.Deref(job.NodeCount.Infinite, false) {
+		return 0, errors.New("infinite NodeCount is not supported")
+	}
+	if job.NodeCount == nil || !ptr.Deref(job.NodeCount.Set, false) {
+		return 0, errors.New("job NodeCount is unset")
+	}
+	replicas := ptr.Deref(job.NodeCount.Number, 0)
+	if replicas <= 0 {
+		return 0, fmt.Errorf("invalid NodeCount: %d", replicas)
+	}
+	return replicas, nil
+}
+
+// requestedNodeCount returns the node count from the job's tres_req_str, if present and valid.
+func requestedNodeCount(job *slurmclienttypes.V0044JobInfo) (int32, bool) {
+	nodes, ok := parseTresString(ptr.Deref(job.TresReqStr, ""))[tresNode]
+	if !ok || nodes <= 0 || nodes > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(nodes), true
 }
 
 func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int64 {

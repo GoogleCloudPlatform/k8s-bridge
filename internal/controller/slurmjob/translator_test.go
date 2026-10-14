@@ -129,6 +129,14 @@ func TestTranslateSlurmJobToJobSet_Validation(t *testing.T) {
 			wantErr: "infinite NodeCount is not supported",
 		},
 		{
+			name: "Failure - Infinite NodeCount with Set",
+			job: newTestJob().
+				withInfiniteNodeCount().
+				withNodeCountSet(true).
+				build(),
+			wantErr: "infinite NodeCount is not supported",
+		},
+		{
 			name: "Failure - Zero Job ID",
 			job: newTestJob().
 				withJobID(0).
@@ -162,6 +170,119 @@ func TestTranslateSlurmJobToJobSet_Validation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			obj, err := translator.Translate(tt.job, wmSpec, controller)
 			verifyTranslationError(t, obj, err, tt.wantErr)
+		})
+	}
+}
+
+// TestTranslateSlurmJobToJobSet_Replicas verifies that replicas follow the requested node count
+// (tres_req_str) rather than node_count, which slurmctld estimates for PENDING jobs.
+// The NodeCount, Tasks, TasksPerNode, CpusPerTask and TresReqStr values below are what slurmrestd
+// (Slurm 26.05) reported for pending jobs in an empty k8s-bridge partition while the largest node
+// in the cluster had 8 CPUs.
+func TestTranslateSlurmJobToJobSet_Replicas(t *testing.T) {
+	wmSpec := getTestWMSpec()
+	translator := NewJobSetTranslator()
+	controller := getTestController()
+
+	// Jobs without task information get 1 CPU per pod and the 2048MB-per-CPU memory fallback.
+	const singleTaskCPU, singleTaskMem = "1", "2048Mi"
+
+	tests := []struct {
+		name         string
+		job          *slurmclienttypes.V0044JobInfo
+		wantReplicas int32
+		wantCPU      string
+		wantMem      string
+	}{
+		{
+			// Regression: replicas used to be 4 (8 CPUs each) while Slurm ran the job on 2 nodes.
+			name: "Success - sbatch -N 2 -n 32 ignores estimated NodeCount 4",
+			job: newTestJob().withNodes(4).withTasks(32).withCpusPerTask(1).
+				withTresReqStr("cpu=32,node=2,billing=32").build(),
+			wantReplicas: 2,
+			wantCPU:      "16",      // CpusPerTask (1) * TasksPerNode (ceil(32/2) = 16)
+			wantMem:      "32768Mi", // fallback 2048MB * 16 CPUs
+		},
+		{
+			name: "Success - sbatch -N 2 -n 32 -c 2 ignores estimated NodeCount 8",
+			job: newTestJob().withNodes(8).withTasks(32).withCpusPerTask(2).
+				withTresReqStr("cpu=64,node=2,billing=64").build(),
+			wantReplicas: 2,
+			wantCPU:      "32",      // CpusPerTask (2) * TasksPerNode (ceil(32/2) = 16)
+			wantMem:      "65536Mi", // fallback 2048MB * 32 CPUs
+		},
+		{
+			name: "Success - sbatch -N 2-4 -n 32 uses minimum node count",
+			job: newTestJob().withNodes(4).withTasks(32).withCpusPerTask(1).
+				withTresReqStr("cpu=32,node=2,billing=32").build(),
+			wantReplicas: 2,
+			wantCPU:      "16",
+			wantMem:      "32768Mi",
+		},
+		{
+			name: "Success - sbatch -n 32 --ntasks-per-node=8 uses node count derived by Slurm",
+			job: newTestJob().withNodes(4).withTasks(32).withTasksPerNode(8).withCpusPerTask(1).
+				withTresReqStr("cpu=32,node=4,billing=32").build(),
+			wantReplicas: 4,
+			wantCPU:      "8",       // CpusPerTask (1) * TasksPerNode (8)
+			wantMem:      "16384Mi", // fallback 2048MB * 8 CPUs
+		},
+		{
+			name: "Success - sbatch -N 3 --ntasks-per-node=4",
+			job: newTestJob().withNodes(3).withTasks(12).withTasksPerNode(4).withCpusPerTask(1).
+				withTresReqStr("cpu=12,node=3,billing=12").build(),
+			wantReplicas: 3,
+			wantCPU:      "4",
+			wantMem:      "8192Mi",
+		},
+		{
+			name: "Success - sbatch -n 32 without -N uses a single node",
+			job: newTestJob().withNodes(4).withTasks(32).withCpusPerTask(1).
+				withTresReqStr("cpu=32,node=1,billing=32").build(),
+			wantReplicas: 1,
+			wantCPU:      "32",
+			wantMem:      "65536Mi",
+		},
+		{
+			name: "Success - Requested node count does not require NodeCount",
+			job: newTestJob().withUnsetNodeCount().withTasks(4).
+				withTresReqStr("cpu=4,node=2,billing=4").build(),
+			wantReplicas: 2,
+			wantCPU:      "2",
+			wantMem:      "4096Mi",
+		},
+		{
+			name:         "Success - Fallback to NodeCount when TresReqStr is unset",
+			job:          newTestJob().withNodes(3).build(),
+			wantReplicas: 3,
+			wantCPU:      singleTaskCPU,
+			wantMem:      singleTaskMem,
+		},
+		{
+			name:         "Success - Fallback to NodeCount when TresReqStr has no node count",
+			job:          newTestJob().withNodes(3).withTresReqStr("cpu=1,billing=1").build(),
+			wantReplicas: 3,
+			wantCPU:      singleTaskCPU,
+			wantMem:      singleTaskMem,
+		},
+		{
+			name:         "Success - Fallback to NodeCount when TresReqStr node count is invalid",
+			job:          newTestJob().withNodes(3).withTresReqStr("cpu=1,node=0,billing=1").build(),
+			wantReplicas: 3,
+			wantCPU:      singleTaskCPU,
+			wantMem:      singleTaskMem,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj, err := translator.Translate(tt.job, wmSpec, controller)
+			verifyJobSet(t, obj, err, "123", tt.wantReplicas,
+				withRequests(corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(tt.wantCPU),
+					corev1.ResourceMemory: resource.MustParse(tt.wantMem),
+				}),
+			)
 		})
 	}
 }
