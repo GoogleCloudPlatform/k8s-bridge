@@ -17,7 +17,6 @@ limitations under the License.
 package clientmap
 
 import (
-	"context"
 	"reflect"
 	"sync"
 	"testing"
@@ -167,7 +166,7 @@ func TestClientMap_add(t *testing.T) {
 				lock:    sync.RWMutex{},
 				clients: tt.fields.clients,
 			}
-			if got := c.add(context.TODO(), tt.args.name, tt.args.client, time.Time{}); got != tt.want {
+			if got := c.add(t.Context(), tt.args.name, tt.args.client, time.Time{}); got != tt.want {
 				t.Errorf("ClientMap.add() = %v, want %v", got, tt.want)
 			}
 		})
@@ -227,7 +226,7 @@ func TestClientMap_Add(t *testing.T) {
 				lock:    sync.RWMutex{},
 				clients: tt.fields.clients,
 			}
-			if got := c.Add(context.TODO(), tt.args.name, tt.args.client); got != tt.want {
+			if got := c.Add(t.Context(), tt.args.name, tt.args.client); got != tt.want {
 				t.Errorf("ClientMap.Add() = %v, want %v", got, tt.want)
 			}
 
