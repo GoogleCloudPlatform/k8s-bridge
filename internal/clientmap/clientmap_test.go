@@ -17,6 +17,7 @@ limitations under the License.
 package clientmap
 
 import (
+	"maps"
 	"reflect"
 	"sync"
 	"testing"
@@ -104,7 +105,7 @@ func TestClientMap_Get(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ClientMap{
 				lock:    sync.RWMutex{},
-				clients: tt.fields.clients,
+				clients: maps.Clone(tt.fields.clients),
 			}
 			if got := c.Get(tt.args.name); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("ClientMap.Get() = %v, want %v", got, tt.want)
@@ -164,7 +165,7 @@ func TestClientMap_add(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ClientMap{
 				lock:    sync.RWMutex{},
-				clients: tt.fields.clients,
+				clients: maps.Clone(tt.fields.clients),
 			}
 			if got := c.add(t.Context(), tt.args.name, tt.args.client, time.Time{}); got != tt.want {
 				t.Errorf("ClientMap.add() = %v, want %v", got, tt.want)
@@ -224,7 +225,7 @@ func TestClientMap_Add(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ClientMap{
 				lock:    sync.RWMutex{},
-				clients: tt.fields.clients,
+				clients: maps.Clone(tt.fields.clients),
 			}
 			if got := c.Add(t.Context(), tt.args.name, tt.args.client); got != tt.want {
 				t.Errorf("ClientMap.Add() = %v, want %v", got, tt.want)
@@ -287,7 +288,7 @@ func TestClientMap_Has(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ClientMap{
 				lock:    sync.RWMutex{},
-				clients: tt.fields.clients,
+				clients: maps.Clone(tt.fields.clients),
 			}
 			if got := c.Has(tt.args.names...); got != tt.want {
 				t.Errorf("ClientMap.Has() = %v, want %v", got, tt.want)
@@ -344,7 +345,7 @@ func TestClientMap_Remove(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ClientMap{
 				lock:    sync.RWMutex{},
-				clients: tt.fields.clients,
+				clients: maps.Clone(tt.fields.clients),
 			}
 			if got := c.Remove(tt.args.name); got != tt.want {
 				t.Errorf("ClientMap.Remove() = %v, want %v", got, tt.want)
@@ -397,7 +398,7 @@ func TestClientMap_GetExpiration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ClientMap{
 				lock:    sync.RWMutex{},
-				clients: tt.fields.clients,
+				clients: maps.Clone(tt.fields.clients),
 			}
 			if got := c.GetExpiration(tt.args.name); !got.Equal(tt.want) {
 				t.Errorf("ClientMap.GetExpiration() = %v, want %v", got, tt.want)
@@ -453,7 +454,7 @@ func TestClientMap_GetClientAndExpiration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &ClientMap{
 				lock:    sync.RWMutex{},
-				clients: tt.fields.clients,
+				clients: maps.Clone(tt.fields.clients),
 			}
 			gotClient, gotExpiry := c.GetClientAndExpiration(tt.args.name)
 			if !reflect.DeepEqual(gotClient, tt.wantClient) {
