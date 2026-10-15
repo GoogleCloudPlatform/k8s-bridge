@@ -906,102 +906,121 @@ func GetSlurmJobOutput(slurmNamespace, jobID string) (string, error) {
 	return RunOnLoginNodeAsUser(slurmNamespace, DefaultSlurmTestUser, cmd)
 }
 
-func expectNoSlurmdProbeKillEvents(g gomega.Gomega, slurmNamespace, podName string) {
+// VerifySlurmdNotKilledByProbes asserts that the slurmd container of podName did
+// not restart and that no failed probe killed it. Call it after the Slurm job
+// ends. If the pod is already deleted, it checks only the pod events.
+func VerifySlurmdNotKilledByProbes(slurmNamespace, podName string) {
 	ginkgo.GinkgoHelper()
-
-	eventsCmd := exec.Command("kubectl", "get", "events", "-n", slurmNamespace,
-		"--field-selector", fmt.Sprintf("involvedObject.name=%s,reason=Killing", podName),
-		"-o", "jsonpath={.items[*].message}")
-	eventsOut, err := Run(eventsCmd)
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Killing events for pod "+podName)
-	g.Expect(eventsOut).NotTo(gomega.ContainSubstring("failed liveness probe"),
-		fmt.Sprintf("Pod %s slurmd container failed liveness probe: %s", podName, eventsOut))
-	g.Expect(eventsOut).NotTo(gomega.ContainSubstring("failed startup probe"),
-		fmt.Sprintf("Pod %s slurmd container failed startup probe: %s", podName, eventsOut))
+	ginkgo.By(fmt.Sprintf("verifying slurmd probes did not restart or kill the container on pod %s", podName))
+	evidence := readSlurmdProbeEvidence(gomega.Default, slurmNamespace, podName)
+	if evidence.restartCount != "" {
+		expectNoSlurmdRestart(gomega.Default, evidence)
+	}
+	expectSlurmdNotKilledByProbes(gomega.Default, evidence)
 }
 
-// ExpectSlurmdProbesNoRestartOrKill asserts that the slurmd container on each pod
-// did not restart or get killed due to startupProbe or livenessProbe failures.
-// It tolerates pods that have already been removed by JobSet teardown and does not
-// check Unhealthy events because post-completion liveness ticks on IDLE nodes are
-// expected to fail as part of the post-execution idle timeout before pod deletion.
-func ExpectSlurmdProbesNoRestartOrKill(g gomega.Gomega, slurmNamespace string, podNames ...string) {
+// VerifySlurmdProbesStayHealthy asserts that the slurmd probes on podNames keep
+// passing for two probe periods. Call it while Slurm job jobID is RUNNING on the
+// pods. The job must stay RUNNING until the check ends.
+func VerifySlurmdProbesStayHealthy(slurmNamespace, jobID string, probePeriod time.Duration, podNames ...string) {
 	ginkgo.GinkgoHelper()
-	g.Expect(podNames).NotTo(gomega.BeEmpty(), "Expected at least one pod name")
 
 	for _, podName := range podNames {
-		cmd := exec.Command("kubectl", "get", "pod", podName, "-n", slurmNamespace, "--ignore-not-found",
-			"-o", "jsonpath={.status.containerStatuses[?(@.name=='slurmd')].restartCount}")
-		restartCount, err := Run(cmd)
-		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query slurmd restartCount on pod "+podName)
-		if trimmed := strings.TrimSpace(restartCount); trimmed != "" {
-			g.Expect(trimmed).To(gomega.Equal("0"),
-				fmt.Sprintf("Expected slurmd container on pod %s to have 0 restarts", podName))
-		}
-
-		expectNoSlurmdProbeKillEvents(g, slurmNamespace, podName)
+		ginkgo.By(fmt.Sprintf("waiting for the slurmd startupProbe to pass on pod %s", podName))
+		gomega.Eventually(func(g gomega.Gomega) {
+			cmd := exec.Command("kubectl", "get", "pod", podName, "-n", slurmNamespace,
+				"-o", "jsonpath={.status.containerStatuses[?(@.name=='slurmd')].started}")
+			started, err := Run(cmd)
+			g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get slurmd container status of pod "+podName)
+			g.Expect(strings.TrimSpace(started)).To(gomega.Equal("true"),
+				fmt.Sprintf("slurmd startupProbe has not passed on pod %s yet", podName))
+		}, time.Minute, time.Second).Should(gomega.Succeed())
 	}
-}
-
-// ExpectSlurmdProbesHealthy asserts that the slurmd container on each pod has passed
-// its startupProbe (started=true), has 0 restarts, and has not reported any Killing
-// or Unhealthy livenessProbe events while a job is active.
-// Note: startupProbe uses the same command and may legitimately emit "Startup probe failed"
-// while the pod is waiting for all job nodes to be allocated, so only "Liveness probe"
-// Unhealthy events are rejected once started=true.
-func ExpectSlurmdProbesHealthy(g gomega.Gomega, slurmNamespace string, podNames ...string) {
-	ginkgo.GinkgoHelper()
-	g.Expect(podNames).NotTo(gomega.BeEmpty(), "Expected at least one pod name")
-
-	for _, podName := range podNames {
-		const slurmdStatusJSONPath = "jsonpath=" +
-			"{.status.containerStatuses[?(@.name=='slurmd')].started}:" +
-			"{.status.containerStatuses[?(@.name=='slurmd')].restartCount}"
-		cmd := exec.Command("kubectl", "get", "pod", podName, "-n", slurmNamespace, "-o", slurmdStatusJSONPath)
-		statusOut, err := Run(cmd)
-		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query slurmd container status on pod "+podName)
-		g.Expect(strings.TrimSpace(statusOut)).To(gomega.Equal("true:0"),
-			fmt.Sprintf("Expected slurmd container on pod %s to be started with 0 restarts (started:restartCount)", podName))
-
-		expectNoSlurmdProbeKillEvents(g, slurmNamespace, podName)
-
-		unhealthyCmd := exec.Command("kubectl", "get", "events", "-n", slurmNamespace,
-			"--field-selector", fmt.Sprintf("involvedObject.name=%s,reason=Unhealthy", podName),
-			"-o", "jsonpath={.items[*].message}")
-		unhealthyOut, err := Run(unhealthyCmd)
-		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Unhealthy events for pod "+podName)
-		g.Expect(unhealthyOut).NotTo(gomega.ContainSubstring("Liveness probe"),
-			fmt.Sprintf("Pod %s slurmd container reported unhealthy liveness probe: %s", podName, unhealthyOut))
-	}
-}
-
-func VerifySlurmdProbesStayHealthy(slurmNamespace, podName string, probePeriod time.Duration) {
-	ginkgo.GinkgoHelper()
-
-	ginkgo.By(fmt.Sprintf("waiting for the slurmd startupProbe to pass on pod %s", podName))
-	WaitForSlurmdProbesStarted(slurmNamespace, time.Minute, podName)
 
 	// observationWindow leaves room for a livenessProbe to start
 	// (within one period) and finish (within its 5s timeout) inside the window.
 	observationWindow := 2 * probePeriod
-	ginkgo.By(fmt.Sprintf("verifying slurmd probes keep passing on pod %s for %s", podName, observationWindow))
+	ginkgo.By(fmt.Sprintf("verifying slurmd probes keep passing on pods %s for %s while Slurm job %s runs",
+		strings.Join(podNames, ", "), observationWindow, jobID))
 	gomega.Consistently(func(g gomega.Gomega) {
-		ExpectSlurmdProbesHealthy(g, slurmNamespace, podName)
+		evidence := make([]slurmdProbeEvidence, 0, len(podNames))
+		for _, podName := range podNames {
+			evidence = append(evidence, readSlurmdProbeEvidence(g, slurmNamespace, podName))
+		}
+
+		js, err := QuerySlurmJobState(slurmNamespace, jobID)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Slurm job state for job "+jobID)
+		g.Expect(js.JobState).To(gomega.Equal("RUNNING"), fmt.Sprintf(
+			"Slurm job %s stopped running before the probe observation window ended. Make the job run longer.", jobID))
+		for _, e := range evidence {
+			expectNoSlurmdRestart(g, e)
+			expectSlurmdNotKilledByProbes(g, e)
+			expectNoSlurmdLivenessFailure(g, e)
+		}
 	}, observationWindow, 2*time.Second).Should(gomega.Succeed())
 }
 
-// WaitForSlurmdProbesStarted waits until the slurmd startupProbe succeeds (started=true)
-// and verifies probes are healthy on all specified worker pods.
-func WaitForSlurmdProbesStarted(slurmNamespace string, timeout time.Duration, podNames ...string) {
-	ginkgo.GinkgoHelper()
-	gomega.Eventually(func(g gomega.Gomega) {
-		ExpectSlurmdProbesHealthy(g, slurmNamespace, podNames...)
-	}, timeout, time.Second).Should(gomega.Succeed())
+// slurmdProbeEvidence holds what the kubelet reported about the probes of the
+// slurmd container of one pod. restartCount is empty if the pod does not exist,
+// for example because it was deleted after the job ended.
+type slurmdProbeEvidence struct {
+	podName         string
+	restartCount    string
+	killingEvents   string
+	unhealthyEvents string
 }
 
-// VerifySlurmdProbesSuccess verifies that the slurmd container on each pod did not
-// restart or get killed due to startupProbe or livenessProbe failures.
-func VerifySlurmdProbesSuccess(slurmNamespace string, podNames ...string) {
+// readSlurmdProbeEvidence reads the restart count of the slurmd container of
+// podName and the messages of the Killing and Unhealthy events of the pod.
+// It asserts through g that each kubectl call succeeds.
+func readSlurmdProbeEvidence(g gomega.Gomega, slurmNamespace, podName string) slurmdProbeEvidence {
 	ginkgo.GinkgoHelper()
-	ExpectSlurmdProbesNoRestartOrKill(gomega.Default, slurmNamespace, podNames...)
+	evidence := slurmdProbeEvidence{podName: podName}
+	cmd := exec.Command("kubectl", "get", "pod", podName, "-n", slurmNamespace, "--ignore-not-found",
+		"-o", "jsonpath={.status.containerStatuses[?(@.name=='slurmd')].restartCount}")
+	out, err := Run(cmd)
+	g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get slurmd restart count of pod "+podName)
+	evidence.restartCount = strings.TrimSpace(out)
+	evidence.killingEvents = podEventMessages(g, slurmNamespace, podName, "Killing")
+	evidence.unhealthyEvents = podEventMessages(g, slurmNamespace, podName, "Unhealthy")
+	return evidence
+}
+
+// podEventMessages returns the messages of the events with the given reason
+// for podName. It asserts through g that kubectl succeeds.
+func podEventMessages(g gomega.Gomega, slurmNamespace, podName, reason string) string {
+	ginkgo.GinkgoHelper()
+	cmd := exec.Command("kubectl", "get", "events", "-n", slurmNamespace,
+		"--field-selector", fmt.Sprintf("involvedObject.name=%s,reason=%s", podName, reason),
+		"-o", "jsonpath={.items[*].message}")
+	out, err := Run(cmd)
+	g.Expect(err).NotTo(gomega.HaveOccurred(), fmt.Sprintf("Failed to get %s events of pod %s", reason, podName))
+	return strings.TrimSpace(out)
+}
+
+// expectNoSlurmdRestart asserts through g that the slurmd container has a
+// restart count of 0.
+func expectNoSlurmdRestart(g gomega.Gomega, evidence slurmdProbeEvidence) {
+	ginkgo.GinkgoHelper()
+	g.Expect(evidence.restartCount).To(gomega.Equal("0"),
+		fmt.Sprintf("Expected slurmd container on pod %s to have 0 restarts", evidence.podName))
+}
+
+// expectSlurmdNotKilledByProbes asserts through g that the kubelet did not kill
+// the slurmd container because a probe failed.
+func expectSlurmdNotKilledByProbes(g gomega.Gomega, evidence slurmdProbeEvidence) {
+	ginkgo.GinkgoHelper()
+	g.Expect(evidence.killingEvents).NotTo(gomega.ContainSubstring("failed liveness probe"),
+		fmt.Sprintf("Pod %s slurmd container failed liveness probe: %s", evidence.podName, evidence.killingEvents))
+	g.Expect(evidence.killingEvents).NotTo(gomega.ContainSubstring("failed startup probe"),
+		fmt.Sprintf("Pod %s slurmd container failed startup probe: %s", evidence.podName, evidence.killingEvents))
+}
+
+// expectNoSlurmdLivenessFailure asserts through g that the slurmd container did
+// not report a failed livenessProbe.
+func expectNoSlurmdLivenessFailure(g gomega.Gomega, evidence slurmdProbeEvidence) {
+	ginkgo.GinkgoHelper()
+	g.Expect(evidence.unhealthyEvents).NotTo(gomega.ContainSubstring("Liveness probe failed"),
+		fmt.Sprintf("Pod %s slurmd container reported unhealthy liveness probe: %s",
+			evidence.podName, evidence.unhealthyEvents))
 }

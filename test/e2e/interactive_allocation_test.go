@@ -74,7 +74,8 @@ var _ = Describe("Interactive Slurm Allocations", func() {
 		))
 
 		By("verifying slurmd probes left the idle interactive worker alone")
-		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, workerPodName, slurmjob.SlurmdProbePeriodSeconds*time.Second)
+		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, jobID,
+			slurmjob.SlurmdProbePeriodSeconds*time.Second, workerPodName)
 
 		session.Exit()
 
@@ -119,7 +120,8 @@ var _ = Describe("Interactive Slurm Allocations", func() {
 		))
 
 		By("verifying slurmd probes left the idle interactive worker alone")
-		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, workerPodName, slurmjob.SlurmdProbePeriodSeconds*time.Second)
+		utils.VerifySlurmdProbesStayHealthy(slurmNamespace, jobID,
+			slurmjob.SlurmdProbePeriodSeconds*time.Second, workerPodName)
 
 		session.Exit()
 

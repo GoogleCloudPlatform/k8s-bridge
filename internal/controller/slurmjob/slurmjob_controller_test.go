@@ -49,6 +49,9 @@ import (
 	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	uberzap "go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 )
 
@@ -654,6 +657,7 @@ func TestReconcile_Cancelled_MultiPartition(t *testing.T) {
 		withPartition(multiPart).
 		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
 		withHold(true).
+		withStateReason(ReasonJobHeldUser).
 		build()
 
 	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
@@ -1833,4 +1837,136 @@ func TestCountActiveJobSets(t *testing.T) {
 			t.Errorf("Expected error to wrap list error, got: %v", err)
 		}
 	})
+}
+
+func newObservedLoggerContext(ctx context.Context) (context.Context, *observer.ObservedLogs) {
+	core, recorded := observer.New(zapcore.DebugLevel)
+	logger := zap.New(zap.UseDevMode(true), zap.RawZapOpts(uberzap.WrapCore(func(zapcore.Core) zapcore.Core {
+		return core
+	})))
+	return logf.IntoContext(ctx, logger), recorded
+}
+
+func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
+	job := newReconTestJob().
+		withNodes(2).
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		withStateReason(ReasonPriority).
+		build()
+
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	ctx, recorded := newObservedLoggerContext(t.Context())
+
+	res, err := env.reconcile(ctx)
+	if err != nil {
+		t.Fatalf("First reconcile failed: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("Expected empty result, got %v", res)
+	}
+
+	js := env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+	if js == nil {
+		t.Fatal("Expected non-nil JobSet")
+	}
+
+	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 1 {
+		t.Errorf("Expected 1 'New Slurm job appeared' log entry on first reconcile, got %d", got)
+	}
+
+	recorded.TakeAll()
+
+	res, err = env.reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Second reconcile failed: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("Expected empty result on second reconcile, got %v", res)
+	}
+
+	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 0 {
+		t.Errorf("Did not expect 'New Slurm job appeared' on subsequent reconcile when JobSet exists, got %d", got)
+	}
+}
+
+func TestReconcile_NewJob_ExplicitHold_DefersWithoutLoggingOrMetrics(t *testing.T) {
+	tests := []struct {
+		name        string
+		stateReason string
+		comment     string
+	}{
+		{
+			name:        "user hold without auto-hold marker",
+			stateReason: ReasonJobHeldUser,
+			comment:     "held by user",
+		},
+		{
+			name:        "admin hold",
+			stateReason: ReasonJobHeldAdmin,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := newReconTestJob().
+				withNodes(2).
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(tc.stateReason).
+				withComment(tc.comment).
+				build()
+
+			env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+			ctx, recorded := newObservedLoggerContext(t.Context())
+
+			initDiscovered := testutil.ToFloat64(metrics.JobsDiscovered.WithLabelValues(reconWmName, reconPartitionName))
+
+			res, err := env.reconcile(ctx)
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res != (ctrl.Result{}) {
+				t.Errorf("Expected empty result, got %v", res)
+			}
+
+			env.verifyJobSetNotFound()
+			env.verifyNoSlurmUpdates()
+
+			if got := recorded.FilterMessage("Job is explicitly held by user or admin, deferring reconciliation").Len(); got != 1 {
+				t.Errorf("Expected 1 'Job is explicitly held by user or admin, deferring reconciliation' log entry, got %d", got)
+			}
+			if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 0 {
+				t.Errorf("Did not expect 'New Slurm job appeared' for explicitly held job, got %d", got)
+			}
+
+			if val := testutil.ToFloat64(metrics.JobsDiscovered.WithLabelValues(reconWmName, reconPartitionName)); val != initDiscovered {
+				t.Errorf("Expected JobsDiscovered to remain %f, got %f", initDiscovered, val)
+			}
+		})
+	}
+}
+
+func TestReconcile_EmptyWMName_SkipsWithoutNewJobLog(t *testing.T) {
+	env := newReconcileTestEnv(t)
+	env.req.Name = "slurm-job-" + reconJobIDStr
+
+	ctx, recorded := newObservedLoggerContext(t.Context())
+
+	res, err := env.reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("Expected empty result, got %v", res)
+	}
+
+	if got := recorded.FilterMessage("Skipping Slurm job reconciliation").Len(); got != 1 {
+		t.Errorf("Expected 1 'Skipping Slurm job reconciliation' log entry, got %d", got)
+	}
+	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 0 {
+		t.Errorf("Did not expect 'New Slurm job appeared' when WorkloadMixing name is empty, got %d", got)
+	}
 }

@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/GoogleCloudPlatform/k8s-bridge/internal/controller/slurmjob"
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 )
 
@@ -327,8 +328,8 @@ var _ = Describe("Manager", func() {
 			By("verifying batch job execution and transition to COMPLETED in Slurm")
 			utils.WaitForSlurmJobCompletion(slurmNamespace, jobID, 3*time.Minute)
 
-			By("verifying slurmd startup and liveness probes on worker pod")
-			utils.VerifySlurmdProbesSuccess(slurmNamespace, workerPodName)
+			By("verifying slurmd probes did not restart or kill the worker pod")
+			utils.VerifySlurmdNotKilledByProbes(slurmNamespace, workerPodName)
 
 			By("verifying teardown reconciler cleans up JobSet and dynamic node")
 			utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
@@ -338,6 +339,7 @@ var _ = Describe("Manager", func() {
 		It("should execute a multi-node batch job across two dynamic worker pods "+
 			"without liveness probe failure", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
+			const jobSleepSeconds = 6*slurmjob.SlurmdProbePeriodSeconds + slurmjob.SlurmdProbeTimeoutSeconds
 
 			By("applying the WorkloadMixing template CR")
 			utils.ApplyManifestWithCleanup(configPath)
@@ -347,7 +349,7 @@ var _ = Describe("Manager", func() {
 				WithPartition(defaultSlurmPartition).
 				WithNodes(2).
 				WithCpusPerTask(1).
-				WithWrap("sleep 45; srun --nodes=2 hostname; echo 'E2E_MULTINODE_SUCCESS'").
+				WithWrap(fmt.Sprintf("sleep %d; srun --nodes=2 hostname; echo 'E2E_MULTINODE_SUCCESS'", jobSleepSeconds)).
 				Submit()
 			jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
 			nodeName0 := fmt.Sprintf("%s-slurmd-0-0", jobSetName)
@@ -363,19 +365,17 @@ var _ = Describe("Manager", func() {
 				WithTimeout(3 * time.Minute).
 				Verify()
 
-			By("waiting for slurmd startupProbe to succeed on both worker pods")
-			utils.WaitForSlurmdProbesStarted(slurmNamespace, 30*time.Second, workerPodNames...)
-
-			By("verifying slurmd livenessProbe succeeds on both worker pods while multi-node job is active")
-			Consistently(func(g Gomega) {
-				utils.ExpectSlurmdProbesHealthy(g, slurmNamespace, workerPodNames...)
-			}, 22*time.Second, 5*time.Second).Should(Succeed())
+			By("verifying slurmd probes stay healthy on both worker pods while the multi-node job is active")
+			utils.VerifySlurmdProbesStayHealthy(slurmNamespace, jobID,
+				slurmjob.SlurmdProbePeriodSeconds*time.Second, workerPodNames...)
 
 			By("verifying multi-node batch job execution and transition to COMPLETED in Slurm")
 			utils.WaitForSlurmJobCompletion(slurmNamespace, jobID, 3*time.Minute)
 
 			By("verifying slurmd probes did not restart or kill either worker pod")
-			utils.VerifySlurmdProbesSuccess(slurmNamespace, workerPodNames...)
+			for _, podName := range workerPodNames {
+				utils.VerifySlurmdNotKilledByProbes(slurmNamespace, podName)
+			}
 
 			By("verifying teardown reconciler cleans up JobSet and both dynamic nodes")
 			utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
