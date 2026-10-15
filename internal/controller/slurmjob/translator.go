@@ -75,11 +75,7 @@ const (
 	ValueTrue                      = "true"
 	AutoHoldMarker                 = "k8s-bridge-auto-hold"
 
-	// DefaultJobSetMaxRestarts is the number of times the JobSet controller restarts a
-	// JobSet after one of its child Jobs fails, for a Slurm job that may be requeued.
-	DefaultJobSetMaxRestarts int32 = 3
-	// NoRequeueJobSetMaxRestarts disables JobSet restarts for a Slurm job that may not be
-	// requeued, for example a job submitted with sbatch --no-requeue.
+	DefaultJobSetMaxRestarts   int32 = 3
 	NoRequeueJobSetMaxRestarts int32 = 0
 
 	SlurmdProbePeriodSeconds            = 10
@@ -209,15 +205,6 @@ func (t *JobSetTranslator) Translate(
 	return buildJobSet(jobIDStr, replicas, resolveMaxRestarts(job), labels, podTemplate), nil
 }
 
-// resolveMaxRestarts returns the JobSet FailurePolicy.MaxRestarts for the job.
-//
-// Slurm reports requeue=false for a job that may not be requeued: the job was submitted
-// with --no-requeue, or slurm.conf sets JobRequeue=0. Slurm does not requeue such a job
-// after a node failure, so the JobSet must not restart its child Jobs either, and the
-// first child Job failure fails the JobSet. Every other job gets the default restart
-// budget of DefaultJobSetMaxRestarts.
-//
-// Reference: https://slurm.schedmd.com/sbatch.html#OPT_no-requeue
 func resolveMaxRestarts(job *slurmclienttypes.V0044JobInfo) int32 {
 	if job.Requeue != nil && !*job.Requeue {
 		return NoRequeueJobSetMaxRestarts

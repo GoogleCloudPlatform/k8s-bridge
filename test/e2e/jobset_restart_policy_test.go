@@ -32,19 +32,9 @@ import (
 )
 
 const (
-	// failingSlurmdConfigPath maps workloadmixing-partition to a pod template whose slurmd
-	// container exits with code 1 instead of starting slurmd. The podFailurePolicy of the
-	// translated JobSet fails the child Job on that exit code, which drives the JobSet
-	// failure policy without a dynamic Slurm node ever registering.
-	failingSlurmdConfigPath = "test/e2e/testdata/workloadmixing_failing_slurmd.yaml"
-
-	// defaultJobSetMaxRestarts mirrors slurmjob.DefaultJobSetMaxRestarts: the restart
-	// budget of a JobSet translated from a Slurm job that may be requeued.
+	failingSlurmdConfigPath        = "test/e2e/testdata/workloadmixing_failing_slurmd.yaml"
 	defaultJobSetMaxRestarts int32 = 3
-
-	// restartPolicyTimeout bounds the wait for a JobSet to run through all of its restart
-	// cycles and for k8s-bridge to cancel the Slurm job afterwards.
-	restartPolicyTimeout = 5 * time.Minute
+	restartPolicyTimeout           = 5 * time.Minute
 )
 
 var _ = Describe("JobSet restart policy", func() {
