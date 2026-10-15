@@ -989,6 +989,14 @@ var dynamicNodeFeatureRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 const UniqueFeaturePrefix = "k8s-id-"
 
+func podMemoryMiB(requests corev1.ResourceList) int64 {
+	qty, ok := requests[corev1.ResourceMemory]
+	if !ok {
+		return 0
+	}
+	return qty.Value() / (1024 * 1024)
+}
+
 func appendSlurmdArgs(podSpec *corev1.PodSpec, jobIDStr string, confServer string, gresList []resolvedGRES, dynamicNodeFeature string) error {
 	for i := range podSpec.Containers {
 		c := &podSpec.Containers[i]
@@ -1062,6 +1070,10 @@ func appendSlurmdArgs(podSpec *corev1.PodSpec, jobIDStr string, confServer strin
 			c.Env = append(filteredEnvs, deterministicNodeEnvs...)
 
 			var confParts []string
+			// Register the pod memory, not the node memory that slurmd detects.
+			if memMiB := podMemoryMiB(c.Resources.Requests); memMiB > 0 {
+				confParts = append(confParts, fmt.Sprintf("RealMemory=%d", memMiB))
+			}
 			var features []string
 			if jobIDStr != "" {
 				features = append(features, fmt.Sprintf("%s%s", UniqueFeaturePrefix, jobIDStr))

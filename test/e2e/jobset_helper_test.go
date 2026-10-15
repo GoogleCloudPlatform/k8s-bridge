@@ -181,7 +181,7 @@ func verifyJobSetCreatedWithCustomTemplate(jobSetName, jobID, jobNameLabel strin
 		g.Expect(slurmdContainer.Args[3]).To(Equal("$(SLURM_NODE_NAME)"))
 		g.Expect(slurmdContainer.Args[4]).To(Equal("-Z"))
 		g.Expect(slurmdContainer.Args[5]).To(Equal("--conf"))
-		g.Expect(slurmdContainer.Args[6]).To(MatchRegexp(`^'Features=k8s-id-[0-9a-f-]+,dynamic_kpartition'$`))
+		g.Expect(slurmdContainer.Args[6]).To(MatchRegexp(`^'RealMemory=4096 Features=k8s-id-[0-9a-f-]+,dynamic_kpartition'$`))
 
 		// Verify Slurmd container has Downward API env vars for deterministic node naming
 		var slurmNodeNameEnv, jobSetNameEnv, replicatedJobNameEnv, jobIndexEnv, podIndexEnv *corev1.EnvVar

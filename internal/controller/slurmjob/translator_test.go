@@ -441,7 +441,7 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 		verifyJobSet(t, obj, err, "123", 2,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 " + testGresGpuL4 + "'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testExpectedGpuL4_2Args}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("2"),
 			}),
@@ -461,7 +461,7 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 		verifyJobSet(t, obj, err, "123", 1,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 Gres=gpu:1'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'" + testDefaultNodeRes + " Features=k8s-id-123 Gres=gpu:1'"}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("1"),
 			}),
@@ -478,7 +478,7 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 		verifyJobSet(t, obj, err, "123", 2,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 Gres=gpu:a100:2'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'RealMemory=4096 Features=k8s-id-123 Gres=gpu:a100:2'"}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("2"),
 			}),
@@ -496,7 +496,7 @@ func TestTranslateSlurmJobToJobSet_GPU_Success(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 		verifyJobSet(t, obj, err, "123", 2,
-			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123 " + testGresGpuL4 + "'"}),
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testExpectedGpuL4_2Args}),
 			withRequests(corev1.ResourceList{
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("2"),
 			}),
@@ -668,6 +668,119 @@ func TestAppendSlurmdArgs(t *testing.T) {
 		if diff := cmp.Diff(expected, podSpec.Containers[0].Args); diff != "" {
 			t.Errorf("Unexpected args (-want +got):\n%s", diff)
 		}
+	})
+
+	t.Run("Success_RegistersPodMemoryAsRealMemory", func(t *testing.T) {
+		podSpec := &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: ContainerSlurmd,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("4"),
+							corev1.ResourceMemory: resource.MustParse("8192Mi"),
+						},
+					},
+				},
+			},
+		}
+		gresList := []resolvedGRES{
+			{name: GRESGPU, count: 2, resourceType: "l4"},
+		}
+		err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, gresList, "dynamic_kpartition")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		expected := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf,
+			"'RealMemory=8192 Features=k8s-id-123,dynamic_kpartition " + testGresGpuL4 + "'"}
+		if diff := cmp.Diff(expected, podSpec.Containers[0].Args); diff != "" {
+			t.Errorf("Unexpected args (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("Success_RoundsMemoryDownToMiB", func(t *testing.T) {
+		podSpec := &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: ContainerSlurmd,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("1G"),
+						},
+					},
+				},
+			},
+		}
+		err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, "")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		expected := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'RealMemory=953 Features=k8s-id-123'"}
+		if diff := cmp.Diff(expected, podSpec.Containers[0].Args); diff != "" {
+			t.Errorf("Unexpected args (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("Success_NoMemoryRequestLeavesDetectionToSlurmd", func(t *testing.T) {
+		podSpec := &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: ContainerSlurmd,
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+						},
+					},
+				},
+			},
+		}
+		err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, "")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		expected := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testFeatureWithPart}
+		if diff := cmp.Diff(expected, podSpec.Containers[0].Args); diff != "" {
+			t.Errorf("Unexpected args (-want +got):\n%s", diff)
+		}
+	})
+}
+
+func TestTranslateSlurmJobToJobSet_NodeMemoryInSlurmdConf(t *testing.T) {
+	wmSpec := getTestWMSpec()
+	translator := NewJobSetTranslator()
+	controller := getTestController()
+
+	t.Run("Fallback memory is registered as RealMemory", func(t *testing.T) {
+		job := newTestJob().
+			withNodes(2).
+			withTasks(4).
+			withCpusPerTask(2).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 2,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'RealMemory=8192 Features=k8s-id-123'"}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			}),
+		)
+	})
+
+	t.Run("Explicit memory request is registered as RealMemory", func(t *testing.T) {
+		job := newTestJob().
+			withCpusPerTask(2).
+			withMemoryPerNode(4096).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 1,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'RealMemory=4096 Features=k8s-id-123'"}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("4096Mi"),
+			}),
+		)
 	})
 }
 
@@ -1378,7 +1491,7 @@ func TestTranslateSlurmJobToJobSet_Features(t *testing.T) {
 		job := newTestJob().build()
 
 		obj, err := translator.Translate(job, customWMSpec, controller)
-		expectedArgs := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'Features=k8s-id-123,dynamic_kpartition'"}
+		expectedArgs := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, "'" + testDefaultNodeRes + " Features=k8s-id-123,dynamic_kpartition'"}
 		verifyJobSet(t, obj, err, "123", 1, withArgs(expectedArgs))
 	})
 }
