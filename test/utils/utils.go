@@ -44,6 +44,7 @@ const CurlImage = "curlimages/curl:8.16.0"
 
 // LINT.ThenChange(
 //   test/e2e/testdata/workloadmixing_template.yaml:curl_image,
+//   test/e2e/testdata/workloadmixing_failing_slurmd.yaml:curl_image,
 //   .github/workflows/test-e2e.yml:curl_image
 // )
 
