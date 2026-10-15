@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -45,9 +46,11 @@ import (
 )
 
 const (
-	ControllerName  = "slurmclient-controller"
-	SlurmrestdPort  = 6820
-	StalenessBuffer = 3 * time.Minute
+	ControllerName = "slurmclient-controller"
+	// TODO: Resolve the slurmrestd service port from RestApi.Spec.Service.Port instead of always using the default port.
+	SlurmrestdPort           = 6820
+	StalenessBuffer          = 3 * time.Minute
+	DefaultHTTPClientTimeout = 30 * time.Second
 )
 
 // ErrRestApiNotFound is returned when no RestApi resources match the Controller.
@@ -146,6 +149,9 @@ func (r *SlurmClientReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	config := &slurmclient.Config{
 		Server:    server,
 		AuthToken: token,
+		HTTPClient: &http.Client{
+			Timeout: DefaultHTTPClientTimeout,
+		},
 	}
 	// JobInfo and Node are listed in DisableFor as we don't want to cache queries for jobs or dynamic nodes
 	options := &slurmclient.ClientOptions{
