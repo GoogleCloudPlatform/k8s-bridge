@@ -239,16 +239,66 @@ var _ = Describe("Manager", func() {
 			jobID, jobSetName := setupJobSetTerminalStateTest()
 
 			By("recording the UID of the JobSet created by the controller")
-			originalUID, err := utils.JobSetUID(jobSetName, slurmNamespace)
-			Expect(err).NotTo(HaveOccurred(), "Failed to read JobSet UID")
-			Expect(originalUID).NotTo(BeEmpty(), "JobSet "+jobSetName+" has no UID")
+			originalUID := waitForJobSetUID(jobSetName)
 
 			By("artificially deleting the JobSet")
-			cmd := exec.Command("kubectl", "delete", "jobset", jobSetName, "-n", slurmNamespace, "--wait=true")
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to delete JobSet")
+			deleteJobSetForSlurmJob(jobSetName)
 
 			verifySlurmJobCancelledWithoutJobSetRecreation(jobID, jobSetName, originalUID)
+		})
+
+		It("should cancel Slurm job without recreating JobSet when JobSet is deleted "+
+			"while Slurm re-holds job with BadConstraints", func() {
+			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
+
+			By("applying the WorkloadMixing template CR")
+			utils.ApplyManifestWithCleanup(configPath)
+
+			By("submitting Job A and waiting for its dynamic node to register and run")
+			jobIDA := utils.NewBatchJobBuilder(slurmNamespace).
+				WithPartition(defaultSlurmPartition).
+				WithNodes(1).
+				WithCpusPerTask(1).
+				WithWrap("sleep 300").
+				Submit()
+			jobSetNameA := fmt.Sprintf("slurm-job-%s", jobIDA)
+			nodeNameA := fmt.Sprintf("%s-slurmd-0-0", jobSetNameA)
+			utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetNameA, 1, 3*time.Minute)
+			utils.NewSlurmJobVerifier(slurmNamespace, jobIDA).
+				WithState("RUNNING").
+				WithNodeList(nodeNameA).
+				Verify()
+
+			By("holding test-local-queue so Job B's JobSet stays suspended from creation")
+			holdLocalQueueWithCleanup("test-local-queue")
+
+			By("submitting Job B and waiting for Slurm to re-hold it with BadConstraints")
+			jobIDB := utils.NewBatchJobBuilder(slurmNamespace).
+				WithPartition(defaultSlurmPartition).
+				WithNodes(1).
+				WithCpusPerTask(1).
+				WithWrap("sleep 300").
+				Submit()
+			jobSetNameB := fmt.Sprintf("slurm-job-%s", jobIDB)
+			originalUID := waitForJobSetUID(jobSetNameB)
+			utils.NewSlurmJobVerifier(slurmNamespace, jobIDB).
+				WithState("PENDING").
+				WithReason("BadConstraints").
+				WithComment(fmt.Sprintf(
+					"Unheld by k8s-bridge: Kubernetes resource %s created successfully",
+					jobSetNameB,
+				)).
+				Verify()
+
+			By("deleting Job B's JobSet and verifying Job B is cancelled without recreation")
+			deleteJobSetForSlurmJob(jobSetNameB)
+			verifySlurmJobCancelledWithoutJobSetRecreation(jobIDB, jobSetNameB, originalUID)
+
+			By("verifying Job A remains RUNNING on its dynamic node")
+			utils.NewSlurmJobVerifier(slurmNamespace, jobIDA).
+				WithState("RUNNING").
+				WithNodeList(nodeNameA).
+				Verify()
 		})
 	})
 

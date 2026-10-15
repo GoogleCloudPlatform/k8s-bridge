@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	slurmErrMsgInvalidJobID    = "Invalid job id specified"
-	slurmErrMsgInvalidNodeName = "Invalid node name specified"
-	slurmErrMsgNodeNotFound    = "Node not found"
+	slurmErrMsgInvalidJobID          = "Invalid job id specified"
+	slurmErrMsgInvalidNodeName       = "Invalid node name specified"
+	slurmErrMsgNodeNotFound          = "Node not found"
+	slurmErrMsgPartConfigUnavailable = "Requested partition configuration not available now"
 )
 
 // isSlurmNotFound checks if a Slurm REST API error indicates the resource was not found.
@@ -44,26 +45,7 @@ const (
 // Exact string matching is used to prevent false positives from other error messages containing "Not Found"
 // (e.g., account, QOS, or partition configuration errors).
 func isSlurmNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	var agg utilerrors.Aggregate
-	if errors.As(err, &agg) {
-		return slices.ContainsFunc(agg.Errors(), isSlurmNotFound)
-	}
-	errMsg := err.Error()
-	if isSlurmNotFoundString(errMsg) {
-		return true
-	}
-	// Handle string-formatted aggregates (e.g. "[Not Found, Invalid job id specified]").
-	if strings.HasPrefix(errMsg, "[") && strings.HasSuffix(errMsg, "]") {
-		for part := range strings.SplitSeq(errMsg[1:len(errMsg)-1], ", ") {
-			if isSlurmNotFoundString(strings.TrimSpace(part)) {
-				return true
-			}
-		}
-	}
-	return false
+	return slices.ContainsFunc(slurmErrorMessages(err), isSlurmNotFoundString)
 }
 
 func isSlurmNotFoundString(msg string) bool {
@@ -71,6 +53,47 @@ func isSlurmNotFoundString(msg string) bool {
 		msg == slurmErrMsgInvalidJobID ||
 		msg == slurmErrMsgInvalidNodeName ||
 		msg == slurmErrMsgNodeNotFound
+}
+
+// isSlurmPartConfigUnavailable reports whether err is only Slurm's HTTP 422
+// "Requested partition configuration not available now" warning. Slurm returns
+// this warning after updating a job when its partition has no nodes.
+func isSlurmPartConfigUnavailable(err error) bool {
+	msgs := slurmErrorMessages(err)
+	if !slices.Contains(msgs, slurmErrMsgPartConfigUnavailable) {
+		return false
+	}
+	for _, msg := range msgs {
+		if msg != slurmErrMsgPartConfigUnavailable && msg != http.StatusText(http.StatusUnprocessableEntity) {
+			return false
+		}
+	}
+	return true
+}
+
+// slurmErrorMessages extracts individual error messages from a Slurm client error,
+// unwrapping utilerrors.Aggregate and "[a, b]" formatted strings.
+func slurmErrorMessages(err error) []string {
+	if err == nil {
+		return nil
+	}
+	var agg utilerrors.Aggregate
+	if errors.As(err, &agg) {
+		var msgs []string
+		for _, subErr := range agg.Errors() {
+			msgs = append(msgs, slurmErrorMessages(subErr)...)
+		}
+		return msgs
+	}
+	errMsg := err.Error()
+	if strings.HasPrefix(errMsg, "[") && strings.HasSuffix(errMsg, "]") {
+		parts := strings.Split(errMsg[1:len(errMsg)-1], ", ")
+		for i, part := range parts {
+			parts[i] = strings.TrimSpace(part)
+		}
+		return parts
+	}
+	return []string{errMsg}
 }
 
 // isJobSetOwnedByWM returns true if the JobSet has an OwnerReference pointing to the WorkloadMixing.
@@ -83,17 +106,32 @@ func isJobSetOwnedByWM(js *jobsetv1alpha2.JobSet, wm *k8sbridgev1alpha1.Workload
 	return false
 }
 
-// isTerminalSlurmJob classifies Slurm job states into terminal vs non-terminal.
+// isTerminalSlurmJob checks whether a Slurm job is in a terminal state (excluding jobs still COMPLETING)
 func isTerminalSlurmJob(jobInfo *slurmclienttypes.V0044JobInfo) (bool, string) {
+	if jobInfo == nil || jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateCOMPLETING) {
+		return false, ""
+	}
+	return classifyTerminalSlurmState(jobInfo)
+}
+
+// hasTerminalSlurmState checks whether a Slurm job is in a terminal state, regardless it it is just COMPLETING or past it
+func hasTerminalSlurmState(jobInfo *slurmclienttypes.V0044JobInfo) bool {
+	terminal, _ := classifyTerminalSlurmState(jobInfo)
+	return terminal
+}
+
+// classifyTerminalSlurmState checks whether a Slurm job is in a terminal state, regardless if it is just COMPLETING or past it, and returns its metrics reason.
+func classifyTerminalSlurmState(jobInfo *slurmclienttypes.V0044JobInfo) (bool, string) {
 	if jobInfo == nil {
 		return false, ""
 	}
 	states := jobInfo.GetStateAsSet()
-	if states.Has(slurmapi.V0044JobInfoJobStatePENDING) ||
-		states.Has(slurmapi.V0044JobInfoJobStateCONFIGURING) ||
-		states.Has(slurmapi.V0044JobInfoJobStateRUNNING) ||
-		states.Has(slurmapi.V0044JobInfoJobStateSUSPENDED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateCOMPLETING) {
+	if states.HasAny(
+		slurmapi.V0044JobInfoJobStatePENDING,
+		slurmapi.V0044JobInfoJobStateCONFIGURING,
+		slurmapi.V0044JobInfoJobStateRUNNING,
+		slurmapi.V0044JobInfoJobStateSUSPENDED,
+	) {
 		return false, ""
 	}
 	if states.Has(slurmapi.V0044JobInfoJobStateCOMPLETED) {
@@ -102,17 +140,19 @@ func isTerminalSlurmJob(jobInfo *slurmclienttypes.V0044JobInfo) (bool, string) {
 	if states.Has(slurmapi.V0044JobInfoJobStateCANCELLED) {
 		return true, metrics.ReasonJobCancelled
 	}
-	if states.Has(slurmapi.V0044JobInfoJobStateFAILED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateTIMEOUT) ||
-		states.Has(slurmapi.V0044JobInfoJobStateNODEFAIL) ||
-		states.Has(slurmapi.V0044JobInfoJobStatePREEMPTED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateBOOTFAIL) ||
-		states.Has(slurmapi.V0044JobInfoJobStateDEADLINE) ||
-		states.Has(slurmapi.V0044JobInfoJobStateOUTOFMEMORY) ||
-		states.Has(slurmapi.V0044JobInfoJobStateLAUNCHFAILED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateRECONFIGFAIL) ||
-		states.Has(slurmapi.V0044JobInfoJobStateREVOKED) ||
-		states.Has(slurmapi.V0044JobInfoJobStateSPECIALEXIT) {
+	if states.HasAny(
+		slurmapi.V0044JobInfoJobStateFAILED,
+		slurmapi.V0044JobInfoJobStateTIMEOUT,
+		slurmapi.V0044JobInfoJobStateNODEFAIL,
+		slurmapi.V0044JobInfoJobStatePREEMPTED,
+		slurmapi.V0044JobInfoJobStateBOOTFAIL,
+		slurmapi.V0044JobInfoJobStateDEADLINE,
+		slurmapi.V0044JobInfoJobStateOUTOFMEMORY,
+		slurmapi.V0044JobInfoJobStateLAUNCHFAILED,
+		slurmapi.V0044JobInfoJobStateRECONFIGFAIL,
+		slurmapi.V0044JobInfoJobStateREVOKED,
+		slurmapi.V0044JobInfoJobStateSPECIALEXIT,
+	) {
 		return true, metrics.ReasonJobFailed
 	}
 	return false, ""

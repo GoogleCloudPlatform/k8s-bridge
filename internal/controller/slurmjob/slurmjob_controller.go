@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -61,11 +60,14 @@ const (
 	ReasonJobSetCompleted = "JobSet completed"
 	ReasonJobSetFailed    = "JobSet failed"
 	ReasonJobSetMissing   = "JobSet missing"
+
+	UnheldCommentPrefix = "Unheld by k8s-bridge:"
 )
 
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
 type SlurmJobReconciler struct {
 	client.Client
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	Recorder            record.EventRecorder
 	AdmissionEventsChan <-chan slurmtypes.SlurmJobAdmissionEvent
@@ -122,6 +124,9 @@ func (r *SlurmJobReconciler) Start(ctx context.Context) error {
 // SetupWithManager sets up the controller with the Manager.
 func (r *SlurmJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.genericEvents = make(chan event.GenericEvent, 1024)
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorderFor("slurmjob-controller") //nolint:staticcheck
 	}
@@ -296,6 +301,7 @@ const (
 type K8sbridgeJobStatus string
 
 const (
+	StatusNewJob              K8sbridgeJobStatus = "NewJob"
 	StatusExplicitlyHeld      K8sbridgeJobStatus = "ExplicitlyHeld"
 	StatusExplicitHoldRemoved K8sbridgeJobStatus = "ExplicitHoldRemoved"
 	StatusShouldUnhold        K8sbridgeJobStatus = "ShouldUnhold"
@@ -306,24 +312,24 @@ const (
 )
 
 func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) K8sbridgeJobStatus {
-	if existingJS == nil {
-		isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
-		isHeld := ptr.Deref(jobInfo.Hold, false)
-		if !isPending || !isHeld {
-			return StatusJobSetMissing
-		}
+	if status, isTerminal := terminalJobSetStatus(existingJS); isTerminal {
+		return status
+	}
+
+	if jobInfo == nil || hasTerminalSlurmState(jobInfo) {
 		return StatusNoAction
 	}
 
-	for _, cond := range existingJS.Status.Conditions {
-		if cond.Status == metav1.ConditionTrue {
-			if cond.Type == string(jobsetv1alpha2.JobSetCompleted) {
-				return StatusJobSetCompleted
-			}
-			if cond.Type == string(jobsetv1alpha2.JobSetFailed) {
-				return StatusJobSetFailed
-			}
+	if existingJS == nil {
+		if isUntranslatedNewJob(jobInfo) {
+			return StatusNewJob
 		}
+		return StatusJobSetMissing
+	}
+
+	// Treat a deleting JobSet as missing so its Slurm job is cancelled.
+	if !existingJS.DeletionTimestamp.IsZero() {
+		return StatusJobSetMissing
 	}
 
 	if isJobExplicitlyHeld(jobInfo) {
@@ -333,7 +339,7 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 		return StatusNoAction
 	}
 
-	if ptr.Deref(existingJS.Spec.Suspend, false) && existingJS.Annotations != nil && existingJS.Annotations[AnnotationSuspendedBySlurmHold] == ValueTrue {
+	if isJobSetSuspendedBySlurmHold(existingJS) {
 		return StatusExplicitHoldRemoved
 	}
 
@@ -342,6 +348,82 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 	}
 
 	return StatusNoAction
+}
+
+// isUntranslatedNewJob check if a Slurm job seems active (PENDING + Held) but also that it is recent (untranslated)
+func isUntranslatedNewJob(jobInfo *slurmclienttypes.V0044JobInfo) bool {
+	if jobInfo == nil {
+		return false
+	}
+	isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
+	isHeld := ptr.Deref(jobInfo.Hold, false)
+	return isPending && isHeld && !isJobTranslated(jobInfo)
+}
+
+// isJobTranslated checks if a Slurm job was translated and unheld by k8s-bridge
+func isJobTranslated(jobInfo *slurmclienttypes.V0044JobInfo) bool {
+	if jobInfo == nil {
+		return false
+	}
+	if jobID := ptr.Deref(jobInfo.JobId, 0); jobID > 0 {
+		uniqueFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
+		if hasFeatureConstraint(ptr.Deref(jobInfo.Features, ""), uniqueFeature) {
+			return true
+		}
+	}
+	comment := ptr.Deref(jobInfo.Comment, "")
+	return strings.Contains(comment, UnheldCommentPrefix) && !strings.Contains(comment, AutoHoldMarker)
+}
+
+func terminalJobSetStatus(js *jobsetv1alpha2.JobSet) (K8sbridgeJobStatus, bool) {
+	if js == nil {
+		return "", false
+	}
+	for _, cond := range js.Status.Conditions {
+		if cond.Status == metav1.ConditionTrue {
+			switch jobsetv1alpha2.JobSetConditionType(cond.Type) {
+			case jobsetv1alpha2.JobSetCompleted:
+				return StatusJobSetCompleted, true
+			case jobsetv1alpha2.JobSetFailed:
+				return StatusJobSetFailed, true
+			}
+		}
+	}
+	return "", false
+}
+
+func isJobSetSuspendedBySlurmHold(js *jobsetv1alpha2.JobSet) bool {
+	return js != nil && ptr.Deref(js.Spec.Suspend, false) && js.Annotations[AnnotationSuspendedBySlurmHold] == ValueTrue
+}
+
+// getExistingJobSet gets the JobSet from the cache, falling back to the API server
+// for active translated jobs so cache lag does not look like a missing JobSet.
+func (r *SlurmJobReconciler) getExistingJobSet(
+	ctx context.Context,
+	namespace string,
+	jobSetName string,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+) (*jobsetv1alpha2.JobSet, error) {
+	key := types.NamespacedName{Name: jobSetName, Namespace: namespace}
+	existingJS := &jobsetv1alpha2.JobSet{}
+	err := r.Get(ctx, key, existingJS)
+	if err == nil {
+		return existingJS, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to get JobSet: %w", err)
+	}
+	// Only active translated jobs expect a JobSet to exist.
+	if r.APIReader == nil || jobInfo == nil || hasTerminalSlurmState(jobInfo) || isUntranslatedNewJob(jobInfo) {
+		return nil, nil
+	}
+	if err := r.APIReader.Get(ctx, key, existingJS); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get JobSet from API server: %w", err)
+		}
+		return nil, nil
+	}
+	return existingJS, nil
 }
 
 func (r *SlurmJobReconciler) reconcileActiveJob(
@@ -354,26 +436,22 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 ) (ReconciliationStatus, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
-	existingJS := &jobsetv1alpha2.JobSet{}
 
-	err := r.Get(ctx, types.NamespacedName{Name: jobSetName, Namespace: wm.Namespace}, existingJS)
+	existingJS, err := r.getExistingJobSet(ctx, wm.Namespace, jobSetName, jobInfo)
 	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to get JobSet: %w", err)
-		}
-		existingJS = nil
+		return ReconciliationDone, ctrl.Result{}, err
 	}
 
 	status := activeJobStatus(jobInfo, existingJS)
 
 	switch status {
 	case StatusJobSetCompleted:
-		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, jobID, wm.Namespace, partition, ReasonJobSetCompleted)
+		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, existingJS, jobID, partition, ReasonJobSetCompleted)
 	case StatusJobSetFailed:
-		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, jobID, wm.Namespace, partition, ReasonJobSetFailed)
+		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, existingJS, jobID, partition, ReasonJobSetFailed)
 
 	case StatusJobSetMissing:
-		logger.Info("JobSet missing for a job that is not in a (PENDING + Hold) state", "jobID", jobID)
+		logger.Info("JobSet missing for active Slurm job, cancelling job", "jobID", jobID)
 		if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, ReasonJobSetMissing); cancelErr != nil {
 			return ReconciliationDone, ctrl.Result{}, cancelErr
 		}
@@ -416,23 +494,33 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 		}
 		return ReconciliationDone, ctrl.Result{}, nil
 
-	case StatusNoAction:
-		if existingJS != nil {
-			return ReconciliationDone, ctrl.Result{}, nil
-		}
+	case StatusNewJob:
 		return ReconciliationContinue, ctrl.Result{}, nil
-	}
 
-	return ReconciliationContinue, ctrl.Result{}, nil
+	default:
+		return ReconciliationDone, ctrl.Result{}, nil
+	}
 }
 
-func (r *SlurmJobReconciler) handleTerminalJobSet(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, jobID, namespace, partition, reason string) (ReconciliationStatus, ctrl.Result, error) {
+func (r *SlurmJobReconciler) handleTerminalJobSet(
+	ctx context.Context,
+	wm *k8sbridgev1alpha1.WorkloadMixing,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	existingJS *jobsetv1alpha2.JobSet,
+	jobID string,
+	partition string,
+	reason string,
+) (ReconciliationStatus, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info(reason, "jobID", jobID)
 	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, reason); cancelErr != nil {
 		return ReconciliationDone, ctrl.Result{}, cancelErr
 	}
-	if errDelete := r.deleteJobSet(ctx, namespace, jobID, reason); errDelete != nil {
+	if err := cleanupDynamicNodes(ctx, slurmClient, existingJS); err != nil {
+		return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", existingJS.Name, err)
+	}
+	if errDelete := r.deleteJobSet(ctx, existingJS, reason); errDelete != nil {
 		return ReconciliationDone, ctrl.Result{}, errDelete
 	}
 
@@ -449,20 +537,14 @@ func (r *SlurmJobReconciler) handleTerminalJobSet(ctx context.Context, wm *k8sbr
 	return ReconciliationDone, ctrl.Result{}, nil
 }
 
-func (r *SlurmJobReconciler) deleteJobSet(ctx context.Context, namespace, jobID, reason string) error {
-	logger := log.FromContext(ctx)
-	jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
-
-	jobSet := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobSetName,
-			Namespace: namespace,
-		},
+func (r *SlurmJobReconciler) deleteJobSet(ctx context.Context, js *jobsetv1alpha2.JobSet, reason string) error {
+	if js == nil || !js.DeletionTimestamp.IsZero() {
+		return nil
 	}
-
-	logger.Info("Cleaning up terminal JobSet", "jobSetName", jobSetName, "reason", reason)
-	if err := r.Delete(ctx, jobSet); err != nil && !apierrors.IsNotFound(err) {
-		logger.Error(err, "Failed to clean up JobSet", "jobSetName", jobSetName)
+	logger := log.FromContext(ctx)
+	logger.Info("Cleaning up terminal JobSet", "jobSetName", js.Name, "reason", reason)
+	if err := r.Delete(ctx, js); err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "Failed to clean up JobSet", "jobSetName", js.Name)
 		return err
 	}
 
@@ -479,11 +561,8 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	isPending := jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
-	isHeld := ptr.Deref(jobInfo.Hold, false)
-
-	if !isPending || !isHeld {
-		logger.Info("Job is not PENDING or not Held, skipping reconciliation", "jobID", jobID, "isPending", isPending, "isHeld", isHeld)
+	if !isUntranslatedNewJob(jobInfo) {
+		logger.Info("Job is not an untranslated held pending job, skipping reconciliation", "jobID", jobID)
 		return ctrl.Result{}, nil
 	}
 
@@ -625,14 +704,13 @@ func (r *SlurmJobReconciler) createK8sResource(ctx context.Context, obj client.O
 }
 
 func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, comment string) error {
+	if jobInfo == nil {
+		return nil
+	}
 	logger := log.FromContext(ctx)
-	jobID := *jobInfo.JobId
+	jobID := ptr.Deref(jobInfo.JobId, 0)
 
-	// If job is already in a terminal state, assume success
-	jobState := jobInfo.GetStateAsSet()
-	if jobState.Has(slurmapi.V0044JobInfoJobStateCANCELLED) ||
-		jobState.Has(slurmapi.V0044JobInfoJobStateCOMPLETED) ||
-		jobState.Has(slurmapi.V0044JobInfoJobStateFAILED) {
+	if hasTerminalSlurmState(jobInfo) {
 		logger.Info("Slurm job is already in a terminal state, assuming cancellation is successful", "jobID", jobID)
 		return nil
 	}
@@ -642,7 +720,11 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 		Comment: ptr.To(comment),
 	}
 	if err := slurmClient.Update(ctx, jobInfo, commentReq); err != nil {
-		logger.Error(err, "Failed to set failure comment on Slurm job, proceeding with job cancellation", "jobID", jobID)
+		if isSlurmPartConfigUnavailable(err) {
+			logger.V(1).Info("Slurm returned partition configuration unavailable when setting failure comment, proceeding with job cancellation", "jobID", jobID, "error", err)
+		} else {
+			logger.Error(err, "Failed to set failure comment on Slurm job, proceeding with job cancellation", "jobID", jobID)
+		}
 	}
 
 	// 2. Cancel the job in Slurm
@@ -657,31 +739,24 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 func (r *SlurmJobReconciler) releaseHold(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, obj client.Object) error {
 	logger := log.FromContext(ctx)
 	jobID := ptr.Deref(jobInfo.JobId, 0)
-	jobIDStr := strconv.Itoa(int(jobID))
 
 	logger.Info("Assigning extra job-specific constraint and unholding Slurm job", "jobID", jobID)
-	msg := fmt.Sprintf("Unheld by k8s-bridge: Kubernetes resource %s created successfully", obj.GetName())
+	msg := fmt.Sprintf("%s Kubernetes resource %s created successfully", UnheldCommentPrefix, obj.GetName())
 	existingComment := stripAutoHoldMarker(strings.TrimSpace(ptr.Deref(jobInfo.Comment, "")))
-	var newComment string
-	if existingComment != "" {
-		if strings.Contains(existingComment, msg) {
-			newComment = existingComment
-		} else {
-			newComment = fmt.Sprintf("%s, %s", existingComment, msg)
-		}
-	} else {
-		newComment = msg
+	newComment := msg
+	if strings.Contains(existingComment, msg) {
+		newComment = existingComment
+	} else if existingComment != "" {
+		newComment = fmt.Sprintf("%s, %s", existingComment, msg)
 	}
 
-	uniqueFeature := fmt.Sprintf("%s%s", UniqueFeaturePrefix, jobIDStr)
+	uniqueFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
 	existingFeatures := strings.TrimSpace(ptr.Deref(jobInfo.Features, ""))
 	newFeatures := uniqueFeature
-	if existingFeatures != "" {
-		if hasFeatureConstraint(existingFeatures, uniqueFeature) {
-			newFeatures = existingFeatures
-		} else {
-			newFeatures = fmt.Sprintf("(%s)&%s", existingFeatures, uniqueFeature)
-		}
+	if hasFeatureConstraint(existingFeatures, uniqueFeature) {
+		newFeatures = existingFeatures
+	} else if existingFeatures != "" {
+		newFeatures = fmt.Sprintf("(%s)&%s", existingFeatures, uniqueFeature)
 	}
 
 	updateReq := slurmapi.V0044JobDescMsg{
@@ -690,6 +765,10 @@ func (r *SlurmJobReconciler) releaseHold(ctx context.Context, slurmClient slurmc
 		Constraints: ptr.To(newFeatures),
 	}
 	if err := slurmClient.Update(ctx, jobInfo, updateReq); err != nil {
+		if isSlurmPartConfigUnavailable(err) {
+			logger.V(1).Info("Slurm returned partition configuration unavailable after unholding job", "jobID", jobID, "error", err)
+			return nil
+		}
 		return fmt.Errorf("failed to release hold on Slurm job %d: %w", jobID, err)
 	}
 	return nil
@@ -746,15 +825,7 @@ func CountActiveJobSets(ctx context.Context, c client.Client, wm *k8sbridgev1alp
 			continue
 		}
 
-		isTerminal := false
-		for _, cond := range js.Status.Conditions {
-			if cond.Status == metav1.ConditionTrue &&
-				(cond.Type == string(jobsetv1alpha2.JobSetCompleted) || cond.Type == string(jobsetv1alpha2.JobSetFailed)) {
-				isTerminal = true
-				break
-			}
-		}
-		if !isTerminal {
+		if _, isTerminal := terminalJobSetStatus(js); !isTerminal {
 			count++
 		}
 	}

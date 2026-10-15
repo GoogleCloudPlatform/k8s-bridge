@@ -212,7 +212,6 @@ func deriveNodeNames(js *jobsetv1alpha2.JobSet) []string {
 	return nodeNames
 }
 
-// cleanupDynamicNodes deletes dynamic slurmd nodes from Slurm.
 const defaultSlurmCallTimeout = 5 * time.Second
 
 func (r *JobTeardownReconciler) cleanupDynamicNodes(
@@ -220,7 +219,19 @@ func (r *JobTeardownReconciler) cleanupDynamicNodes(
 	slurmClient slurmclient.Client,
 	js *jobsetv1alpha2.JobSet,
 ) error {
-	logger := log.FromContext(ctx).WithName("slurmjob-teardown-reconciler")
+	return cleanupDynamicNodes(ctx, slurmClient, js)
+}
+
+// cleanupDynamicNodes deletes dynamic slurmd nodes from Slurm.
+func cleanupDynamicNodes(
+	ctx context.Context,
+	slurmClient slurmclient.Client,
+	js *jobsetv1alpha2.JobSet,
+) error {
+	if js == nil || slurmClient == nil {
+		return nil
+	}
+	logger := log.FromContext(ctx)
 	nodeNames := deriveNodeNames(js)
 
 	var errs []error
@@ -238,15 +249,13 @@ func (r *JobTeardownReconciler) cleanupDynamicNodes(
 		callCtx, cancel := context.WithTimeout(ctx, defaultSlurmCallTimeout)
 		err := slurmClient.Delete(callCtx, node)
 		cancel()
-		if err != nil {
-			if isSlurmNotFound(err) {
-				logger.V(1).Info("Dynamic node already removed or not found in Slurm", "node", nodeName)
-				continue
-			}
-			errs = append(errs, fmt.Errorf("failed to delete dynamic node %s: %w", nodeName, err))
-		} else {
+		if err == nil {
 			deletedCount++
 			logger.V(1).Info("Deleted dynamic node from Slurm", "node", nodeName)
+		} else if isSlurmNotFound(err) {
+			logger.V(1).Info("Dynamic node already removed or not found in Slurm", "node", nodeName)
+		} else {
+			errs = append(errs, fmt.Errorf("failed to delete dynamic node %s: %w", nodeName, err))
 		}
 	}
 	if deletedCount > 0 {
