@@ -19,8 +19,10 @@ package utils
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
+	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	"github.com/SlinkyProject/slurm-client/pkg/client"
 	"github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
@@ -36,13 +38,17 @@ type JobUpdate struct {
 }
 
 type SlurmClient struct {
-	lock        sync.RWMutex
-	server      string
-	token       string
-	jobs        map[string][]slurmclienttypes.V0044JobInfo
-	deletedJobs []int32
-	updatedJobs []JobUpdate
-	GetError    error
+	lock            sync.RWMutex
+	server          string
+	token           string
+	jobs            map[string][]slurmclienttypes.V0044JobInfo
+	deletedJobs     []int32
+	deletedNodes    []string
+	updatedJobs     []JobUpdate
+	GetError        error
+	UpdateError     error
+	DeleteNodeError error
+	MutateOnUpdate  bool
 }
 
 func (s *SlurmClient) Start(ctx context.Context) {
@@ -119,6 +125,18 @@ func (s *SlurmClient) List(ctx context.Context, list object.ObjectList, opts ...
 	return nil
 }
 
+func applyJobDescMutation(target *slurmclienttypes.V0044JobInfo, reqMsg slurmapi.V0044JobDescMsg) {
+	if reqMsg.Comment != nil {
+		target.Comment = ptr.To(*reqMsg.Comment)
+	}
+	if reqMsg.Hold != nil {
+		target.Hold = ptr.To(*reqMsg.Hold)
+	}
+	if reqMsg.Constraints != nil {
+		target.Features = ptr.To(*reqMsg.Constraints)
+	}
+}
+
 func (s *SlurmClient) Update(ctx context.Context, obj object.Object, req any, opts ...client.UpdateOption) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -129,7 +147,18 @@ func (s *SlurmClient) Update(ctx context.Context, obj object.Object, req any, op
 			JobID: jobID,
 			Req:   req,
 		})
-		return nil
+		if s.MutateOnUpdate {
+			if reqMsg, ok := req.(slurmapi.V0044JobDescMsg); ok {
+				for part, jobs := range s.jobs {
+					for i := range jobs {
+						if ptr.Deref(jobs[i].JobId, 0) == jobID {
+							applyJobDescMutation(&s.jobs[part][i], reqMsg)
+						}
+					}
+				}
+			}
+		}
+		return s.UpdateError
 	}
 	return fmt.Errorf("unsupported object type: %T", obj)
 }
@@ -152,6 +181,13 @@ func (s *SlurmClient) Delete(ctx context.Context, obj object.Object, opts ...cli
 		}
 		return nil
 	}
+	if node, ok := obj.(*slurmclienttypes.V0044Node); ok {
+		s.deletedNodes = append(s.deletedNodes, ptr.Deref(node.Name, ""))
+		if s.DeleteNodeError != nil {
+			return s.DeleteNodeError
+		}
+		return nil
+	}
 	return fmt.Errorf("unsupported object type: %T", obj)
 }
 
@@ -161,17 +197,23 @@ func (s *SlurmClient) SetPendingJobs(partition string, jobs []slurmclienttypes.V
 	if s.jobs == nil {
 		s.jobs = make(map[string][]slurmclienttypes.V0044JobInfo)
 	}
-	s.jobs[partition] = jobs
+	s.jobs[partition] = slices.Clone(jobs)
 }
 
 func (s *SlurmClient) GetDeletedJobs() []int32 {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
-	return s.deletedJobs
+	return slices.Clone(s.deletedJobs)
+}
+
+func (s *SlurmClient) GetDeletedNodes() []string {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return slices.Clone(s.deletedNodes)
 }
 
 func (s *SlurmClient) GetUpdatedJobs() []JobUpdate {
 	s.lock.RLock()
 	defer s.lock.RUnlock()
-	return s.updatedJobs
+	return slices.Clone(s.updatedJobs)
 }

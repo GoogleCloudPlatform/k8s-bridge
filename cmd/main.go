@@ -258,6 +258,7 @@ func main() {
 	}
 	if err := (&slurmjob.SlurmJobReconciler{
 		Client:              mgr.GetClient(),
+		APIReader:           mgr.GetAPIReader(),
 		Scheme:              mgr.GetScheme(),
 		AdmissionEventsChan: admissionEventsChan,
 		ClientMap:           cMap,

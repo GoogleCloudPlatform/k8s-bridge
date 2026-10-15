@@ -18,16 +18,21 @@ package slurmjob
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
+	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,6 +41,7 @@ import (
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
+	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
@@ -52,6 +58,13 @@ const (
 	reconJobIDStr        = "12345"
 	reconSlurmAuthSecret = "slurm-auth-slurm"
 )
+
+func newPartConfigUnavailable422Error() error {
+	return utilerrors.NewAggregate([]error{
+		errors.New(http.StatusText(http.StatusUnprocessableEntity)),
+		errors.New("Requested partition configuration not available now"),
+	})
+}
 
 func getReconTestController() *slinkyv1beta1.Controller {
 	return &slinkyv1beta1.Controller{
@@ -120,6 +133,7 @@ func newTestJobSet(name string) *testJobSetBuilder {
 func newReconTestJobSet() *testJobSetBuilder {
 	return newTestJobSet("slurm-job-" + reconJobIDStr).
 		withLabels(map[string]string{
+			LabelKueueQueue:     "some-queue",
 			LabelSlurmJobID:     reconJobIDStr,
 			LabelSlurmPartition: reconPartitionName,
 		}).
@@ -134,6 +148,13 @@ func (b *testJobBuilder) withDefaultReconFields() *testJobBuilder {
 		withJobID(reconJobID).
 		withPartition(reconPartitionName).
 		withNodes(testDefaultNodeCount)
+}
+
+func (b *testJobBuilder) withTranslatedJobMarkers() *testJobBuilder {
+	jobID := ptr.Deref(b.job.JobId, reconJobID)
+	return b.
+		withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)).
+		withComment(fmt.Sprintf("Unheld by k8s-bridge: Kubernetes resource slurm-job-%d created successfully", jobID))
 }
 
 func newReconTestJob() *testJobBuilder {
@@ -166,6 +187,25 @@ func (b *testJobSetBuilder) withSuspend(suspend bool) *testJobSetBuilder {
 	return b
 }
 
+func (b *testJobSetBuilder) withDeletionTimestamp() *testJobSetBuilder {
+	now := metav1.Now()
+	b.jobSet.DeletionTimestamp = &now
+	if len(b.jobSet.Finalizers) == 0 {
+		b.jobSet.Finalizers = []string{testFinalizer}
+	}
+	return b
+}
+
+func (b *testJobSetBuilder) withSlurmdReplicas(replicas int32) *testJobSetBuilder {
+	b.jobSet.Spec.ReplicatedJobs = []jobsetv1alpha2.ReplicatedJob{
+		{
+			Name:     ContainerSlurmd,
+			Replicas: replicas,
+		},
+	}
+	return b
+}
+
 //nolint:unparam
 func (b *testJobSetBuilder) withCondition(conditionType string, status metav1.ConditionStatus) *testJobSetBuilder {
 	b.jobSet.Status.Conditions = append(b.jobSet.Status.Conditions, metav1.Condition{
@@ -184,6 +224,7 @@ type reconcileTestEnv struct {
 	scheme     *runtime.Scheme
 	wm         *k8sbridgev1alpha1.WorkloadMixing
 	req        ctrl.Request
+	baseClient client.Client
 	fakeClient client.Client
 	mockSlurm  *utils.SlurmClient
 	clientMap  *clientmap.ClientMap
@@ -201,6 +242,8 @@ type reconcileEnvConfig struct {
 	interceptors           *interceptor.Funcs
 	pendingJobs            []slurmclienttypes.V0044JobInfo
 	partition              string
+	slurmUpdateError       error
+	slurmMutateOnUpdate    bool
 }
 
 func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
@@ -243,6 +286,13 @@ func withPendingSlurmJobs(jobs ...*slurmclienttypes.V0044JobInfo) reconcileEnvOp
 	}
 }
 
+func withSlurmUpdateError(err error, mutateOnUpdate bool) reconcileEnvOpt {
+	return func(c *reconcileEnvConfig) {
+		c.slurmUpdateError = err
+		c.slurmMutateOnUpdate = mutateOnUpdate
+	}
+}
+
 func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEnv {
 	t.Helper()
 	var cfg reconcileEnvConfig
@@ -263,13 +313,16 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 	}
 	initObjs = append(initObjs, cfg.extraObjects...)
 
-	clientBuilder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).Build()
+	fakeClient := client.Client(baseClient)
 	if cfg.interceptors != nil {
-		clientBuilder = clientBuilder.WithInterceptorFuncs(*cfg.interceptors)
+		fakeClient = interceptor.NewClient(baseClient, *cfg.interceptors)
 	}
-	fakeClient := clientBuilder.Build()
 
-	mockSlurm := &utils.SlurmClient{}
+	mockSlurm := &utils.SlurmClient{
+		UpdateError:    cfg.slurmUpdateError,
+		MutateOnUpdate: cfg.slurmMutateOnUpdate,
+	}
 	if len(cfg.pendingJobs) > 0 {
 		mockSlurm.SetPendingJobs(cfg.partition, cfg.pendingJobs)
 	}
@@ -285,6 +338,7 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 
 	reconciler := &SlurmJobReconciler{
 		Client:    fakeClient,
+		APIReader: baseClient,
 		Scheme:    scheme,
 		ClientMap: cMap,
 	}
@@ -294,6 +348,7 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 		scheme:     scheme,
 		wm:         wm,
 		req:        req,
+		baseClient: baseClient,
 		fakeClient: fakeClient,
 		mockSlurm:  mockSlurm,
 		clientMap:  cMap,
@@ -311,10 +366,11 @@ func (e *reconcileTestEnv) reconcile(ctx ...context.Context) (ctrl.Result, error
 	return e.reconciler.Reconcile(c, e.req)
 }
 
+//nolint:unparam
 func (e *reconcileTestEnv) verifyJobSetCreated(wantQueue string, wantJobID string, wantOwnerName string) *jobsetv1alpha2.JobSet {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet
-	if err := e.fakeClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
+	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
 		e.t.Fatalf("Expected JobSet to be created, but got error: %v", err)
 		return nil
 	}
@@ -340,7 +396,7 @@ func (e *reconcileTestEnv) verifyJobSetCreated(wantQueue string, wantJobID strin
 func (e *reconcileTestEnv) verifyJobSetNotFound() {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet
-	err := e.fakeClient.Get(context.Background(), e.jobSetKey, &js)
+	err := e.baseClient.Get(context.Background(), e.jobSetKey, &js)
 	if !apierrors.IsNotFound(err) {
 		e.t.Errorf("Expected JobSet to NOT exist (NotFound), got err: %v", err)
 	}
@@ -349,7 +405,7 @@ func (e *reconcileTestEnv) verifyJobSetNotFound() {
 func (e *reconcileTestEnv) verifyJobSetSuspended(wantSuspended bool, wantSuspendedBySlurmHoldAnnotation bool) {
 	e.t.Helper()
 	var js jobsetv1alpha2.JobSet
-	if err := e.fakeClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
+	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
 		e.t.Fatalf("Failed to fetch JobSet: %v", err)
 	}
 	isSuspended := js.Spec.Suspend != nil && *js.Spec.Suspend
@@ -412,6 +468,13 @@ func (e *reconcileTestEnv) verifySlurmCancellation(wantCommentSubstr string) {
 	}
 }
 
+func (e *reconcileTestEnv) verifySlurmNodesDeleted(wantNodes ...string) {
+	e.t.Helper()
+	if gotNodes := e.mockSlurm.GetDeletedNodes(); !slices.Equal(gotNodes, wantNodes) {
+		e.t.Errorf("Deleted Slurm nodes = %v, want %v", gotNodes, wantNodes)
+	}
+}
+
 func (e *reconcileTestEnv) verifyNoSlurmUpdates() {
 	e.t.Helper()
 	if len(e.mockSlurm.GetUpdatedJobs()) != 0 {
@@ -420,4 +483,15 @@ func (e *reconcileTestEnv) verifyNoSlurmUpdates() {
 	if len(e.mockSlurm.GetDeletedJobs()) != 0 {
 		e.t.Errorf("Expected no job deletions, got %v", e.mockSlurm.GetDeletedJobs())
 	}
+	if len(e.mockSlurm.GetDeletedNodes()) != 0 {
+		e.t.Errorf("Expected no node deletions, got %v", e.mockSlurm.GetDeletedNodes())
+	}
+}
+
+func (e *reconcileTestEnv) jobsDiscoveredCount() float64 {
+	return testutil.ToFloat64(metrics.JobsDiscovered.WithLabelValues(reconWmName, reconPartitionName))
+}
+
+func (e *reconcileTestEnv) jobsSyncCount(status, reason string) float64 {
+	return testutil.ToFloat64(metrics.JobsSync.WithLabelValues(status, reason, reconWmName, reconPartitionName))
 }
