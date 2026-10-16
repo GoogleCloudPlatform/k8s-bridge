@@ -354,6 +354,13 @@ func (b *testJobBuilder) withFeatures(features string) *testJobBuilder {
 	return b
 }
 
+// withRequeue sets the requeue flag that slurmrestd reports for the job:
+// false for sbatch --no-requeue (or JobRequeue=0), true otherwise.
+func (b *testJobBuilder) withRequeue(requeue bool) *testJobBuilder {
+	b.job.Requeue = ptr.To(requeue)
+	return b
+}
+
 func (b *testJobBuilder) build() *slurmclienttypes.V0044JobInfo {
 	return b.job
 }
@@ -505,8 +512,8 @@ func verifyJobSetBasics(t *testing.T, js *jobsetv1alpha2.JobSet, wantJobID strin
 	}
 	if js.Spec.FailurePolicy == nil {
 		t.Error("Translate() returned FailurePolicy = nil, want non-nil")
-	} else if js.Spec.FailurePolicy.MaxRestarts != 1 {
-		t.Errorf("Translate() returned FailurePolicy.MaxRestarts = %v, want 1", js.Spec.FailurePolicy.MaxRestarts)
+	} else if js.Spec.FailurePolicy.MaxRestarts != 3 {
+		t.Errorf("Translate() returned FailurePolicy.MaxRestarts = %v, want 3", js.Spec.FailurePolicy.MaxRestarts)
 	}
 
 	if len(js.Spec.ReplicatedJobs) != 1 {

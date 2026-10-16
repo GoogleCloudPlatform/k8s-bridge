@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,6 +80,26 @@ func JobSetUID(name, ns string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// JobSetRestarts returns status.restarts of the named JobSet.
+// It returns 0 if the field is unset or the JobSet does not exist.
+func JobSetRestarts(name, ns string) (int32, error) {
+	out, err := Run(exec.Command(
+		"kubectl", "get", "jobset", name, "-n", ns, "--ignore-not-found", "-o", "jsonpath={.status.restarts}",
+	))
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(out)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse status.restarts %q of JobSet %s: %w", s, name, err)
+	}
+	return int32(n), nil
 }
 
 // ExpectJobSetNotRecreated asserts that no JobSet with the given name exists
