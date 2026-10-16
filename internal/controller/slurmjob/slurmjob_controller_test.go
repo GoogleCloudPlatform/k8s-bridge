@@ -1078,26 +1078,24 @@ func TestReconcile_ExplicitHold_DoesNotMutateExistingJobSetOrUnhold(t *testing.T
 				withSuspend(false).
 				build()
 
-			jobBuilder := newReconTestJob().
+			job := newReconTestJob().
 				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
 				withHold(true).
-				withStateReason(tc.stateReason)
-			if tc.comment != "" {
-				jobBuilder = jobBuilder.withComment(tc.comment)
-			}
-			job := jobBuilder.build()
+				withStateReason(tc.stateReason).
+				withComment(tc.comment).
+				build()
 
 			env := newReconcileTestEnv(t,
 				withExtraObjects(js),
 				withPendingSlurmJobs(job),
 			)
 
-			_, err := env.reconcile()
-			if err != nil {
+			before := env.getJobSet()
+			if _, err := env.reconcile(); err != nil {
 				t.Fatalf("Reconcile failed: %v", err)
 			}
 
-			env.verifyJobSetSuspended(false)
+			env.verifyJobSetUnchanged(before)
 			env.verifyNoSlurmUpdates()
 		})
 	}
@@ -1175,12 +1173,12 @@ func TestReconcile_SuspendedJobSet_UnheldJob_NotResumedByBridge(t *testing.T) {
 		withPendingSlurmJobs(job),
 	)
 
-	_, err := env.reconcile()
-	if err != nil {
+	before := env.getJobSet()
+	if _, err := env.reconcile(); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifyJobSetSuspended(true)
+	env.verifyJobSetUnchanged(before)
 	env.verifyNoSlurmUpdates()
 }
 

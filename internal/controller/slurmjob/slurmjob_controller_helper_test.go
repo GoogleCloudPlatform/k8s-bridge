@@ -26,6 +26,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -399,15 +400,19 @@ func (e *reconcileTestEnv) verifyJobSetNotFound() {
 	}
 }
 
-func (e *reconcileTestEnv) verifyJobSetSuspended(wantSuspended bool) {
+func (e *reconcileTestEnv) getJobSet() *jobsetv1alpha2.JobSet {
 	e.t.Helper()
-	var js jobsetv1alpha2.JobSet
-	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
-		e.t.Fatalf("Failed to fetch JobSet: %v", err)
+	js := &jobsetv1alpha2.JobSet{}
+	if err := e.baseClient.Get(e.t.Context(), e.jobSetKey, js); err != nil {
+		e.t.Fatalf("Failed to get JobSet %s: %v", e.jobSetKey, err)
 	}
-	isSuspended := js.Spec.Suspend != nil && *js.Spec.Suspend
-	if isSuspended != wantSuspended {
-		e.t.Errorf("Expected JobSet.Spec.Suspend = %v, got %v", wantSuspended, isSuspended)
+	return js
+}
+
+func (e *reconcileTestEnv) verifyJobSetUnchanged(before *jobsetv1alpha2.JobSet) {
+	e.t.Helper()
+	if diff := cmp.Diff(before, e.getJobSet()); diff != "" {
+		e.t.Errorf("Reconcile changed the JobSet (-before +after):\n%s", diff)
 	}
 }
 
