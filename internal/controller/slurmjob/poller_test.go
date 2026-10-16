@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
@@ -416,6 +417,7 @@ func TestSlurmPoller_Poll(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	t.Run("Success - Single WorkloadMixing with jobs", func(t *testing.T) {
 		testPollSingleWorkloadMixing(t, scheme)
@@ -450,6 +452,7 @@ func TestSlurmPoller_Poll_MultiPartition(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm).Build()
@@ -499,6 +502,7 @@ func TestSlurmPoller_Metrics(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	wm := newTestWorkloadMixing(testMetricsWMName, testMetricsCtrlName, testPartitionName, testQueueName)
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm).Build()
@@ -1360,5 +1364,236 @@ func TestPoll_OrphanedJobSet_PrunesDeletedJobSetsFromTracking(t *testing.T) {
 	case ev := <-teardownChan:
 		t.Fatalf("Expected no teardown event for recreated jsB yet, got: %v", ev)
 	default:
+	}
+}
+
+func TestShouldEmitAdmissionEvent(t *testing.T) {
+	const jobID int32 = 301
+	const jobSetName = "slurm-job-301"
+
+	newPendingJobBuilder := func() *testJobBuilder {
+		return newEmptyTestJob().
+			withJobID(jobID).
+			withPartition(testPartitionName).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
+	}
+
+	newJobSet := func(suspend bool, annotations map[string]string) *jobsetv1alpha2.JobSet {
+		return newTestJobSet(jobSetName).
+			withSuspend(suspend).
+			withAnnotations(annotations).
+			build()
+	}
+
+	tests := []struct {
+		name       string
+		job        *slurmclienttypes.V0044JobInfo
+		existingJS *jobsetv1alpha2.JobSet
+		want       bool
+	}{
+		{
+			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newJobSet(false, nil),
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newJobSet(true, nil),
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has no JobSet and is explicitly held by user",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment("user hold comment").
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has no JobSet and is explicitly held by admin",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldAdmin).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name: "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
+			job: newPendingJobBuilder().
+				withPartition(testPartitionName + ",other-partition").
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has no JobSet and is auto-held",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusExplicitlyHeld)",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				build(),
+			existingJS: newJobSet(false, nil),
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has existing JobSet suspended by Slurm hold and explicit hold is removed (StatusExplicitHoldRemoved)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("None").
+				build(),
+			existingJS: newJobSet(true, map[string]string{AnnotationSuspendedBySlurmHold: ValueTrue}),
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newJobSet(false, nil),
+			want:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldEmitAdmissionEvent(tc.job, tc.existingJS); got != tc.want {
+				t.Errorf("shouldEmitAdmissionEvent() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	const jobID int32 = 301
+	const jobSetName = "slurm-job-301"
+
+	newPendingJobBuilder := func() *testJobBuilder {
+		return newEmptyTestJob().
+			withJobID(jobID).
+			withPartition(testPartitionName).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
+	}
+
+	newOwnedJobSet := func(suspend bool, ownerUID types.UID) *jobsetv1alpha2.JobSet {
+		return &jobsetv1alpha2.JobSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      jobSetName,
+				Namespace: testNamespace,
+				Labels: map[string]string{
+					LabelSlurmJobID:     "301",
+					LabelSlurmPartition: testPartitionName,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+						Kind:       KindWorkloadMixing,
+						Name:       testWMName,
+						UID:        ownerUID,
+					},
+				},
+			},
+			Spec: jobsetv1alpha2.JobSetSpec{
+				Suspend: ptr.To(suspend),
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		job        slurmclienttypes.V0044JobInfo
+		existingJS *jobsetv1alpha2.JobSet
+		wantEmit   bool
+	}{
+		{
+			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			job: *newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newOwnedJobSet(false, testWMUID),
+			wantEmit:   false,
+		},
+		{
+			name: "Emits when PENDING job has existing JobSet with mismatched owner UID (not owned by WM)",
+			job: *newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newOwnedJobSet(true, "stale-wm-uid"),
+			wantEmit:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+			wm.UID = testWMUID
+
+			objs := []client.Object{wm}
+			if tc.existingJS != nil {
+				objs = append(objs, tc.existingJS)
+			}
+			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+
+			cMap := clientmap.NewClientMap()
+			mockSlurm := &utils.SlurmClient{}
+			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{tc.job})
+			controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+			cMap.Add(ctx, controllerKey, mockSlurm)
+
+			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
+			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+			poller := &SlurmPoller{
+				Client:          fakeK8sClient,
+				ClientMap:       cMap,
+				AdmissionEvents: admissionChan,
+				TeardownEvents:  teardownChan,
+				PollInterval:    10 * time.Second,
+			}
+
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll failed: %v", err)
+			}
+
+			want := 0
+			if tc.wantEmit {
+				want = 1
+			}
+			if got := len(admissionChan); got != want {
+				t.Fatalf("Poll() emitted %d admission events, want %d", got, want)
+			}
+		})
 	}
 }
