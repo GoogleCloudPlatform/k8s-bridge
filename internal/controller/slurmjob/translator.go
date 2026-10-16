@@ -75,8 +75,12 @@ const (
 	ValueTrue                      = "true"
 	AutoHoldMarker                 = "k8s-bridge-auto-hold"
 
+	// LINT.IfChange(max_restarts)
+	// DefaultJobSetMaxRestarts and NoRequeueJobSetMaxRestarts set failurePolicy.maxRestarts
+	// on a translated JobSet. A job that was submitted with sbatch --no-requeue must not restart.
 	DefaultJobSetMaxRestarts   int32 = 3
 	NoRequeueJobSetMaxRestarts int32 = 0
+	// LINT.ThenChange(test/e2e/jobset_restart_policy_test.go:max_restarts)
 
 	SlurmdProbePeriodSeconds            = 10
 	SlurmdProbeTimeoutSeconds           = 5
@@ -205,8 +209,11 @@ func (t *JobSetTranslator) Translate(
 	return buildJobSet(jobIDStr, replicas, resolveMaxRestarts(job), labels, podTemplate), nil
 }
 
+// resolveMaxRestarts returns the JobSet restart budget for a Slurm job.
+// Requeue is false for a job that Slurm must not requeue, for example a job
+// that was submitted with sbatch --no-requeue. A nil Requeue keeps the default budget.
 func resolveMaxRestarts(job *slurmclienttypes.V0044JobInfo) int32 {
-	if job.Requeue != nil && !*job.Requeue {
+	if !ptr.Deref(job.Requeue, true) {
 		return NoRequeueJobSetMaxRestarts
 	}
 	return DefaultJobSetMaxRestarts
@@ -830,7 +837,8 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 			return corev1.ResourceRequirements{}, nil, fmt.Errorf("missing GRES mapping for gpu:%s", resolvedGPU.resourceType)
 		}
 		k8sGpuResourceName = mapping.K8sResourceName
-		nodeSelectors = mapping.NodeSelectors
+		// Copy the map so that the JobSet does not share it with the WorkloadMixing spec.
+		nodeSelectors = maps.Clone(mapping.NodeSelectors)
 	}
 
 	// Resolve CPUs per pod

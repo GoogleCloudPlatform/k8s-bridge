@@ -20,9 +20,6 @@ package e2e
 
 import (
 	"fmt"
-	"os/exec"
-	"strconv"
-	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -32,9 +29,14 @@ import (
 )
 
 const (
-	failingSlurmdConfigPath        = "test/e2e/testdata/workloadmixing_failing_slurmd.yaml"
+	failingSlurmdConfigPath = "test/e2e/testdata/workloadmixing_failing_slurmd.yaml"
+	restartPolicyTimeout    = 5 * time.Minute
+
+	// LINT.IfChange(max_restarts)
+	// defaultJobSetMaxRestarts is the restart budget that k8s-bridge sets on a
+	// translated JobSet when the Slurm job may be requeued.
 	defaultJobSetMaxRestarts int32 = 3
-	restartPolicyTimeout           = 5 * time.Minute
+	// LINT.ThenChange(internal/controller/slurmjob/translator.go:max_restarts)
 )
 
 var _ = Describe("JobSet restart policy", func() {
@@ -148,6 +150,9 @@ func verifyJobSetMaxRestarts(jobSetName string, wantMaxRestarts int32) {
 // count cannot be read afterwards; the tracker records the highest value seen while the
 // JobSet exists instead. Each restart attempt lives for several seconds (the failing
 // slurmd container sleeps before it exits), so 1 s polls see every attempt.
+//
+// A jobSetRestartTracker is not safe for concurrent use. Call expectWithinBudget
+// only from an Eventually poll function, because it can call StopTrying(...).Now().
 type jobSetRestartTracker struct {
 	jobSetName  string
 	maxRestarts int32
@@ -163,19 +168,9 @@ func newJobSetRestartTracker(jobSetName string, maxRestarts int32) *jobSetRestar
 // an unexpected restart is reported immediately instead of as a timeout. A JobSet that
 // k8s-bridge already deleted is tolerated.
 func (t *jobSetRestartTracker) expectWithinBudget(g Gomega) {
-	out, err := utils.Run(exec.Command(
-		"kubectl", "get", "jobset", t.jobSetName, "-n", slurmNamespace,
-		"--ignore-not-found", "-o", "jsonpath={.status.restarts}",
-	))
-	g.Expect(err).NotTo(HaveOccurred(), "Failed to read status.restarts of JobSet "+t.jobSetName)
-	// The field is omitted while it is 0 and once the JobSet is gone.
-	trimmed := strings.TrimSpace(out)
-	if trimmed == "" {
-		return
-	}
-	restarts, err := strconv.ParseInt(trimmed, 10, 32)
-	g.Expect(err).NotTo(HaveOccurred(), "Failed to parse status.restarts %q of JobSet %s", trimmed, t.jobSetName)
-	t.maxObserved = max(t.maxObserved, int32(restarts))
+	restarts, err := utils.JobSetRestarts(t.jobSetName, slurmNamespace)
+	g.Expect(err).NotTo(HaveOccurred(), "Failed to read status.restarts of JobSet %s", t.jobSetName)
+	t.maxObserved = max(t.maxObserved, restarts)
 	if t.maxObserved > t.maxRestarts {
 		StopTrying(fmt.Sprintf("JobSet %s was restarted %d times, at most %d restarts are allowed",
 			t.jobSetName, t.maxObserved, t.maxRestarts)).Now()

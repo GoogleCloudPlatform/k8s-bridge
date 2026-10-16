@@ -512,8 +512,8 @@ func verifyJobSetBasics(t *testing.T, js *jobsetv1alpha2.JobSet, wantJobID strin
 	}
 	if js.Spec.FailurePolicy == nil {
 		t.Error("Translate() returned FailurePolicy = nil, want non-nil")
-	} else if js.Spec.FailurePolicy.MaxRestarts != DefaultJobSetMaxRestarts {
-		t.Errorf("Translate() returned FailurePolicy.MaxRestarts = %v, want %v", js.Spec.FailurePolicy.MaxRestarts, DefaultJobSetMaxRestarts)
+	} else if js.Spec.FailurePolicy.MaxRestarts != 3 {
+		t.Errorf("Translate() returned FailurePolicy.MaxRestarts = %v, want 3", js.Spec.FailurePolicy.MaxRestarts)
 	}
 
 	if len(js.Spec.ReplicatedJobs) != 1 {
