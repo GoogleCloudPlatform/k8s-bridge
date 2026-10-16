@@ -1367,6 +1367,127 @@ func TestPoll_OrphanedJobSet_PrunesDeletedJobSetsFromTracking(t *testing.T) {
 	}
 }
 
+func TestShouldEmitAdmissionEvent(t *testing.T) {
+	const jobID int32 = 301
+	const jobSetName = "slurm-job-301"
+
+	newPendingJobBuilder := func() *testJobBuilder {
+		return newEmptyTestJob().
+			withJobID(jobID).
+			withPartition(testPartitionName).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
+	}
+
+	newJobSet := func(suspend bool, annotations map[string]string) *jobsetv1alpha2.JobSet {
+		return newTestJobSet(jobSetName).
+			withSuspend(suspend).
+			withAnnotations(annotations).
+			build()
+	}
+
+	tests := []struct {
+		name       string
+		job        *slurmclienttypes.V0044JobInfo
+		existingJS *jobsetv1alpha2.JobSet
+		want       bool
+	}{
+		{
+			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newJobSet(false, nil),
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newJobSet(true, nil),
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has no JobSet and is explicitly held by user",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment("user hold comment").
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has no JobSet and is explicitly held by admin",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldAdmin).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name: "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
+			job: newPendingJobBuilder().
+				withPartition(testPartitionName + ",other-partition").
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has no JobSet and is auto-held",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusExplicitlyHeld)",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				build(),
+			existingJS: newJobSet(false, nil),
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has existing JobSet suspended by Slurm hold and explicit hold is removed (StatusExplicitHoldRemoved)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("None").
+				build(),
+			existingJS: newJobSet(true, map[string]string{AnnotationSuspendedBySlurmHold: ValueTrue}),
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newJobSet(false, nil),
+			want:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldEmitAdmissionEvent(tc.job, tc.existingJS); got != tc.want {
+				t.Errorf("shouldEmitAdmissionEvent() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -1376,12 +1497,18 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 	const jobID int32 = 301
 	const jobSetName = "slurm-job-301"
 
-	newOwnedJobSet := func(suspend bool, annotations map[string]string) *jobsetv1alpha2.JobSet {
+	newPendingJobBuilder := func() *testJobBuilder {
+		return newEmptyTestJob().
+			withJobID(jobID).
+			withPartition(testPartitionName).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
+	}
+
+	newOwnedJobSet := func(suspend bool, ownerUID types.UID) *jobsetv1alpha2.JobSet {
 		return &jobsetv1alpha2.JobSet{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        jobSetName,
-				Namespace:   testNamespace,
-				Annotations: annotations,
+				Name:      jobSetName,
+				Namespace: testNamespace,
 				Labels: map[string]string{
 					LabelSlurmJobID:     "301",
 					LabelSlurmPartition: testPartitionName,
@@ -1391,7 +1518,7 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 						APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
 						Kind:       KindWorkloadMixing,
 						Name:       testWMName,
-						UID:        testWMUID,
+						UID:        ownerUID,
 					},
 				},
 			},
@@ -1409,152 +1536,22 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 	}{
 		{
 			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(false),
-					StateReason: ptr.To("Resources"),
-				},
-			},
-			existingJS: newOwnedJobSet(false, nil),
+			job: *newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newOwnedJobSet(false, testWMUID),
 			wantEmit:   false,
-		},
-		{
-			name: "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(false),
-					StateReason: ptr.To("Resources"),
-				},
-			},
-			existingJS: newOwnedJobSet(true, nil),
-			wantEmit:   false,
-		},
-		{
-			name: "Skips when PENDING job has no JobSet and is explicitly held by user",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(true),
-					StateReason: ptr.To(ReasonJobHeldUser),
-					Comment:     ptr.To("user hold comment"),
-				},
-			},
-			existingJS: nil,
-			wantEmit:   false,
-		},
-		{
-			name: "Skips when PENDING job has no JobSet and is explicitly held by admin",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(true),
-					StateReason: ptr.To(ReasonJobHeldAdmin),
-					Comment:     ptr.To(AutoHoldMarker),
-				},
-			},
-			existingJS: nil,
-			wantEmit:   false,
-		},
-		{
-			name: "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName + ",other-partition"),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(true),
-					StateReason: ptr.To(ReasonJobHeldUser),
-				},
-			},
-			existingJS: nil,
-			wantEmit:   true,
-		},
-		{
-			name: "Emits when PENDING job has no JobSet and is auto-held",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(true),
-					StateReason: ptr.To(ReasonJobHeldUser),
-					Comment:     ptr.To(AutoHoldMarker),
-				},
-			},
-			existingJS: nil,
-			wantEmit:   true,
-		},
-		{
-			name: "Emits when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusExplicitlyHeld)",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(true),
-					StateReason: ptr.To(ReasonJobHeldUser),
-				},
-			},
-			existingJS: newOwnedJobSet(false, nil),
-			wantEmit:   true,
-		},
-		{
-			name: "Emits when PENDING job has existing JobSet suspended by Slurm hold and explicit hold is removed (StatusExplicitHoldRemoved)",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(false),
-					StateReason: ptr.To("None"),
-				},
-			},
-			existingJS: newOwnedJobSet(true, map[string]string{AnnotationSuspendedBySlurmHold: ValueTrue}),
-			wantEmit:   true,
-		},
-		{
-			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(true),
-					StateReason: ptr.To(ReasonJobHeldUser),
-					Comment:     ptr.To(AutoHoldMarker),
-				},
-			},
-			existingJS: newOwnedJobSet(false, nil),
-			wantEmit:   true,
 		},
 		{
 			name: "Emits when PENDING job has existing JobSet with mismatched owner UID (not owned by WM)",
-			job: slurmclienttypes.V0044JobInfo{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:       ptr.To(jobID),
-					Partition:   ptr.To(testPartitionName),
-					JobState:    ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStatePENDING}),
-					Hold:        ptr.To(true),
-					StateReason: ptr.To(ReasonJobHeldUser),
-					Comment:     ptr.To(AutoHoldMarker),
-				},
-			},
-			existingJS: func() *jobsetv1alpha2.JobSet {
-				js := newOwnedJobSet(true, nil)
-				js.OwnerReferences[0].UID = "stale-wm-uid"
-				return js
-			}(),
-			wantEmit: true,
+			job: *newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newOwnedJobSet(true, "stale-wm-uid"),
+			wantEmit:   true,
 		},
 	}
 
@@ -1590,17 +1587,12 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 				t.Fatalf("Poll failed: %v", err)
 			}
 
-			close(admissionChan)
-			var received []slurmtypes.SlurmJobAdmissionEvent
-			for ev := range admissionChan {
-				received = append(received, ev)
+			want := 0
+			if tc.wantEmit {
+				want = 1
 			}
-
-			if tc.wantEmit && len(received) != 1 {
-				t.Fatalf("Expected 1 admission event, got %d", len(received))
-			}
-			if !tc.wantEmit && len(received) != 0 {
-				t.Fatalf("Expected 0 admission events, got %d: %+v", len(received), received)
+			if got := len(admissionChan); got != want {
+				t.Fatalf("Poll() emitted %d admission events, want %d", got, want)
 			}
 		})
 	}

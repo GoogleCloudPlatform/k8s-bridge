@@ -43,6 +43,7 @@ const (
 	// defaultOrphanGracePeriod defines the default duration an absent Slurm workload's
 	// corresponding JobSet must remain missing before being flagged as orphaned and torn down.
 	defaultOrphanGracePeriod = 1 * time.Minute
+	jobSetNameFormat         = "slurm-job-%d"
 )
 
 // SlurmPoller periodically queries the Slurm REST API for pending jobs
@@ -480,7 +481,8 @@ func (p *SlurmPoller) processPendingJobsForWM(
 
 			if matched {
 				jobID := ptr.Deref(job.JobId, 0)
-				existingJS := jobSetsByName[fmt.Sprintf("slurm-job-%d", jobID)]
+				jobSetName := fmt.Sprintf(jobSetNameFormat, jobID)
+				existingJS := jobSetsByName[jobSetName]
 				if !shouldEmitAdmissionEvent(job, existingJS) {
 					logger.V(1).Info("Skipping redundant SlurmJobAdmissionEvent", "jobID", jobID, "workloadMixing", client.ObjectKeyFromObject(wm))
 					continue
