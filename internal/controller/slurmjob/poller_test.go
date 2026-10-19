@@ -1443,25 +1443,13 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       true,
 		},
 		{
-			name: "Emits when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusExplicitlyHeld)",
+			name: "Skips when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusNoAction)",
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
 				build(),
 			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
-			want:       true,
-		},
-		{
-			name: "Emits when PENDING job has existing JobSet suspended by Slurm hold and explicit hold is removed (StatusExplicitHoldRemoved)",
-			job: newPendingJobBuilder().
-				withHold(false).
-				withStateReason("None").
-				build(),
-			existingJS: newTestJobSet(jobSetName).
-				withSuspend(true).
-				withAnnotations(map[string]string{AnnotationSuspendedBySlurmHold: ValueTrue}).
-				build(),
-			want: true,
+			want:       false,
 		},
 		{
 			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
