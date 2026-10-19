@@ -161,6 +161,11 @@ func newReconTestJob() *testJobBuilder {
 	return newEmptyTestJob().withDefaultReconFields()
 }
 
+func (b *testJobSetBuilder) withNamespace(namespace string) *testJobSetBuilder {
+	b.jobSet.Namespace = namespace
+	return b
+}
+
 func (b *testJobSetBuilder) withLabels(labels map[string]string) *testJobSetBuilder {
 	if b.jobSet.Labels == nil {
 		b.jobSet.Labels = make(map[string]string)

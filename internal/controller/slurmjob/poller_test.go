@@ -1378,13 +1378,6 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
 	}
 
-	newJobSet := func(suspend bool, annotations map[string]string) *jobsetv1alpha2.JobSet {
-		return newTestJobSet(jobSetName).
-			withSuspend(suspend).
-			withAnnotations(annotations).
-			build()
-	}
-
 	tests := []struct {
 		name       string
 		job        *slurmclienttypes.V0044JobInfo
@@ -1397,7 +1390,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 				withHold(false).
 				withStateReason("Resources").
 				build(),
-			existingJS: newJobSet(false, nil),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
 			want:       false,
 		},
 		{
@@ -1406,7 +1399,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 				withHold(false).
 				withStateReason("Resources").
 				build(),
-			existingJS: newJobSet(true, nil),
+			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
 			want:       false,
 		},
 		{
@@ -1455,7 +1448,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
 				build(),
-			existingJS: newJobSet(false, nil),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
 			want:       true,
 		},
 		{
@@ -1464,8 +1457,11 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 				withHold(false).
 				withStateReason("None").
 				build(),
-			existingJS: newJobSet(true, map[string]string{AnnotationSuspendedBySlurmHold: ValueTrue}),
-			want:       true,
+			existingJS: newTestJobSet(jobSetName).
+				withSuspend(true).
+				withAnnotations(map[string]string{AnnotationSuspendedBySlurmHold: ValueTrue}).
+				build(),
+			want: true,
 		},
 		{
 			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
@@ -1474,7 +1470,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 				withStateReason(ReasonJobHeldUser).
 				withComment(AutoHoldMarker).
 				build(),
-			existingJS: newJobSet(false, nil),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
 			want:       true,
 		},
 	}
@@ -1504,28 +1500,19 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
 	}
 
-	newOwnedJobSet := func(suspend bool, ownerUID types.UID) *jobsetv1alpha2.JobSet {
-		return &jobsetv1alpha2.JobSet{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      jobSetName,
-				Namespace: testNamespace,
-				Labels: map[string]string{
-					LabelSlurmJobID:     "301",
-					LabelSlurmPartition: testPartitionName,
-				},
-				OwnerReferences: []metav1.OwnerReference{
-					{
-						APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-						Kind:       KindWorkloadMixing,
-						Name:       testWMName,
-						UID:        ownerUID,
-					},
-				},
-			},
-			Spec: jobsetv1alpha2.JobSetSpec{
-				Suspend: ptr.To(suspend),
-			},
-		}
+	newOwnedJobSetBuilder := func(ownerUID types.UID) *testJobSetBuilder {
+		return newTestJobSet(jobSetName).
+			withNamespace(testNamespace).
+			withLabels(map[string]string{
+				LabelSlurmJobID:     "301",
+				LabelSlurmPartition: testPartitionName,
+			}).
+			withOwnerReference(metav1.OwnerReference{
+				APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+				Kind:       KindWorkloadMixing,
+				Name:       testWMName,
+				UID:        ownerUID,
+			})
 	}
 
 	tests := []struct {
@@ -1540,7 +1527,7 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 				withHold(false).
 				withStateReason("Resources").
 				build(),
-			existingJS: newOwnedJobSet(false, testWMUID),
+			existingJS: newOwnedJobSetBuilder(testWMUID).withSuspend(false).build(),
 			wantEmit:   false,
 		},
 		{
@@ -1550,7 +1537,7 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 				withStateReason(ReasonJobHeldUser).
 				withComment(AutoHoldMarker).
 				build(),
-			existingJS: newOwnedJobSet(true, "stale-wm-uid"),
+			existingJS: newOwnedJobSetBuilder("stale-wm-uid").withSuspend(true).build(),
 			wantEmit:   true,
 		},
 	}
