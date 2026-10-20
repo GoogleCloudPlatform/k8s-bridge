@@ -2116,6 +2116,17 @@ func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 1 {
 		t.Errorf("Expected 1 'New Slurm job appeared' log entry on first reconcile, got %d", got)
 	}
+	if got := recorded.FilterMessage("Created Kubernetes JobSet for Slurm job").Len(); got != 1 {
+		t.Errorf("Expected 1 'Created Kubernetes JobSet for Slurm job' log entry on first reconcile, got %d", got)
+	}
+	if got := recorded.FilterMessage("Released hold on Slurm job").Len(); got != 1 {
+		t.Errorf("Expected 1 'Released hold on Slurm job' log entry on first reconcile, got %d", got)
+	}
+	for _, entry := range recorded.All() {
+		if entry.ContextMap()["jobID"] != reconJobIDStr {
+			t.Errorf("Expected log entry %q to carry jobID=%q, got %v", entry.Message, reconJobIDStr, entry.ContextMap())
+		}
+	}
 
 	recorded.TakeAll()
 

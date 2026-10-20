@@ -106,14 +106,20 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 	ctx, cancel := context.WithTimeout(ctx, r.getReconciliationTimeout())
 	defer cancel()
 
-	logger := log.FromContext(ctx)
+	logger := log.FromContext(ctx).WithValues(
+		"jobID", ev.JobID,
+		"workloadMixing", ev.WorkloadMixing,
+	)
+	ctx = log.IntoContext(ctx, logger)
 
 	jobSetName := jobSetNameForJobID(ev.JobID)
+	logger.V(1).Info("Reconciling Slurm job teardown", "jobSet", jobSetName, "reason", ev.Reason, "partition", ev.Partition)
+
 	js := &jobsetv1alpha2.JobSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: jobSetName, Namespace: ev.WorkloadMixing.Namespace}, js)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.V(1).Info("JobSet not found, skipping teardown", "jobSet", jobSetName, "jobID", ev.JobID)
+			logger.V(1).Info("JobSet not found, skipping teardown", "jobSet", jobSetName)
 			return nil
 		}
 		return fmt.Errorf("failed to get JobSet %s/%s: %w", ev.WorkloadMixing.Namespace, jobSetName, err)
@@ -125,7 +131,7 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("failed to get parent WorkloadMixing %s: %w", ev.WorkloadMixing, err)
 		}
-		logger.V(1).Info("Parent WorkloadMixing not found, skipping event and gauge update", "workloadMixing", ev.WorkloadMixing)
+		logger.V(1).Info("Parent WorkloadMixing not found, skipping event and gauge update")
 		wm = nil
 	}
 
@@ -140,7 +146,7 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 
 	// Skip duplicate deletion if JobSet is already terminating
 	if isDeleting {
-		logger.V(1).Info("JobSet already has deletion timestamp, skipping redundant delete", "jobSet", jobSetName, "jobID", ev.JobID)
+		logger.V(1).Info("JobSet already has deletion timestamp, skipping redundant delete", "jobSet", jobSetName)
 	} else {
 		// Delete JobSet
 		if err := r.Delete(ctx, js); err != nil {
@@ -148,7 +154,7 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 				return fmt.Errorf("failed to delete JobSet %s/%s: %w", js.Namespace, js.Name, err)
 			}
 		}
-		logger.Info("Deleted JobSet for terminated Slurm job", "jobSet", jobSetName, "jobID", ev.JobID, "reason", ev.Reason)
+		logger.Info("Deleted JobSet for terminated Slurm job", "jobSet", jobSetName, "reason", ev.Reason)
 	}
 
 	if !isDeleting && r.Recorder != nil && wm != nil {
@@ -181,7 +187,7 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 	if wm != nil && partition != "" {
 		count, err := CountActiveJobSets(ctx, r.Client, wm, partition, js.Name)
 		if err != nil {
-			logger.Error(err, "Failed to count active JobSets for gauge metric update", "workloadMixing", wm.Name, "partition", partition)
+			logger.V(1).Info("Failed to count active JobSets for metric", "partition", partition, "error", err)
 		} else {
 			metrics.SetActiveJobs(wm.Name, partition, count)
 		}

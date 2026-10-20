@@ -17,10 +17,58 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"flag"
+	"strings"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
+
+func TestDefaultZapOptions(t *testing.T) {
+	t.Run("defaults to info level and disables debug logs", func(t *testing.T) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		opts := defaultZapOptions()
+		var buf bytes.Buffer
+		opts.DestWriter = &buf
+		opts.BindFlags(fs)
+		if err := fs.Parse([]string{}); err != nil {
+			t.Fatalf("unexpected error parsing flags: %v", err)
+		}
+
+		logger := zap.New(zap.UseFlagOptions(&opts))
+		logger.Info("info message")
+		logger.V(1).Info("debug message")
+
+		out := buf.String()
+		if !strings.Contains(out, "info message") {
+			t.Errorf("expected info message in default log output, got: %s", out)
+		}
+		if strings.Contains(out, "debug message") {
+			t.Errorf("expected debug message to be suppressed by default, got: %s", out)
+		}
+	})
+
+	t.Run("enables debug logs with --zap-log-level=debug", func(t *testing.T) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		opts := defaultZapOptions()
+		var buf bytes.Buffer
+		opts.DestWriter = &buf
+		opts.BindFlags(fs)
+		if err := fs.Parse([]string{"--zap-log-level=debug"}); err != nil {
+			t.Fatalf("unexpected error parsing flags: %v", err)
+		}
+
+		logger := zap.New(zap.UseFlagOptions(&opts))
+		logger.V(1).Info("debug message")
+
+		out := buf.String()
+		if !strings.Contains(out, "debug message") {
+			t.Errorf("expected debug message when --zap-log-level=debug is set, got: %s", out)
+		}
+	})
+}
 
 func TestBindManagerFlags(t *testing.T) {
 	t.Run("default flags", func(t *testing.T) {
