@@ -244,11 +244,19 @@ type reconcileEnvConfig struct {
 	partition              string
 	slurmUpdateError       error
 	slurmMutateOnUpdate    bool
+	podTemplate            *corev1.PodTemplateSpec
 }
 
 func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
 	return func(c *reconcileEnvConfig) {
 		c.extraObjects = append(c.extraObjects, objs...)
+	}
+}
+
+// withWMPodTemplate sets the podTemplate of the WorkloadMixing in the test environment.
+func withWMPodTemplate(podTemplate *corev1.PodTemplateSpec) reconcileEnvOpt {
+	return func(c *reconcileEnvConfig) {
+		c.podTemplate = podTemplate
 	}
 }
 
@@ -304,6 +312,9 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 	scheme, wm, req := setupReconcileTest(t)
 	if cfg.emptyControllerRefName {
 		wm.Spec.ControllerRef.Name = ""
+	}
+	if cfg.podTemplate != nil {
+		wm.Spec.PodTemplate = cfg.podTemplate
 	}
 
 	var initObjs []client.Object

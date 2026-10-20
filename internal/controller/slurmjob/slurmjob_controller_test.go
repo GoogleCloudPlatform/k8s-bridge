@@ -1895,6 +1895,123 @@ func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 	}
 }
 
+// maxNodeSizeWarning is the log message for a WorkloadMixing whose slurmd container has no CPU or memory limit.
+const maxNodeSizeWarning = "Maximum node size not configured: the slurmd container in spec.podTemplate has no cpu or memory limit"
+
+func TestReconcile_NewJobAboveMaxNodeSize_CancelsJob(t *testing.T) {
+	job := newReconTestJob().
+		withTasks(8).
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		build()
+	podTemplate := &corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{slurmdWithLimits("4", testSlurmdMemoryLimit)}},
+	}
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job), withWMPodTemplate(podTemplate))
+	ctx, recorded := newObservedLoggerContext(t.Context())
+	initTranslationErrors := env.jobsSyncCount(metrics.StatusError, metrics.ReasonTranslationError)
+
+	res, err := env.reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("Expected empty result, got %v", res)
+	}
+
+	env.verifySlurmCancellation("Translation failed: job needs 8 CPUs and 16384 MiB per node, " +
+		"but the maximum node size of partition " + reconPartitionName + " is 4 CPUs and 8192 MiB")
+	env.verifyJobSetNotFound()
+	if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonTranslationError); got != initTranslationErrors+1 {
+		t.Errorf("Expected JobsSync(translation_error) delta +1, got %f", got-initTranslationErrors)
+	}
+	if got := recorded.FilterMessage(maxNodeSizeWarning).Len(); got != 0 {
+		t.Errorf("Expected no missing-limit warning for a WorkloadMixing with slurmd limits, got %d", got)
+	}
+}
+
+func TestReconcile_MaxNodeSizeUnset_WarnsOncePerWorkloadMixing(t *testing.T) {
+	const secondJobID = reconJobID + 1
+	newPendingJob := func(jobID int32) *slurmclienttypes.V0044JobInfo {
+		return newReconTestJob().
+			withJobID(jobID).
+			withTasks(48).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+	}
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(newPendingJob(reconJobID), newPendingJob(secondJobID)))
+	ctx, recorded := newObservedLoggerContext(t.Context())
+
+	for _, jobID := range []int32{reconJobID, secondJobID} {
+		req := ctrl.Request{NamespacedName: types.NamespacedName{
+			Namespace: reconNamespace,
+			Name:      fmt.Sprintf("slurm-job-%s-%d", reconWmName, jobID),
+		}}
+		if _, err := env.reconciler.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile of job %d failed: %v", jobID, err)
+		}
+		var js jobsetv1alpha2.JobSet
+		key := types.NamespacedName{Namespace: reconNamespace, Name: fmt.Sprintf("slurm-job-%d", jobID)}
+		if err := env.baseClient.Get(ctx, key, &js); err != nil {
+			t.Errorf("Expected JobSet %s for job %d, got error: %v", key.Name, jobID, err)
+		}
+	}
+
+	warnings := recorded.FilterMessage(maxNodeSizeWarning).All()
+	if len(warnings) != 1 {
+		t.Fatalf("Expected 1 missing-limit warning for two jobs, got %d", len(warnings))
+	}
+	fields := warnings[0].ContextMap()
+	if got := fmt.Sprint(fields["workloadMixing"]); !strings.Contains(got, reconWmName) {
+		t.Errorf("Expected workloadMixing field to name %q, got %q", reconWmName, got)
+	}
+	if got := fmt.Sprint(fields["missingLimits"]); got != "[cpu memory]" {
+		t.Errorf("Expected missingLimits field [cpu memory], got %q", got)
+	}
+}
+
+func TestWarnIfMaxNodeSizeUnset(t *testing.T) {
+	r := &SlurmJobReconciler{}
+	ctx, recorded := newObservedLoggerContext(t.Context())
+	warningCount := func() int { return recorded.FilterMessage(maxNodeSizeWarning).Len() }
+	wm := &k8sbridgev1alpha1.WorkloadMixing{
+		ObjectMeta: metav1.ObjectMeta{Name: reconWmName, Namespace: reconNamespace},
+	}
+
+	r.warnIfMaxNodeSizeUnset(ctx, wm)
+	r.warnIfMaxNodeSizeUnset(ctx, wm)
+	if got := warningCount(); got != 1 {
+		t.Fatalf("Expected 1 warning for a WorkloadMixing without podTemplate, got %d", got)
+	}
+
+	wm.Spec.PodTemplate = &corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{slurmdWithLimits("4", testSlurmdMemoryLimit)}},
+	}
+	r.warnIfMaxNodeSizeUnset(ctx, wm)
+	if got := warningCount(); got != 1 {
+		t.Fatalf("Expected no new warning after the slurmd limits were added, got %d warnings", got)
+	}
+
+	wm.Spec.PodTemplate.Spec.Containers[0] = slurmdWithLimits("4", "")
+	r.warnIfMaxNodeSizeUnset(ctx, wm)
+	warnings := recorded.FilterMessage(maxNodeSizeWarning).All()
+	if len(warnings) != 2 {
+		t.Fatalf("Expected a new warning after the memory limit was removed, got %d warnings", len(warnings))
+	}
+	if got := fmt.Sprint(warnings[1].ContextMap()["missingLimits"]); got != "[memory]" {
+		t.Errorf("Expected missingLimits field [memory], got %q", got)
+	}
+
+	other := &k8sbridgev1alpha1.WorkloadMixing{
+		ObjectMeta: metav1.ObjectMeta{Name: "other-wm", Namespace: reconNamespace},
+	}
+	r.warnIfMaxNodeSizeUnset(ctx, other)
+	if got := warningCount(); got != 3 {
+		t.Errorf("Expected a separate warning for another WorkloadMixing, got %d warnings", got)
+	}
+}
+
 func TestReconcile_NewJob_ExplicitHold_DefersWithoutLoggingOrMetrics(t *testing.T) {
 	tests := []struct {
 		name        string

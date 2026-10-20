@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +59,8 @@ const (
 	testUserVolumeName      = "user-vol"
 	testHighPrioQueue       = "high-prio-queue"
 	testHighPrioClass       = "high-prio-class"
+	// testSlurmdMemoryLimit is the memory limit of the slurmd container in the maximum node size tests.
+	testSlurmdMemoryLimit = "8Gi"
 
 	wantLabelAppName      = "app.kubernetes.io/name"
 	wantLabelAppComponent = "app.kubernetes.io/component"
@@ -173,6 +176,23 @@ func (b *testWMSpecBuilder) build() *k8sbridgev1alpha1.WorkloadMixingSpec {
 
 func getTestWMSpec() *k8sbridgev1alpha1.WorkloadMixingSpec {
 	return newTestWMSpec().build()
+}
+
+// slurmdWithLimits returns a slurmd container whose CPU and memory limits are the
+// maximum node size of the partition. An empty value leaves that limit unset.
+func slurmdWithLimits(cpu, memory string) corev1.Container {
+	limits := corev1.ResourceList{}
+	if cpu != "" {
+		limits[corev1.ResourceCPU] = resource.MustParse(cpu)
+	}
+	if memory != "" {
+		limits[corev1.ResourceMemory] = resource.MustParse(memory)
+	}
+	return corev1.Container{
+		Name:      ContainerSlurmd,
+		Image:     testCustomSlurmdImage,
+		Resources: corev1.ResourceRequirements{Limits: limits},
+	}
 }
 
 const (
