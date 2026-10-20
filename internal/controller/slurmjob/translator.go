@@ -92,6 +92,7 @@ const (
 	AppName           = "k8s-bridge"
 	ComponentJobSet   = "jobset"
 	ComponentWorker   = "worker"
+	FinalizerJobSet   = "k8s-bridge.x-k8s.io/finalizer"
 )
 
 var (
@@ -453,8 +454,9 @@ func buildJobSet(
 
 	return &jobsetv1alpha2.JobSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   jobSetName,
-			Labels: labels,
+			Name:       jobSetName,
+			Labels:     labels,
+			Finalizers: []string{FinalizerJobSet},
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
 			Suspend: ptr.To(true),

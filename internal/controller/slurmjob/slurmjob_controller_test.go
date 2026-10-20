@@ -457,11 +457,157 @@ func TestReconcile_DeletingJobSet_CancelsSlurmJob(t *testing.T) {
 				env.verifySlurmCancellation(tc.wantCancelReason)
 			}
 
+			env.verifyJobSetNotFound()
+
 			if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+tc.wantFailedDelta {
 				t.Errorf("Expected JobsSync(jobset_failed) delta %f, got %f", tc.wantFailedDelta, got-initFailed)
 			}
 		})
 	}
+}
+
+func TestReconcile_DeletingJobSet_FinalizerAndDynamicNodes(t *testing.T) {
+	const (
+		dynamicNode0 = "slurm-job-12345-slurmd-0-0"
+		dynamicNode1 = "slurm-job-12345-slurmd-1-0"
+	)
+
+	t.Run("JobSet deleted during slurmrestd outage cleans up dynamic nodes and removes finalizer once job is COMPLETED", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		completedJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateCOMPLETED).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withPendingSlurmJobs(completedJob),
+		)
+
+		// 1. Simulate slurmrestd outage when the JobSet deletion watch event first arrives
+		env.mockSlurm.GetError = errors.New("connection refused")
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error during slurmrestd outage, got nil")
+		}
+
+		// Finalizer must keep the JobSet in Kubernetes so cleanup is not lost
+		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+		env.verifyNoSlurmUpdates()
+
+		// 2. slurmrestd recovers and reports the Slurm job is now COMPLETED
+		env.mockSlurm.GetError = nil
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected second reconcile to succeed after slurmrestd recovery, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+	})
+
+	t.Run("Transient dynamic node deletion error on deleting JobSet retains finalizer for retry", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		runningJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withPendingSlurmJobs(runningJob),
+		)
+		env.mockSlurm.DeleteNodeError = errors.New("Nodes busy")
+
+		initFailed := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed)
+
+		// 1. First reconcile cancels the RUNNING Slurm job, fails node deletion, and retains the finalizer
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error when dynamic node deletion fails with Nodes busy, got nil")
+		}
+		env.verifySlurmCancellation(ReasonJobSetMissing)
+		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+
+		// 2. On retry, the Slurm job is now CANCELLED and nodes are no longer busy
+		cancelledJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateCANCELLED).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+		env.mockSlurm.SetPendingJobs(reconPartitionName, []slurmclienttypes.V0044JobInfo{*cancelledJob})
+		env.mockSlurm.DeleteNodeError = nil
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected retry reconcile to succeed, got: %v", err)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1, dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+
+		if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+1 {
+			t.Errorf("Expected JobsSync(jobset_failed) delta 1 across retries, got %f", got-initFailed)
+		}
+	})
+
+	t.Run("Deleting JobSet when Slurm job is purged (NotFound) cleans up dynamic nodes and removes finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(deletingJS))
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected no error when Slurm job is NotFound for deleting JobSet, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+	})
+
+	t.Run("Deleting JobSet when parent WorkloadMixing is NotFound removes finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(deletingJS))
+		if err := env.baseClient.Delete(t.Context(), env.wm); err != nil {
+			t.Fatalf("Failed to delete WorkloadMixing: %v", err)
+		}
+
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected no error when WorkloadMixing is NotFound for deleting JobSet, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifyJobSetNotFound()
+		env.verifyNoSlurmUpdates()
+	})
 }
 
 func TestReconcile_InformerCacheLag_DoesNotCancelNewlyTranslatedJob(t *testing.T) {

@@ -1073,7 +1073,7 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup_WhenAlreadyDele
 			Name:              testJobSet103Name,
 			Namespace:         testNamespace,
 			DeletionTimestamp: &now,
-			Finalizers:        []string{testFinalizer},
+			Finalizers:        []string{FinalizerJobSet},
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
 			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
@@ -1124,6 +1124,77 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup_WhenAlreadyDele
 	// Dynamic nodes must still be cleaned up in Slurm even if JobSet has DeletionTimestamp
 	if nodeDeleteCalls != 2 {
 		t.Errorf("Expected 2 node delete calls for already deleting JobSet, got %d", nodeDeleteCalls)
+	}
+
+	// Verify FinalizerJobSet was removed and the terminating JobSet is now fully deleted
+	checkJS := &jobsetv1alpha2.JobSet{}
+	getErr := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: testJobSet103Name}, checkJS)
+	if !apierrors.IsNotFound(getErr) {
+		t.Errorf("Expected terminating JobSet to be deleted after finalizer removal, got: %v", getErr)
+	}
+}
+
+func TestJobTeardownReconciler_HandleTeardown_MissingSlurmClientRetainsFinalizer(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	wm := &k8sbridgev1alpha1.WorkloadMixing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      reconWmName,
+			Namespace: testNamespace,
+		},
+		Spec: k8sbridgev1alpha1.WorkloadMixingSpec{
+			ControllerRef: corev1.LocalObjectReference{
+				Name: "missing-controller",
+			},
+		},
+	}
+
+	js := &jobsetv1alpha2.JobSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       testJobSet101Name,
+			Namespace:  testNamespace,
+			Finalizers: []string{FinalizerJobSet},
+		},
+		Spec: jobsetv1alpha2.JobSetSpec{
+			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
+				{
+					Name:     ContainerSlurmd,
+					Replicas: 1,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
+	reconciler := &JobTeardownReconciler{
+		Client:    fakeClient,
+		ClientMap: clientmap.NewClientMap(),
+	}
+
+	ev := slurmtypes.SlurmJobTeardownEvent{
+		JobID: "101",
+		WorkloadMixing: types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      reconWmName,
+		},
+		Partition: testBatchPartition,
+		Reason:    metrics.ReasonJobCompleted,
+	}
+
+	err := reconciler.handleTeardown(context.Background(), ev)
+	if err == nil {
+		t.Fatal("Expected error when Slurm client is missing from ClientMap, got nil")
+	}
+
+	checkJS := &jobsetv1alpha2.JobSet{}
+	if getErr := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: testJobSet101Name}, checkJS); getErr != nil {
+		t.Fatalf("Expected JobSet to remain when Slurm client is missing, got: %v", getErr)
+	}
+	if len(checkJS.Finalizers) != 1 || checkJS.Finalizers[0] != FinalizerJobSet {
+		t.Errorf("Expected FinalizerJobSet to be retained on JobSet, got: %v", checkJS.Finalizers)
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
@@ -294,8 +295,8 @@ func (p *SlurmPoller) auditOrphanedJobSets(
 			continue
 		}
 
-		// If JobSet is already being deleted, clean up missing tracking and skip
-		if !js.DeletionTimestamp.IsZero() {
+		// If JobSet is already being deleted and no longer carries our finalizer, clean up missing tracking and skip
+		if !js.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
 			p.mu.Lock()
 			delete(p.firstSeenMissing, key)
 			p.mu.Unlock()
@@ -391,8 +392,8 @@ func getTeardownEvent(
 	wm *k8sbridgev1alpha1.WorkloadMixing,
 	jobsByID map[string]*slurmclienttypes.V0044JobInfo,
 ) *slurmtypes.SlurmJobTeardownEvent {
-	// Guard against duplicate processing if already being deleted
-	if !js.DeletionTimestamp.IsZero() {
+	// Guard against duplicate processing if already being deleted and our finalizer has been removed
+	if !js.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
 		return nil
 	}
 

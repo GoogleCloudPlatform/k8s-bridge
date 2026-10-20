@@ -1098,6 +1098,173 @@ func TestPoll_OrphanedJobSet_AlreadyDeletingIgnored(t *testing.T) {
 	}
 }
 
+func TestPoll_DeletingJobSetWithFinalizer_EmitsTeardownEvents(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	deletionTime := metav1.NewTime(now.Add(-10 * time.Second))
+
+	t.Run("Terminal Slurm job with deleting JobSet carrying FinalizerJobSet emits teardown event", func(t *testing.T) {
+		wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+		wm.UID = testWMUID
+
+		jsWithFinalizer := &jobsetv1alpha2.JobSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "slurm-job-210",
+				Namespace:         testNamespace,
+				DeletionTimestamp: &deletionTime,
+				Finalizers:        []string{FinalizerJobSet},
+				Labels: map[string]string{
+					LabelSlurmJobID:     "210",
+					LabelSlurmPartition: testPartitionName,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+						Kind:       KindWorkloadMixing,
+						Name:       testWMName,
+						UID:        testWMUID,
+					},
+				},
+			},
+		}
+		jsWithoutBridgeFinalizer := &jobsetv1alpha2.JobSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "slurm-job-211",
+				Namespace:         testNamespace,
+				DeletionTimestamp: &deletionTime,
+				Finalizers:        []string{testFinalizer},
+				Labels: map[string]string{
+					LabelSlurmJobID:     "211",
+					LabelSlurmPartition: testPartitionName,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+						Kind:       KindWorkloadMixing,
+						Name:       testWMName,
+						UID:        testWMUID,
+					},
+				},
+			},
+		}
+
+		fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, jsWithFinalizer, jsWithoutBridgeFinalizer).Build()
+		cMap := clientmap.NewClientMap()
+		mockSlurm := &utils.SlurmClient{}
+		mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{
+			{
+				V0044JobInfo: slurmapi.V0044JobInfo{
+					JobId:     ptr.To[int32](210),
+					Partition: ptr.To(testPartitionName),
+					JobState:  ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateCOMPLETED}),
+				},
+			},
+			{
+				V0044JobInfo: slurmapi.V0044JobInfo{
+					JobId:     ptr.To[int32](211),
+					Partition: ptr.To(testPartitionName),
+					JobState:  ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateCOMPLETED}),
+				},
+			},
+		})
+		controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+		cMap.Add(context.Background(), controllerKey, mockSlurm)
+
+		teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+		poller := &SlurmPoller{
+			Client:         fakeK8sClient,
+			ClientMap:      cMap,
+			TeardownEvents: teardownChan,
+			PollInterval:   10 * time.Second,
+		}
+
+		if err := poller.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll failed: %v", err)
+		}
+
+		select {
+		case ev := <-teardownChan:
+			if ev.JobID != "210" || ev.Reason != metrics.ReasonJobCompleted {
+				t.Errorf("Expected teardown event for JobID 210 with reason %s, got %+v", metrics.ReasonJobCompleted, ev)
+			}
+		default:
+			t.Fatal("Expected teardown event for deleting JobSet carrying FinalizerJobSet, got none")
+		}
+
+		select {
+		case ev := <-teardownChan:
+			t.Fatalf("Expected no teardown event for JobID 211 without FinalizerJobSet, got %+v", ev)
+		default:
+		}
+	})
+
+	t.Run("Orphaned deleting JobSet carrying FinalizerJobSet emits teardown event after grace period", func(t *testing.T) {
+		wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+		wm.UID = testWMUID
+
+		js := &jobsetv1alpha2.JobSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "slurm-job-212",
+				Namespace:         testNamespace,
+				CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
+				DeletionTimestamp: &deletionTime,
+				Finalizers:        []string{FinalizerJobSet},
+				Labels: map[string]string{
+					LabelSlurmJobID:     "212",
+					LabelSlurmPartition: testPartitionName,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+						Kind:       KindWorkloadMixing,
+						Name:       testWMName,
+						UID:        testWMUID,
+					},
+				},
+			},
+		}
+
+		fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
+		cMap := clientmap.NewClientMap()
+		mockSlurm := &utils.SlurmClient{}
+		controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+		cMap.Add(context.Background(), controllerKey, mockSlurm)
+
+		teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+		currentTime := now
+		poller := &SlurmPoller{
+			Client:            fakeK8sClient,
+			ClientMap:         cMap,
+			TeardownEvents:    teardownChan,
+			PollInterval:      10 * time.Second,
+			OrphanGracePeriod: 1 * time.Minute,
+			nowFn:             func() time.Time { return currentTime },
+		}
+
+		if err := poller.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll cycle 1 failed: %v", err)
+		}
+
+		currentTime = now.Add(70 * time.Second)
+		if err := poller.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll cycle 2 failed: %v", err)
+		}
+
+		select {
+		case ev := <-teardownChan:
+			if ev.JobID != "212" || ev.Reason != metrics.ReasonJobOrphaned {
+				t.Errorf("Expected orphan teardown event for JobID 212, got %+v", ev)
+			}
+		default:
+			t.Fatal("Expected orphan teardown event for deleting JobSet carrying FinalizerJobSet, got none")
+		}
+	})
+}
+
 func TestPoll_OrphanedJobSet_ChannelFull_RetriesOnNextPoll(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)

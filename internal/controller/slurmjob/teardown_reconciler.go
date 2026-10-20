@@ -135,17 +135,20 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 			Name:      wm.Spec.ControllerRef.Name,
 		}
 		slurmClient := r.ClientMap.Get(controllerKey)
-		if slurmClient != nil {
-			if err := r.cleanupDynamicNodes(ctx, slurmClient, js); err != nil {
-				return fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", js.Name, err)
-			}
-		} else {
-			logger.V(1).Info("Slurm client not found in ClientMap, skipping dynamic node deletion", "controller", controllerKey)
+		if slurmClient == nil {
+			return fmt.Errorf("slurm client not found in ClientMap for controller %s", controllerKey)
+		}
+		if err := r.cleanupDynamicNodes(ctx, slurmClient, js); err != nil {
+			return fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", js.Name, err)
 		}
 	}
 
-	// Skip duplicate deletion if JobSet is already terminating
 	isDeleting := !js.DeletionTimestamp.IsZero()
+	if err := removeJobSetFinalizer(ctx, r.Client, js); err != nil {
+		return fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", js.Namespace, js.Name, err)
+	}
+
+	// Skip duplicate deletion if JobSet is already terminating
 	if isDeleting {
 		logger.V(1).Info("JobSet already has deletion timestamp, skipping redundant delete", "jobSet", jobSetName, "jobID", ev.JobID)
 	} else {

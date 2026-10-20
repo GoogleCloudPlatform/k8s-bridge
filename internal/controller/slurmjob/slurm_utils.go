@@ -17,7 +17,9 @@ limitations under the License.
 package slurmjob
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -27,7 +29,10 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 )
 
@@ -159,4 +164,17 @@ func classifyTerminalSlurmState(jobInfo *slurmclienttypes.V0044JobInfo) (bool, s
 		return true, metrics.ReasonJobFailed
 	}
 	return false, ""
+}
+
+// removeJobSetFinalizer removes FinalizerJobSet from the given JobSet if present.
+func removeJobSetFinalizer(ctx context.Context, c client.Client, js *jobsetv1alpha2.JobSet) error {
+	if js == nil || !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
+		return nil
+	}
+	patch := client.MergeFrom(js.DeepCopy())
+	controllerutil.RemoveFinalizer(js, FinalizerJobSet)
+	if err := c.Patch(ctx, js, patch); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", js.Namespace, js.Name, err)
+	}
+	return nil
 }

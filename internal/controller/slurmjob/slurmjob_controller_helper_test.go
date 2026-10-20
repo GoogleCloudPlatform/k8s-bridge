@@ -133,6 +133,7 @@ func newTestJobSet(name string) *testJobSetBuilder {
 
 func newReconTestJobSet() *testJobSetBuilder {
 	return newTestJobSet("slurm-job-" + reconJobIDStr).
+		withFinalizers(FinalizerJobSet).
 		withLabels(map[string]string{
 			LabelKueueQueue:     "some-queue",
 			LabelSlurmJobID:     reconJobIDStr,
@@ -185,11 +186,16 @@ func (b *testJobSetBuilder) withSuspend(suspend bool) *testJobSetBuilder {
 	return b
 }
 
+func (b *testJobSetBuilder) withFinalizers(finalizers ...string) *testJobSetBuilder {
+	b.jobSet.Finalizers = slices.Clone(finalizers)
+	return b
+}
+
 func (b *testJobSetBuilder) withDeletionTimestamp() *testJobSetBuilder {
 	now := metav1.Now()
 	b.jobSet.DeletionTimestamp = &now
 	if len(b.jobSet.Finalizers) == 0 {
-		b.jobSet.Finalizers = []string{testFinalizer}
+		b.jobSet.Finalizers = []string{FinalizerJobSet}
 	}
 	return b
 }
@@ -376,6 +382,9 @@ func (e *reconcileTestEnv) verifyJobSetCreated(wantQueue string, wantJobID strin
 	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
 		e.t.Fatalf("Expected JobSet to be created, but got error: %v", err)
 		return nil
+	}
+	if !slices.Contains(js.Finalizers, FinalizerJobSet) {
+		e.t.Errorf("Expected JobSet to contain finalizer %q, got %v", FinalizerJobSet, js.Finalizers)
 	}
 	if wantQueue != "" && js.Labels[LabelKueueQueue] != wantQueue {
 		e.t.Errorf("Expected JobSet queue label %q, got %q", wantQueue, js.Labels[LabelKueueQueue])
