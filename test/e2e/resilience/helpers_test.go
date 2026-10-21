@@ -56,7 +56,8 @@ const (
 )
 
 // gatedJob is a 1-node Slurm batch job that runs until the test releases it. Its batch
-// step always has a running process, so the slurmd probe passes with a local check.
+// step always has a running process, so the slurmd probe passes with a local check
+// also while slurmctld is down.
 type gatedJob struct {
 	ID         string
 	JobSetName string
@@ -151,10 +152,21 @@ func takeSnapshot(job gatedJob) workloadSnapshot {
 	return s
 }
 
+// slurmCheck says if expectWorkloadUndisturbed also checks the Slurm job.
+type slurmCheck bool
+
+const (
+	// checkSlurmJob also checks that the Slurm job stays RUNNING.
+	checkSlurmJob slurmCheck = true
+	// skipSlurmJobCheck skips the Slurm job check. Use it while slurmctld is down,
+	// because Slurm cannot answer then.
+	skipSlurmJobCheck slurmCheck = false
+)
+
 // expectWorkloadUndisturbed checks during window that the JobSet of the job, its worker
-// pod, and its Kueue Workload keep the state of the snapshot, and that the Slurm job
-// stays RUNNING.
-func expectWorkloadUndisturbed(job gatedJob, s workloadSnapshot, window time.Duration) {
+// pod, and its Kueue Workload keep the state of the snapshot. With checkSlurmJob, it also
+// checks that the Slurm job stays RUNNING.
+func expectWorkloadUndisturbed(job gatedJob, s workloadSnapshot, window time.Duration, slurm slurmCheck) {
 	GinkgoHelper()
 
 	By(fmt.Sprintf("verifying for %s that the JobSet, the worker pod, and the Workload of job %s do not change",
@@ -180,10 +192,42 @@ func expectWorkloadUndisturbed(job gatedJob, s workloadSnapshot, window time.Dur
 
 		expectWorkloadAdmitted(g, s.JobSetUID)
 
-		state, err := utils.QuerySlurmJobState(slurmNamespace, job.ID)
-		g.Expect(err).NotTo(HaveOccurred(), "Failed to get the state of Slurm job "+job.ID)
-		g.Expect(state.JobState).To(Equal("RUNNING"), "Slurm job %s is not RUNNING", job.ID)
+		if slurm == checkSlurmJob {
+			state, err := utils.QuerySlurmJobState(slurmNamespace, job.ID)
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to get the state of Slurm job "+job.ID)
+			g.Expect(state.JobState).To(Equal("RUNNING"), "Slurm job %s is not RUNNING", job.ID)
+		}
 	}, window, pollInterval).Should(Succeed())
+}
+
+// Messages that SlurmPoller logs (internal/controller/slurmjob/poller.go). Keep them
+// equal to the messages in poller.go.
+const (
+	pollerListFailedMessage = "Failed to list jobs for controller"
+	// pollerRecordedMissingMessage is a debug message. The manager logs it, because
+	// cmd/main.go sets the development mode of zap.
+	pollerRecordedMissingMessage    = "Recorded missing Slurm job for orphan grace period"
+	pollerSentOrphanTeardownMessage = "Sent SlurmJobTeardownEvent for orphaned JobSet"
+)
+
+// expectPollerSkippedOrphanAudit checks the log of the controller-manager pod since the
+// given time. The poller must report that it could not list the Slurm jobs, and it must
+// not record a job as missing or send an orphan teardown event. During a slurmctld outage,
+// the JobSet checks cannot show a wrong orphan decision: the teardown stops at the failed
+// delete of the dynamic node, before it deletes the JobSet.
+func expectPollerSkippedOrphanAudit(podName string, since time.Time) {
+	GinkgoHelper()
+
+	By("verifying in the manager log that the poller did not read the failed Slurm job list as empty")
+	out, err := utils.Run(exec.Command("kubectl", "logs", podName, "-n", namespace,
+		"-c", utils.ControllerManagerContainer, "--since-time="+since.UTC().Format(time.RFC3339)))
+	Expect(err).NotTo(HaveOccurred(), "Failed to get the log of pod "+podName)
+	Expect(out).To(ContainSubstring(pollerListFailedMessage),
+		"The poller did not report a failed Slurm job list during the outage")
+	Expect(out).NotTo(ContainSubstring(pollerRecordedMissingMessage),
+		"The poller recorded a running job as missing during the outage")
+	Expect(out).NotTo(ContainSubstring(pollerSentOrphanTeardownMessage),
+		"The poller sent an orphan teardown event during the outage")
 }
 
 // expectSlurmJobUnchanged checks that the Slurm job still runs as before the failure: on
@@ -305,6 +349,15 @@ func currentControllerPodName() string {
 	return name
 }
 
+// controllerRestartCount returns the restart count of the manager container of a pod.
+func controllerRestartCount(podName string) string {
+	GinkgoHelper()
+
+	count, err := utils.ContainerRestartCount(namespace, podName, utils.ControllerManagerContainer)
+	Expect(err).NotTo(HaveOccurred(), "Failed to get the restart count of pod "+podName)
+	return count
+}
+
 // dumpDiagnostics writes the default diagnostics, and the state of the nodes, the Slurm
 // pods, and the Slurm jobs, to the Ginkgo log.
 func dumpDiagnostics() {
@@ -312,7 +365,8 @@ func dumpDiagnostics() {
 
 	for _, command := range []string{
 		"kubectl get nodes -o wide",
-		"kubectl get pods -n " + slurmNamespace + " -o wide",
+		"kubectl get pods,pvc -n " + slurmNamespace + " -o wide",
+		"kubectl describe pod " + utils.DefaultSlurmControllerPod + " -n " + slurmNamespace,
 		"kubectl get jobsets.jobset.x-k8s.io,workloads.kueue.x-k8s.io -n " + slurmNamespace + " -o wide",
 	} {
 		args := strings.Fields(command)
@@ -324,7 +378,7 @@ func dumpDiagnostics() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "%s:\n%s\n", command, out)
 	}
 
-	for _, command := range []string{"squeue -a", "scontrol show nodes", "scontrol show jobs"} {
+	for _, command := range []string{"scontrol ping", "squeue -a", "scontrol show nodes", "scontrol show jobs"} {
 		out, err := utils.RunOnLoginNodeAsUser(slurmNamespace, utils.DefaultSlurmTestUser, command)
 		if err != nil {
 			utils.WarnError(err)

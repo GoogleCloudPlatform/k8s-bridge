@@ -36,6 +36,8 @@ const (
 	slurmNamespace        = utils.DefaultSlurmNamespace
 	defaultSlurmPartition = utils.DefaultSlurmPartition
 
+	// slurmClusterManifest deploys a Slurm Controller with persistence enabled.
+	slurmClusterManifest   = "test/e2e/testdata/slurm_cluster_persistent.yaml"
 	kueueResourcesManifest = "test/e2e/testdata/kueue_resources.yaml"
 	workloadMixingManifest = "test/e2e/testdata/workloadmixing_template.yaml"
 	// workloadMixingName is the name of the WorkloadMixing in workloadMixingManifest.
@@ -53,6 +55,9 @@ const (
 	// decides that a running job is gone while Slurm answers, it deletes the JobSet
 	// within this window.
 	outageWindow = orphanGracePeriod + 2*utils.E2EPollInterval + 10*time.Second
+	// baselineWindow is the time of the invariant check before a failure. slurmctld
+	// writes its state files a few seconds after each change.
+	baselineWindow = 10 * time.Second
 )
 
 var (
@@ -77,9 +82,11 @@ func TestE2EResilience(t *testing.T) {
 
 var _ = BeforeSuite(func() {
 	utils.ConfigureKubectlKubeRC()
-	// The specs delete pods, so stop before any change if kubectl uses another cluster.
+	// The specs delete pods and cordon nodes, so stop before any change if kubectl
+	// uses another cluster.
 	utils.VerifyKindContext()
 	clusterVerified = true
+	utils.UncordonAllNodes()
 
 	By("building the manager image")
 	_, err := utils.Run(exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage)))
@@ -97,7 +104,8 @@ var _ = BeforeSuite(func() {
 
 	utils.InstallCRDs()
 
-	utils.SetupSlinkySlurm()
+	utils.SetupSlinkySlurmWithCluster(slurmClusterManifest)
+	utils.VerifySlurmctldPersistence(slurmNamespace)
 
 	By("deploying Kueue resources (ResourceFlavor, ClusterQueue, LocalQueue)")
 	_, err = utils.Run(exec.Command("kubectl", "apply", "-f", kueueResourcesManifest))
@@ -121,7 +129,8 @@ var _ = AfterSuite(func() {
 		return
 	}
 
-	utils.TeardownSlinkySlurm()
+	utils.UncordonAllNodes()
+	utils.TeardownSlinkySlurmWithCluster(slurmClusterManifest)
 
 	By("deleting Kueue resources")
 	cmd := exec.Command("kubectl", "delete", "-f", kueueResourcesManifest, "--ignore-not-found")

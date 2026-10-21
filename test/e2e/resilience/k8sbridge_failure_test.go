@@ -46,7 +46,7 @@ var _ = Describe("k8s-bridge controller manager failure", Serial, Label("disrupt
 
 		By("stopping the controller manager and keeping it stopped")
 		utils.StopControllerManager(managerImage, namespace)
-		expectWorkloadUndisturbed(job, before, outageWindow)
+		expectWorkloadUndisturbed(job, before, outageWindow, checkSlurmJob)
 
 		By("starting the controller manager again")
 		controllerPodName = utils.StartControllerManager(managerImage, namespace)
@@ -55,7 +55,7 @@ var _ = Describe("k8s-bridge controller manager failure", Serial, Label("disrupt
 		// This window is longer than the orphan grace period, so it also covers the
 		// orphan audit of the new poller.
 		By("verifying that the restarted controller manager keeps the healthy job")
-		expectWorkloadUndisturbed(job, before, outageWindow)
+		expectWorkloadUndisturbed(job, before, outageWindow, checkSlurmJob)
 		expectSlurmJobUnchanged(job, before)
 
 		By("verifying that the restarted controller manager deletes the job resources when the job ends")

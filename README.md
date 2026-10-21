@@ -112,7 +112,7 @@ make test-e2e
 
 #### Resilience E2E Tests (Dedicated Kind Cluster)
 
-The resilience suite (`test/e2e/resilience`) stops components while a job runs. It checks that the job continues, and that each component manages the job correctly after it starts again. The suite stops the k8s-bridge controller manager.
+The resilience suite (`test/e2e/resilience`) stops components while a job runs. It checks that the job continues, and that each component manages the job correctly after it starts again. The suite stops the k8s-bridge controller manager and slurmctld. Slurm runs with slurmctld persistence enabled.
 
 The suite runs on its own Kind cluster, `k8s-bridge-e2e-resilience`. Kind writes the credentials of this cluster to `bin/kubeconfig-k8s-bridge-e2e-resilience`, so the current context of `~/.kube/config` does not change.
 
