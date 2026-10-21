@@ -17,14 +17,90 @@ limitations under the License.
 package slurmjob
 
 import (
+	"context"
+	"slices"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
 )
+
+func TestRemoveJobSetFinalizer(t *testing.T) {
+	const otherFinalizer = "orphan"
+
+	newClient := func(t *testing.T) (*jobsetv1alpha2.JobSet, client.Client) {
+		t.Helper()
+		scheme := runtime.NewScheme()
+		_ = jobsetv1alpha2.AddToScheme(scheme)
+		js := newTestJobSet(testJobSet101Name).withFinalizers(FinalizerJobSet).build()
+		return js, fake.NewClientBuilder().WithScheme(scheme).WithObjects(js).Build()
+	}
+
+	t.Run("Removes only FinalizerJobSet from an up-to-date JobSet", func(t *testing.T) {
+		js, c := newClient(t)
+		ctx := context.Background()
+		key := types.NamespacedName{Namespace: js.Namespace, Name: js.Name}
+
+		current := &jobsetv1alpha2.JobSet{}
+		if err := c.Get(ctx, key, current); err != nil {
+			t.Fatalf("Get() failed: %v", err)
+		}
+		current.Finalizers = append(current.Finalizers, otherFinalizer)
+		if err := c.Update(ctx, current); err != nil {
+			t.Fatalf("Update() failed: %v", err)
+		}
+
+		if err := removeJobSetFinalizer(ctx, c, current); err != nil {
+			t.Fatalf("removeJobSetFinalizer() failed: %v", err)
+		}
+
+		got := &jobsetv1alpha2.JobSet{}
+		if err := c.Get(ctx, key, got); err != nil {
+			t.Fatalf("Get() failed: %v", err)
+		}
+		if !slices.Equal(got.Finalizers, []string{otherFinalizer}) {
+			t.Errorf("Finalizers = %v, want [%s]", got.Finalizers, otherFinalizer)
+		}
+	})
+
+	t.Run("Returns conflict and keeps concurrently added finalizers when JobSet is stale", func(t *testing.T) {
+		js, c := newClient(t)
+		ctx := context.Background()
+		key := types.NamespacedName{Namespace: js.Namespace, Name: js.Name}
+
+		stale := &jobsetv1alpha2.JobSet{}
+		if err := c.Get(ctx, key, stale); err != nil {
+			t.Fatalf("Get() failed: %v", err)
+		}
+		current := stale.DeepCopy()
+		current.Finalizers = append(current.Finalizers, otherFinalizer)
+		if err := c.Update(ctx, current); err != nil {
+			t.Fatalf("Update() failed: %v", err)
+		}
+
+		err := removeJobSetFinalizer(ctx, c, stale)
+		if !apierrors.IsConflict(err) {
+			t.Fatalf("removeJobSetFinalizer() error = %v, want Conflict", err)
+		}
+
+		got := &jobsetv1alpha2.JobSet{}
+		if err := c.Get(ctx, key, got); err != nil {
+			t.Fatalf("Get() failed: %v", err)
+		}
+		if !slices.Equal(got.Finalizers, []string{FinalizerJobSet, otherFinalizer}) {
+			t.Errorf("Finalizers = %v, want [%s %s]", got.Finalizers, FinalizerJobSet, otherFinalizer)
+		}
+	})
+}
 
 func TestIsTerminalSlurmJob(t *testing.T) {
 	tests := []struct {

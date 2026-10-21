@@ -29,7 +29,9 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	slinkyv1beta1 "github.com/SlinkyProject/slurm-operator/api/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -167,14 +169,27 @@ func classifyTerminalSlurmState(jobInfo *slurmclienttypes.V0044JobInfo) (bool, s
 }
 
 // removeJobSetFinalizer removes FinalizerJobSet from the given JobSet if present.
+// The patch uses optimistic locking because a JSON merge patch replaces the whole finalizers list,
+// which could otherwise drop finalizers added concurrently (e.g. foregroundDeletion or orphan).
 func removeJobSetFinalizer(ctx context.Context, c client.Client, js *jobsetv1alpha2.JobSet) error {
 	if js == nil || !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
 		return nil
 	}
-	patch := client.MergeFrom(js.DeepCopy())
+	patch := client.MergeFromWithOptions(js.DeepCopy(), client.MergeFromWithOptimisticLock{})
 	controllerutil.RemoveFinalizer(js, FinalizerJobSet)
 	if err := c.Patch(ctx, js, patch); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", js.Namespace, js.Name, err)
 	}
 	return nil
+}
+
+// isSlurmControllerGone reports whether the Slurm Controller CR identified by key no longer exists.
+func isSlurmControllerGone(ctx context.Context, c client.Reader, key types.NamespacedName) (bool, error) {
+	if err := c.Get(ctx, key, &slinkyv1beta1.Controller{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to get Slurm Controller %s: %w", key, err)
+	}
+	return false, nil
 }

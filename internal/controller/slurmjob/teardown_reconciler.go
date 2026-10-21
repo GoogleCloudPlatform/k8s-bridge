@@ -130,16 +130,8 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 
 	// Delete dynamic slurmd nodes in Slurm
 	if wm != nil && r.ClientMap != nil && wm.Spec.ControllerRef.Name != "" {
-		controllerKey := types.NamespacedName{
-			Namespace: wm.Namespace,
-			Name:      wm.Spec.ControllerRef.Name,
-		}
-		slurmClient := r.ClientMap.Get(controllerKey)
-		if slurmClient == nil {
-			return fmt.Errorf("slurm client not found in ClientMap for controller %s", controllerKey)
-		}
-		if err := r.cleanupDynamicNodes(ctx, slurmClient, js); err != nil {
-			return fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", js.Name, err)
+		if err := r.cleanupDynamicNodesForWM(ctx, wm, js); err != nil {
+			return err
 		}
 	}
 
@@ -197,6 +189,32 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 		}
 	}
 
+	return nil
+}
+
+// cleanupDynamicNodesForWM deletes the JobSet's dynamic slurmd nodes using the Slurm client of the
+// WorkloadMixing's Slurm Controller. Node cleanup is skipped if the Slurm Controller no longer exists,
+// and an error is returned if the Slurm client is not ready yet so the finalizer is retained.
+func (r *JobTeardownReconciler) cleanupDynamicNodesForWM(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing, js *jobsetv1alpha2.JobSet) error {
+	controllerKey := types.NamespacedName{
+		Namespace: wm.Namespace,
+		Name:      wm.Spec.ControllerRef.Name,
+	}
+	slurmClient := r.ClientMap.Get(controllerKey)
+	if slurmClient != nil {
+		if err := r.cleanupDynamicNodes(ctx, slurmClient, js); err != nil {
+			return fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", js.Name, err)
+		}
+		return nil
+	}
+	gone, err := isSlurmControllerGone(ctx, r.Client, controllerKey)
+	if err != nil {
+		return err
+	}
+	if !gone {
+		return fmt.Errorf("slurm client not found in ClientMap for controller %s", controllerKey)
+	}
+	log.FromContext(ctx).WithName("slurmjob-teardown-reconciler").Info("Slurm Controller not found, skipping dynamic node cleanup", "controller", controllerKey, "jobSet", js.Name)
 	return nil
 }
 

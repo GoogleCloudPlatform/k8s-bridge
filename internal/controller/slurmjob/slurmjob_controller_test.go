@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -850,6 +851,51 @@ func TestReconcile_Graceful_MissingClient(t *testing.T) {
 	logOutput := buf.String()
 	if !strings.Contains(logOutput, "Slurm client not found in ClientMap") {
 		t.Errorf("Expected log message about missing client not found: %s", logOutput)
+	}
+}
+
+func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
+	tests := []struct {
+		name              string
+		opts              []reconcileEnvOpt
+		wantJobSetDeleted bool
+	}{
+		{
+			name:              "retains finalizer while Slurm Controller exists",
+			wantJobSetDeleted: false,
+		},
+		{
+			name:              "releases finalizer when Slurm Controller is gone",
+			opts:              []reconcileEnvOpt{withWithoutController()},
+			wantJobSetDeleted: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append([]reconcileEnvOpt{
+				withWithoutSlurmClient(),
+				withExtraObjects(newReconTestJobSet().withDeletionTimestamp().build()),
+			}, tc.opts...)
+			env := newReconcileTestEnv(t, opts...)
+
+			res, err := env.reconcile()
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res.RequeueAfter != 5*time.Second {
+				t.Errorf("Expected requeue after 5s, got %v", res.RequeueAfter)
+			}
+
+			if tc.wantJobSetDeleted {
+				env.verifyJobSetNotFound()
+				return
+			}
+			js := env.getJobSet()
+			if !slices.Contains(js.Finalizers, FinalizerJobSet) {
+				t.Errorf("Expected JobSet to retain finalizer %q, got %v", FinalizerJobSet, js.Finalizers)
+			}
+		})
 	}
 }
 

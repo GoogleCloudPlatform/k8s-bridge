@@ -331,6 +331,9 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 	wmKey := client.ObjectKey{Namespace: namespace, Name: wmName}
 	if err := r.Get(ctx, wmKey, wm); err != nil {
 		if apierrors.IsNotFound(err) {
+			// TODO: Without the WorkloadMixing the Slurm client cannot be resolved, so the finalizer is released
+			// without dynamic node cleanup (only the slurmd PreStop hook deregisters nodes). Record the Slurm
+			// Controller reference on the JobSet so cleanup does not depend on the WorkloadMixing.
 			if finErr := r.releaseFinalizerForDeletingJobSet(ctx, namespace, jobID, nil); finErr != nil {
 				return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, finErr
 			}
@@ -350,6 +353,18 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 	}
 	slurmClient := r.ClientMap.Get(controllerKey)
 	if slurmClient == nil {
+		gone, err := isSlurmControllerGone(ctx, r.Client, controllerKey)
+		if err != nil {
+			return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, err
+		}
+		if gone {
+			// The Slurm cluster is gone together with its dynamic nodes, so release the finalizer
+			// of a deleting JobSet instead of blocking its deletion forever.
+			logger.Info("Slurm Controller not found, releasing JobSet finalizer without node cleanup", "controller", controllerKey, "jobID", jobID)
+			if finErr := r.releaseFinalizerForDeletingJobSet(ctx, namespace, jobID, nil); finErr != nil {
+				return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, finErr
+			}
+		}
 		logger.Error(nil, "Slurm client not found in ClientMap", "controller", controllerKey)
 		return slurmJobState{Result: ctrl.Result{RequeueAfter: 5 * time.Second}}, ReconciliationDone, nil
 	}

@@ -221,8 +221,16 @@ slurm-job-2-slurmd-1-0
 
 ## 7. Cleanup
 
+Delete the `WorkloadMixing` first and wait until `k8s-bridge` has removed its finalizer from all JobSets (the `kubectl get` command must return no resources) before uninstalling `k8s-bridge`:
+
 ```bash
 kubectl delete -f docs/examples/quickstart/workloadmixing.yaml
+kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
+```
+
+Then remove the remaining components:
+
+```bash
 helm uninstall k8s-bridge -n k8s-bridge-system
 helm uninstall slurm -n slurm
 kubectl delete -f docs/examples/quickstart/kueue-resources.yaml
