@@ -163,6 +163,7 @@ func newReconTestJob() *testJobBuilder {
 	return newEmptyTestJob().withDefaultReconFields()
 }
 
+//nolint:unparam
 func (b *testJobSetBuilder) withNamespace(namespace string) *testJobSetBuilder {
 	b.jobSet.Namespace = namespace
 	return b
