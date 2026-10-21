@@ -99,7 +99,6 @@ var flagRejectionTestCases = []flagRejectionTestCase{
 	},
 	{Flag: "--gres-flags", Args: []string{"--gres-flags=enforce-binding"}},
 	{Flag: "--mincpus", Args: []string{"--mincpus=2"}},
-	{Flag: "--no-requeue", Args: []string{"--no-requeue"}},
 	{Flag: "--ntasks-per-core", Args: []string{"--ntasks-per-core=1"}},
 	{Flag: "--ntasks-per-gpu", Args: []string{"--gres=gpu:1", "--ntasks-per-gpu=1"}},
 	{Flag: "--ntasks-per-socket", Args: []string{"--ntasks-per-socket=1"}},
@@ -204,6 +203,7 @@ var _ = Describe("Rejection of job options unsupported by k8s-bridge", Ordered, 
 			"--tmp=1024",
 			"--time=10",
 			"--comment=test",
+			"--no-requeue",
 			"--wrap=sleep 10",
 		}
 		output, _ := utils.RunOnLoginNodeAsUser(

@@ -41,39 +41,44 @@ import (
 )
 
 const (
-	LabelSlurmJobID                = "k8s-bridge.x-k8s.io/slurm-job-id"
-	LabelSlurmJobName              = "k8s-bridge.x-k8s.io/slurm-job-name"
-	LabelSlurmPartition            = "k8s-bridge.x-k8s.io/slurm-partition"
-	AnnotationSuspendedBySlurmHold = "k8s-bridge.x-k8s.io/suspended-by-slurm-hold"
-	LabelKueueQueue                = "kueue.x-k8s.io/queue-name"
-	LabelKueuePriorityClass        = "kueue.x-k8s.io/priority-class"
-	GRESGPU                        = "gpu"
-	tresNode                       = "node"
-	ContainerSlurmd                = "slurmd"
-	DefaultSlurmdImage             = "placeholder-image"
-	defaultMemoryPerCPUMB          = 2048
-	SlurmConfigVolume              = "slurm-etc"
-	SlurmConfigDir                 = "/etc/slurm"
-	SlurmKeyFile                   = "slurm.key"
-	SlurmKeyMode                   = 0o600
-	SlurmctldDefaultPort           = 6817
-	argConfServer                  = "--conf-server"
-	argNodeName                    = "-N"
-	valNodeName                    = "$(SLURM_NODE_NAME)"
-	envJobSetName                  = "JOBSET_NAME"
-	envReplicatedJobName           = "REPLICATED_JOB_NAME"
-	envJobIndex                    = "JOB_INDEX"
-	envPodIndex                    = "POD_INDEX"
-	envSlurmNodeName               = "SLURM_NODE_NAME"
-	fieldPathJobSetName            = "metadata.labels['jobset.sigs.k8s.io/jobset-name']"
-	fieldPathReplicatedJobName     = "metadata.labels['jobset.sigs.k8s.io/replicatedjob-name']"
-	fieldPathJobIndex              = "metadata.labels['jobset.sigs.k8s.io/job-index']"
-	fieldPathJobCompletionIndex    = "metadata.labels['batch.kubernetes.io/job-completion-index']"
-	ReasonJobHeldUser              = "JobHeldUser"
-	ReasonJobHeldAdmin             = "JobHeldAdmin"
-	ReasonPriority                 = "Priority"
-	ValueTrue                      = "true"
-	AutoHoldMarker                 = "k8s-bridge-auto-hold"
+	LabelSlurmJobID             = "k8s-bridge.x-k8s.io/slurm-job-id"
+	LabelSlurmJobName           = "k8s-bridge.x-k8s.io/slurm-job-name"
+	LabelSlurmPartition         = "k8s-bridge.x-k8s.io/slurm-partition"
+	LabelKueueQueue             = "kueue.x-k8s.io/queue-name"
+	LabelKueuePriorityClass     = "kueue.x-k8s.io/priority-class"
+	GRESGPU                     = "gpu"
+	tresNode                    = "node"
+	ContainerSlurmd             = "slurmd"
+	DefaultSlurmdImage          = "placeholder-image"
+	defaultMemoryPerCPUMB       = 2048
+	SlurmConfigVolume           = "slurm-etc"
+	SlurmConfigDir              = "/etc/slurm"
+	SlurmKeyFile                = "slurm.key"
+	SlurmKeyMode                = 0o600
+	SlurmctldDefaultPort        = 6817
+	argConfServer               = "--conf-server"
+	argNodeName                 = "-N"
+	valNodeName                 = "$(SLURM_NODE_NAME)"
+	envJobSetName               = "JOBSET_NAME"
+	envReplicatedJobName        = "REPLICATED_JOB_NAME"
+	envJobIndex                 = "JOB_INDEX"
+	envPodIndex                 = "POD_INDEX"
+	envSlurmNodeName            = "SLURM_NODE_NAME"
+	fieldPathJobSetName         = "metadata.labels['jobset.sigs.k8s.io/jobset-name']"
+	fieldPathReplicatedJobName  = "metadata.labels['jobset.sigs.k8s.io/replicatedjob-name']"
+	fieldPathJobIndex           = "metadata.labels['jobset.sigs.k8s.io/job-index']"
+	fieldPathJobCompletionIndex = "metadata.labels['batch.kubernetes.io/job-completion-index']"
+	ReasonJobHeldUser           = "JobHeldUser"
+	ReasonJobHeldAdmin          = "JobHeldAdmin"
+	ReasonPriority              = "Priority"
+	AutoHoldMarker              = "k8s-bridge-auto-hold"
+
+	// LINT.IfChange(max_restarts)
+	// DefaultJobSetMaxRestarts and NoRequeueJobSetMaxRestarts set failurePolicy.maxRestarts
+	// on a translated JobSet. A job that was submitted with sbatch --no-requeue must not restart.
+	DefaultJobSetMaxRestarts   int32 = 3
+	NoRequeueJobSetMaxRestarts int32 = 0
+	// LINT.ThenChange(test/e2e/jobset_restart_policy_test.go:max_restarts)
 
 	SlurmdProbePeriodSeconds            = 10
 	SlurmdProbeTimeoutSeconds           = 5
@@ -204,7 +209,17 @@ func (t *JobSetTranslator) Translate(
 	injectPreStopHook(&podTemplate.Spec)
 	injectSlurmdProbes(&podTemplate.Spec, jobIDStr)
 
-	return buildJobSet(jobIDStr, replicas, labels, podTemplate), nil
+	return buildJobSet(jobIDStr, replicas, resolveMaxRestarts(job), labels, podTemplate), nil
+}
+
+// resolveMaxRestarts returns the JobSet restart budget for a Slurm job.
+// Requeue is false for a job that Slurm must not requeue, for example a job
+// that was submitted with sbatch --no-requeue. A nil Requeue keeps the default budget.
+func resolveMaxRestarts(job *slurmclienttypes.V0044JobInfo) int32 {
+	if !ptr.Deref(job.Requeue, true) {
+		return NoRequeueJobSetMaxRestarts
+	}
+	return DefaultJobSetMaxRestarts
 }
 
 func applyPodTemplateOverrides(
@@ -490,6 +505,7 @@ func buildPodTemplate(jobIDStr, sanitizedJobName string, resources corev1.Resour
 func buildJobSet(
 	jobIDStr string,
 	replicas int32,
+	maxRestarts int32,
 	labels map[string]string,
 	podTemplate corev1.PodTemplateSpec,
 ) *jobsetv1alpha2.JobSet {
@@ -519,7 +535,7 @@ func buildJobSet(
 		Spec: jobsetv1alpha2.JobSetSpec{
 			Suspend: ptr.To(true),
 			FailurePolicy: &jobsetv1alpha2.FailurePolicy{
-				MaxRestarts: 1,
+				MaxRestarts: maxRestarts,
 			},
 			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
 				{
@@ -895,7 +911,8 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 			return corev1.ResourceRequirements{}, nil, fmt.Errorf("missing GRES mapping for gpu:%s", resolvedGPU.resourceType)
 		}
 		k8sGpuResourceName = mapping.K8sResourceName
-		nodeSelectors = mapping.NodeSelectors
+		// Copy the map so that the JobSet does not share it with the WorkloadMixing spec.
+		nodeSelectors = maps.Clone(mapping.NodeSelectors)
 	}
 
 	// Resolve CPUs per pod

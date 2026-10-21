@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -1051,56 +1052,54 @@ func TestCancelJobWithComment_PartConfigUnavailable422_DoesNotLogError(t *testin
 	}
 }
 
-func TestReconcile_ExplicitHold_SuspendsExistingJobSet(t *testing.T) {
-	js := newReconTestJobSet().
-		withSuspend(false).
-		build()
-
-	job := newReconTestJob().
-		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-		withHold(true).
-		withStateReason("JobHeldUser").
-		build()
-
-	env := newReconcileTestEnv(t,
-		withExtraObjects(js),
-		withPendingSlurmJobs(job),
-	)
-
-	_, err := env.reconcile()
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+func TestReconcile_ExplicitHold_DoesNotMutateExistingJobSetOrUnhold(t *testing.T) {
+	tests := []struct {
+		name        string
+		stateReason string
+		comment     string
+	}{
+		{
+			name:        "user hold without auto-hold marker",
+			stateReason: ReasonJobHeldUser,
+		},
+		{
+			name:        "admin hold",
+			stateReason: ReasonJobHeldAdmin,
+		},
+		{
+			name:        "admin hold with auto-hold marker",
+			stateReason: ReasonJobHeldAdmin,
+			comment:     AutoHoldMarker,
+		},
 	}
 
-	env.verifyJobSetSuspended(true, true)
-	env.verifyNoSlurmUpdates()
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := newReconTestJobSet().
+				withSuspend(false).
+				build()
 
-func TestReconcile_ExplicitHold_Removed_ResumesJobSet(t *testing.T) {
-	js := newReconTestJobSet().
-		withAnnotations(map[string]string{
-			AnnotationSuspendedBySlurmHold: ValueTrue,
-		}).
-		withSuspend(true).
-		build()
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(tc.stateReason).
+				withComment(tc.comment).
+				build()
 
-	job := newReconTestJob().
-		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-		withHold(false).
-		withStateReason("None").
-		build()
+			env := newReconcileTestEnv(t,
+				withExtraObjects(js),
+				withPendingSlurmJobs(job),
+			)
 
-	env := newReconcileTestEnv(t,
-		withExtraObjects(js),
-		withPendingSlurmJobs(job),
-	)
+			before := env.getJobSet()
+			if _, err := env.reconcile(); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
 
-	_, err := env.reconcile()
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+			env.verifyJobSetUnchanged(before)
+			env.verifyNoSlurmUpdates()
+		})
 	}
-
-	env.verifyJobSetSuspended(false, false)
 }
 
 func TestReconcile_SuspendedJobSet_DoesNotReleaseHold(t *testing.T) {
@@ -1159,7 +1158,7 @@ func TestReconcile_Preempted_PreservesJobSet(t *testing.T) {
 	}
 }
 
-func TestReconcile_SuspendedJobSet_WithoutAnnotation_NotResumed(t *testing.T) {
+func TestReconcile_SuspendedJobSet_UnheldJob_NotResumedByBridge(t *testing.T) {
 	js := newReconTestJobSet().
 		withSuspend(true).
 		build()
@@ -1175,12 +1174,13 @@ func TestReconcile_SuspendedJobSet_WithoutAnnotation_NotResumed(t *testing.T) {
 		withPendingSlurmJobs(job),
 	)
 
-	_, err := env.reconcile()
-	if err != nil {
+	before := env.getJobSet()
+	if _, err := env.reconcile(); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifyJobSetSuspended(true, false)
+	env.verifyJobSetUnchanged(before)
+	env.verifyNoSlurmUpdates()
 }
 
 func TestReconcile_ReleaseHold_PreservesExistingComment(t *testing.T) {
@@ -2371,6 +2371,234 @@ func TestReconcile_SlurmCallTimeout_BlockedCallsAbort(t *testing.T) {
 		}
 		if nodeDeleteAttempts == 0 || nodeDeleteAttempts >= totalNodes {
 			t.Errorf("Expected reconciliationTimeout to short-circuit node cleanup before all %d nodes were attempted, got %d attempts", totalNodes, nodeDeleteAttempts)
+		}
+	})
+}
+
+func TestJobSetWatchPredicate(t *testing.T) {
+	pred := jobSetWatchPredicate()
+	now := metav1.Now()
+
+	t.Run("Create", func(t *testing.T) {
+		tests := []struct {
+			name string
+			obj  *jobsetv1alpha2.JobSet
+			want bool
+		}{
+			{
+				name: "Nil object is ignored",
+				obj:  nil,
+				want: false,
+			},
+			{
+				name: "Newly created suspended non-terminal JobSet is ignored",
+				obj:  newReconTestJobSet().withSuspend(true).build(),
+				want: false,
+			},
+			{
+				name: "Unsuspended JobSet is allowed",
+				obj:  newReconTestJobSet().withSuspend(false).build(),
+				want: true,
+			},
+			{
+				name: "Completed JobSet is allowed",
+				obj: newReconTestJobSet().
+					withSuspend(true).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name: "Failed JobSet is allowed",
+				obj: newReconTestJobSet().
+					withSuspend(true).
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name: "Deleting suspended JobSet is allowed",
+				obj: newReconTestJobSet().
+					withSuspend(true).
+					withDeletionTimestamp().
+					build(),
+				want: true,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got := pred.Create(event.TypedCreateEvent[*jobsetv1alpha2.JobSet]{Object: tc.obj})
+				if got != tc.want {
+					t.Errorf("Create() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			oldObj *jobsetv1alpha2.JobSet
+			newObj *jobsetv1alpha2.JobSet
+			want   bool
+		}{
+			{
+				name:   "Nil ObjectOld is ignored",
+				oldObj: nil,
+				newObj: newReconTestJobSet().build(),
+				want:   false,
+			},
+			{
+				name:   "Nil ObjectNew is ignored",
+				oldObj: newReconTestJobSet().build(),
+				newObj: nil,
+				want:   false,
+			},
+			{
+				name:   "Non-terminal status replica update is ignored",
+				oldObj: newReconTestJobSet().withSuspend(false).build(),
+				newObj: func() *jobsetv1alpha2.JobSet {
+					js := newReconTestJobSet().withSuspend(false).build()
+					js.Status.ReplicatedJobsStatus = []jobsetv1alpha2.ReplicatedJobStatus{
+						{Name: ContainerSlurmd, Ready: 2, Active: 2},
+					}
+					return js
+				}(),
+				want: false,
+			},
+			{
+				name: "Transition to JobSetCompleted condition is allowed",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					build(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name: "Transition to JobSetFailed condition is allowed",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					build(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name:   "Transition in spec.suspend is allowed",
+				oldObj: newReconTestJobSet().withSuspend(true).build(),
+				newObj: newReconTestJobSet().withSuspend(false).build(),
+				want:   true,
+			},
+			{
+				name:   "Transition in deletionTimestamp on non-terminal JobSet is allowed",
+				oldObj: newReconTestJobSet().withSuspend(false).build(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withDeletionTimestamp().
+					build(),
+				want: true,
+			},
+			{
+				name: "Transition in deletionTimestamp on already-terminal JobSet is ignored",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				newObj: func() *jobsetv1alpha2.JobSet {
+					js := newReconTestJobSet().
+						withSuspend(false).
+						withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+						build()
+					js.DeletionTimestamp = ptr.To(now)
+					return js
+				}(),
+				want: false,
+			},
+			{
+				name: "Subsequent status update on already-deleting JobSet is ignored",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					withDeletionTimestamp().
+					build(),
+				newObj: func() *jobsetv1alpha2.JobSet {
+					js := newReconTestJobSet().
+						withSuspend(false).
+						withDeletionTimestamp().
+						build()
+					js.Status.ReplicatedJobsStatus = []jobsetv1alpha2.ReplicatedJobStatus{
+						{Name: ContainerSlurmd, Ready: 0, Active: 1},
+					}
+					return js
+				}(),
+				want: false,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got := pred.Update(event.TypedUpdateEvent[*jobsetv1alpha2.JobSet]{
+					ObjectOld: tc.oldObj,
+					ObjectNew: tc.newObj,
+				})
+				if got != tc.want {
+					t.Errorf("Update() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		tests := []struct {
+			name string
+			obj  *jobsetv1alpha2.JobSet
+			want bool
+		}{
+			{
+				name: "Nil Object is ignored",
+				obj:  nil,
+				want: false,
+			},
+			{
+				name: "Non-terminal JobSet is allowed",
+				obj:  newReconTestJobSet().build(),
+				want: true,
+			},
+			{
+				name: "Completed JobSet is ignored",
+				obj: newReconTestJobSet().
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				want: false,
+			},
+			{
+				name: "Failed JobSet is ignored",
+				obj: newReconTestJobSet().
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build(),
+				want: false,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got := pred.Delete(event.TypedDeleteEvent[*jobsetv1alpha2.JobSet]{Object: tc.obj})
+				if got != tc.want {
+					t.Errorf("Delete() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Generic", func(t *testing.T) {
+		js := newReconTestJobSet().build()
+		if pred.Generic(event.TypedGenericEvent[*jobsetv1alpha2.JobSet]{Object: js}) {
+			t.Errorf("Generic() = true, want false")
 		}
 	})
 }
