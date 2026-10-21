@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/GoogleCloudPlatform/k8s-bridge/internal/controller/slurmjob"
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 )
 
@@ -96,5 +97,33 @@ var _ = Describe("k8s-bridge controller manager failure", Serial, Label("disrupt
 		Expect(err).NotTo(HaveOccurred(), "Failed to get the state of Slurm job "+job.ID)
 		Expect(state.JobState).To(Equal("COMPLETED"))
 		Expect(state.Comment).To(Equal(before.SlurmJob.Comment), "k8s-bridge changed the comment of the job")
+	})
+
+	It("translates a job that was submitted while the controller manager was down", func() {
+		By("stopping the controller manager and keeping it stopped")
+		utils.StopControllerManager(managerImage, namespace)
+
+		jobID := submitGatedJob()
+		jobSetName := "slurm-job-" + jobID
+
+		By("verifying that the job stays held without a JobSet while the controller manager is down")
+		Consistently(func(g Gomega) {
+			state, err := utils.QuerySlurmJobState(slurmNamespace, jobID)
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to get the state of Slurm job "+jobID)
+			g.Expect(state.JobState).To(Equal("PENDING"), "Slurm job %s is not PENDING", jobID)
+			g.Expect(state.Reason).To(Equal("JobHeldUser"), "Slurm job %s is not held", jobID)
+			g.Expect(state.Comment).To(ContainSubstring(slurmjob.AutoHoldMarker),
+				"Slurm job %s has no k8s-bridge hold marker, so the poller would skip it", jobID)
+			uid, err := utils.JobSetUID(jobSetName, slurmNamespace)
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to get the UID of JobSet "+jobSetName)
+			g.Expect(uid).To(BeEmpty(), "JobSet %s exists while the controller manager is down", jobSetName)
+		}, baselineWindow, pollInterval).Should(Succeed())
+
+		By("starting the controller manager again")
+		controllerPodName = utils.StartControllerManager(managerImage, namespace)
+
+		By("verifying that the restarted controller manager translates and starts the job")
+		job := waitForGatedJob(jobID)
+		releaseAndVerifyCleanup(job)
 	})
 })
