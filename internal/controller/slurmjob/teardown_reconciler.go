@@ -46,11 +46,27 @@ import (
 // It implements manager.Runnable and manager.LeaderElectionRunnable.
 type JobTeardownReconciler struct {
 	client.Client
-	ClientMap      *clientmap.ClientMap
-	Recorder       record.EventRecorder
-	TeardownEvents <-chan slurmtypes.SlurmJobTeardownEvent
+	ClientMap             *clientmap.ClientMap
+	Recorder              record.EventRecorder
+	TeardownEvents        <-chan slurmtypes.SlurmJobTeardownEvent
+	slurmCallTimeout      time.Duration
+	reconciliationTimeout time.Duration
 	// onEventHandled is an optional callback invoked after processing an event (used for test synchronization).
 	onEventHandled func(ev slurmtypes.SlurmJobTeardownEvent)
+}
+
+func (r *JobTeardownReconciler) getSlurmCallTimeout() time.Duration {
+	if r.slurmCallTimeout > 0 {
+		return r.slurmCallTimeout
+	}
+	return defaultSlurmCallTimeout
+}
+
+func (r *JobTeardownReconciler) getReconciliationTimeout() time.Duration {
+	if r.reconciliationTimeout > 0 {
+		return r.reconciliationTimeout
+	}
+	return defaultReconciliationTimeout
 }
 
 // NeedLeaderElection implements manager.LeaderElectionRunnable ensuring
@@ -86,6 +102,9 @@ func (r *JobTeardownReconciler) Start(ctx context.Context) error {
 
 // handleTeardown reconciles a single teardown event.
 func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtypes.SlurmJobTeardownEvent) error {
+	ctx, cancel := context.WithTimeout(ctx, r.getReconciliationTimeout())
+	defer cancel()
+
 	logger := log.FromContext(ctx).WithName("slurmjob-teardown-reconciler")
 
 	jobSetName := fmt.Sprintf("slurm-job-%s", ev.JobID)
@@ -212,14 +231,13 @@ func deriveNodeNames(js *jobsetv1alpha2.JobSet) []string {
 	return nodeNames
 }
 
-const defaultSlurmCallTimeout = 5 * time.Second
-
+// cleanupDynamicNodes deletes dynamic slurmd nodes from Slurm.
 func (r *JobTeardownReconciler) cleanupDynamicNodes(
 	ctx context.Context,
 	slurmClient slurmclient.Client,
 	js *jobsetv1alpha2.JobSet,
 ) error {
-	return cleanupDynamicNodes(ctx, slurmClient, js)
+	return cleanupDynamicNodes(ctx, slurmClient, js, r.getSlurmCallTimeout())
 }
 
 // cleanupDynamicNodes deletes dynamic slurmd nodes from Slurm.
@@ -227,9 +245,13 @@ func cleanupDynamicNodes(
 	ctx context.Context,
 	slurmClient slurmclient.Client,
 	js *jobsetv1alpha2.JobSet,
+	callTimeout time.Duration,
 ) error {
 	if js == nil || slurmClient == nil {
 		return nil
+	}
+	if callTimeout <= 0 {
+		callTimeout = defaultSlurmCallTimeout
 	}
 	logger := log.FromContext(ctx)
 	nodeNames := deriveNodeNames(js)
@@ -246,7 +268,7 @@ func cleanupDynamicNodes(
 				Name: ptr.To(nodeName),
 			},
 		}
-		callCtx, cancel := context.WithTimeout(ctx, defaultSlurmCallTimeout)
+		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
 		err := slurmClient.Delete(callCtx, node)
 		cancel()
 		if err == nil {

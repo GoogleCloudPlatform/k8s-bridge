@@ -1753,6 +1753,42 @@ func TestTranslateSlurmJobToJobSet_PodFailurePolicy(t *testing.T) {
 	})
 }
 
+func TestTranslateSlurmJobToJobSet_FailurePolicyMaxRestarts(t *testing.T) {
+	tests := []struct {
+		name            string
+		job             *testJobBuilder
+		wantMaxRestarts int32
+	}{
+		{
+			name:            "Requeue unset keeps the default restart budget",
+			job:             newTestJob(),
+			wantMaxRestarts: 3,
+		},
+		{
+			name:            "Requeue true keeps the default restart budget",
+			job:             newTestJob().withRequeue(true),
+			wantMaxRestarts: 3,
+		},
+		{
+			name:            "Requeue false (--no-requeue) disables JobSet restarts",
+			job:             newTestJob().withRequeue(false),
+			wantMaxRestarts: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			js := translateTestJobSetWithJob(t, tt.job, newTestWMSpec())
+			if js.Spec.FailurePolicy == nil {
+				t.Fatalf("Translate() returned FailurePolicy = nil, want MaxRestarts = %d", tt.wantMaxRestarts)
+			}
+			if got := js.Spec.FailurePolicy.MaxRestarts; got != tt.wantMaxRestarts {
+				t.Errorf("Translate() returned FailurePolicy.MaxRestarts = %d, want %d", got, tt.wantMaxRestarts)
+			}
+		})
+	}
+}
+
 func TestTranslate_JobSetCarriesK8sBridgeLabels(t *testing.T) {
 	js := translateTestJobSet(t, newTestWMSpec())
 

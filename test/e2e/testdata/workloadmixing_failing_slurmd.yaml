@@ -1,0 +1,44 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# WorkloadMixing whose slurmd container exits with code 1 instead of starting slurmd.
+# The podFailurePolicy that k8s-bridge injects into the translated JobSet fails the child
+# Job on that exit code, which exercises the JobSet failure policy (maxRestarts) in a
+# deterministic way, without a dynamic Slurm node ever registering.
+apiVersion: k8s-bridge.x-k8s.io/v1alpha1
+kind: WorkloadMixing
+metadata:
+  name: workloadmixing-failing-slurmd
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+  partitionsMapping:
+    - partition: workloadmixing-partition
+      localQueue: test-local-queue
+      dynamicNodeFeature: dynamic_kpartition
+  podTemplate:
+    spec:
+      containers:
+        - name: slurmd
+          # A small image that the e2e suite preloads into every Kind node, so that each
+          # restart cycle of the JobSet is fast and does not depend on an image pull.
+          # LINT.IfChange(curl_image)
+          image: curlimages/curl:8.16.0
+          # LINT.ThenChange(test/utils/utils.go:curl_image)
+          # The translator appends the slurmd arguments after this command. sh receives
+          # them as positional parameters and still runs the script. The sleep keeps each
+          # restart attempt alive long enough for the e2e specs to observe status.restarts
+          # of the JobSet before the next attempt starts.
+          command: ["sh", "-c", "sleep 5; exit 1"]

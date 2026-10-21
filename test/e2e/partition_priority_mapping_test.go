@@ -214,7 +214,7 @@ var _ = Describe("Partition Priority Mapping", func() {
 		Expect(err.Error()).To(MatchRegexp(`(?i)not\s*found`))
 	})
 
-	It("suspends/defers JobSets when corresponding Slurm job is explicitly held (priority=0)", func() {
+	It("defers JobSets when corresponding Slurm job is explicitly held (priority=0)", func() {
 		utils.ApplyManifestWithCleanup("test/e2e/testdata/partition_mapping_held.yaml")
 
 		By(fmt.Sprintf(

@@ -43,6 +43,7 @@ const (
 	// defaultOrphanGracePeriod defines the default duration an absent Slurm workload's
 	// corresponding JobSet must remain missing before being flagged as orphaned and torn down.
 	defaultOrphanGracePeriod = 1 * time.Minute
+	jobSetNameFormat         = "slurm-job-%d"
 )
 
 // SlurmPoller periodically queries the Slurm REST API for pending jobs
@@ -140,7 +141,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 		}
 
 		start := time.Now()
-		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		timeoutCtx, cancel := context.WithTimeout(ctx, defaultSlurmCallTimeout)
 		var jobList slurmclienttypes.V0044JobInfoList
 		err := cli.List(timeoutCtx, &jobList)
 		duration := time.Since(start)
@@ -169,8 +170,17 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 			}
 		}
 
+		jsList := &jobsetv1alpha2.JobSetList{}
+		if err := p.List(ctx, jsList, client.InNamespace(controllerKey.Namespace)); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			logger.Error(err, "Failed to list JobSets for controller namespace", "controller", controllerKey)
+			continue
+		}
+
 		for _, wm := range wms {
-			if err := p.processPendingJobsForWM(ctx, &jobList, wm); err != nil {
+			if err := p.processPendingJobsForWM(ctx, &jobList, wm, jsList.Items); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
@@ -178,7 +188,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 				continue
 			}
 
-			if err := p.reconcileWorkloadsForWM(ctx, jobsByID, wm); err != nil {
+			if err := p.reconcileWorkloadsForWM(ctx, jobsByID, wm, jsList.Items); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
@@ -196,20 +206,12 @@ func (p *SlurmPoller) reconcileWorkloadsForWM(
 	ctx context.Context,
 	jobsByID map[string]*slurmclienttypes.V0044JobInfo,
 	wm *k8sbridgev1alpha1.WorkloadMixing,
+	jobSets []jobsetv1alpha2.JobSet,
 ) error {
 	logger := log.FromContext(ctx).WithName("slurm-poller")
 
-	// List cached JobSets in the WorkloadMixing namespace
-	jsList := &jobsetv1alpha2.JobSetList{}
-	if err := p.List(ctx, jsList, client.InNamespace(wm.Namespace)); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("failed to list JobSets for WorkloadMixing %s/%s: %w", wm.Namespace, wm.Name, err)
-	}
-
-	for i := range jsList.Items {
-		event := getTeardownEvent(&jsList.Items[i], wm, jobsByID)
+	for i := range jobSets {
+		event := getTeardownEvent(&jobSets[i], wm, jobsByID)
 		if event == nil {
 			continue
 		}
@@ -225,7 +227,7 @@ func (p *SlurmPoller) reconcileWorkloadsForWM(
 		}
 	}
 
-	return p.auditOrphanedJobSets(ctx, wm, jsList.Items, jobsByID)
+	return p.auditOrphanedJobSets(ctx, wm, jobSets, jobsByID)
 }
 
 // getOrphanGracePeriod returns the configured grace period or the default.
@@ -432,7 +434,23 @@ func getTeardownEvent(
 	}
 }
 
-func (p *SlurmPoller) processPendingJobsForWM(ctx context.Context, jobList *slurmclienttypes.V0044JobInfoList, wm *k8sbridgev1alpha1.WorkloadMixing) error {
+func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
+	status := activeJobStatus(job, existingJS)
+	if status == StatusNewJob {
+		if strings.Contains(ptr.Deref(job.Partition, ""), ",") {
+			return true
+		}
+		return !isJobExplicitlyHeld(job)
+	}
+	return status != StatusNoAction
+}
+
+func (p *SlurmPoller) processPendingJobsForWM(
+	ctx context.Context,
+	jobList *slurmclienttypes.V0044JobInfoList,
+	wm *k8sbridgev1alpha1.WorkloadMixing,
+	jobSets []jobsetv1alpha2.JobSet,
+) error {
 	logger := log.FromContext(ctx).WithName("slurm-poller")
 
 	observedPartitions := make(map[string]bool, len(wm.Spec.PartitionsMapping))
@@ -440,7 +458,15 @@ func (p *SlurmPoller) processPendingJobsForWM(ctx context.Context, jobList *slur
 		observedPartitions[pm.Partition] = true
 	}
 
-	for _, job := range jobList.Items {
+	jobSetsByName := make(map[string]*jobsetv1alpha2.JobSet, len(jobSets))
+	for i := range jobSets {
+		if isJobSetOwnedByWM(&jobSets[i], wm) {
+			jobSetsByName[jobSets[i].Name] = &jobSets[i]
+		}
+	}
+
+	for i := range jobList.Items {
+		job := &jobList.Items[i]
 		if job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING) {
 			jobPartition := ptr.Deref(job.Partition, "")
 			partitions := strings.Split(jobPartition, ",")
@@ -455,7 +481,14 @@ func (p *SlurmPoller) processPendingJobsForWM(ctx context.Context, jobList *slur
 
 			if matched {
 				jobID := ptr.Deref(job.JobId, 0)
-				rawJSON, err := json.Marshal(job)
+				jobSetName := fmt.Sprintf(jobSetNameFormat, jobID)
+				existingJS := jobSetsByName[jobSetName]
+				if !shouldEmitAdmissionEvent(job, existingJS) {
+					logger.V(1).Info("Skipping redundant SlurmJobAdmissionEvent", "jobID", jobID, "workloadMixing", client.ObjectKeyFromObject(wm))
+					continue
+				}
+
+				rawJSON, err := json.Marshal(*job)
 				if err != nil {
 					logger.Error(err, "Failed to marshal job info", "jobID", jobID)
 					continue

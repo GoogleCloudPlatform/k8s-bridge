@@ -109,6 +109,7 @@ local ALLOWED_OPTIONS = {
     ["mem-per-gpu"]       = true, -- --mem-per-gpu
     ["msg-timeout"]       = true, -- --msg-timeout
     ["no-bell"]           = true, -- --no-bell
+    ["no-requeue"]        = true, -- --no-requeue
     ["no-shell"]          = true, -- --no-shell
     ["nodes"]             = true, -- -N, --nodes
     ["ntasks"]            = true, -- -n, --ntasks

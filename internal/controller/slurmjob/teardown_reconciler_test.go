@@ -1248,3 +1248,85 @@ func TestCleanupDynamicNodes_ContextCancelled(t *testing.T) {
 		t.Errorf("Expected 0 delete calls when context is pre-cancelled, got %d", callCount)
 	}
 }
+
+func TestJobTeardownReconciler_HandleTeardown_ReconciliationTimeoutShortCircuitsNodeCleanup(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	const (
+		testCtrlName = "slurmctld-controller-timeout"
+		totalNodes   = 20
+	)
+	wm := &k8sbridgev1alpha1.WorkloadMixing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      reconWmName,
+			Namespace: testNamespace,
+		},
+		Spec: k8sbridgev1alpha1.WorkloadMixingSpec{
+			ControllerRef: corev1.LocalObjectReference{
+				Name: testCtrlName,
+			},
+		},
+	}
+
+	js := &jobsetv1alpha2.JobSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobSet101Name,
+			Namespace: testNamespace,
+			Labels: map[string]string{
+				LabelSlurmJobID:     "101",
+				LabelSlurmPartition: testBatchPartition,
+			},
+		},
+		Spec: jobsetv1alpha2.JobSetSpec{
+			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
+				{
+					Name:     ContainerSlurmd,
+					Replicas: totalNodes,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
+
+	var nodeDeleteAttempts int
+	fakeSlurm := slurmclientfake.NewClientBuilder().WithInterceptorFuncs(slurmclientinterceptor.Funcs{
+		Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+			nodeDeleteAttempts++
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}).Build()
+
+	cm := clientmap.NewClientMap()
+	ctrlKey := types.NamespacedName{Namespace: testNamespace, Name: testCtrlName}
+	cm.Add(t.Context(), ctrlKey, fakeSlurm)
+
+	reconciler := &JobTeardownReconciler{
+		Client:                fakeClient,
+		ClientMap:             cm,
+		slurmCallTimeout:      15 * time.Millisecond,
+		reconciliationTimeout: 35 * time.Millisecond,
+	}
+
+	ev := slurmtypes.SlurmJobTeardownEvent{
+		JobID: "101",
+		WorkloadMixing: types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      reconWmName,
+		},
+		Partition: testBatchPartition,
+		Reason:    metrics.ReasonJobCompleted,
+	}
+
+	err := reconciler.handleTeardown(context.Background(), ev)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Expected handleTeardown error wrapping context.DeadlineExceeded, got: %v", err)
+	}
+	if nodeDeleteAttempts == 0 || nodeDeleteAttempts >= totalNodes {
+		t.Errorf("Expected reconciliationTimeout to short-circuit node cleanup before all %d nodes were attempted, got %d attempts", totalNodes, nodeDeleteAttempts)
+	}
+}

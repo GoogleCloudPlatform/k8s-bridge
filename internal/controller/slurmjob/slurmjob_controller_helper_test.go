@@ -26,6 +26,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -161,19 +162,16 @@ func newReconTestJob() *testJobBuilder {
 	return newEmptyTestJob().withDefaultReconFields()
 }
 
+func (b *testJobSetBuilder) withNamespace(namespace string) *testJobSetBuilder {
+	b.jobSet.Namespace = namespace
+	return b
+}
+
 func (b *testJobSetBuilder) withLabels(labels map[string]string) *testJobSetBuilder {
 	if b.jobSet.Labels == nil {
 		b.jobSet.Labels = make(map[string]string)
 	}
 	maps.Copy(b.jobSet.Labels, labels)
-	return b
-}
-
-func (b *testJobSetBuilder) withAnnotations(annotations map[string]string) *testJobSetBuilder {
-	if b.jobSet.Annotations == nil {
-		b.jobSet.Annotations = make(map[string]string)
-	}
-	maps.Copy(b.jobSet.Annotations, annotations)
 	return b
 }
 
@@ -363,6 +361,11 @@ func (e *reconcileTestEnv) reconcile(ctx ...context.Context) (ctrl.Result, error
 	if len(ctx) > 0 && ctx[0] != nil {
 		c = ctx[0]
 	}
+	if _, hasDeadline := c.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		c, cancel = context.WithTimeout(c, e.reconciler.getReconciliationTimeout())
+		defer cancel()
+	}
 	return e.reconciler.Reconcile(c, e.req)
 }
 
@@ -402,19 +405,19 @@ func (e *reconcileTestEnv) verifyJobSetNotFound() {
 	}
 }
 
-func (e *reconcileTestEnv) verifyJobSetSuspended(wantSuspended bool, wantSuspendedBySlurmHoldAnnotation bool) {
+func (e *reconcileTestEnv) getJobSet() *jobsetv1alpha2.JobSet {
 	e.t.Helper()
-	var js jobsetv1alpha2.JobSet
-	if err := e.baseClient.Get(context.Background(), e.jobSetKey, &js); err != nil {
-		e.t.Fatalf("Failed to fetch JobSet: %v", err)
+	js := &jobsetv1alpha2.JobSet{}
+	if err := e.baseClient.Get(e.t.Context(), e.jobSetKey, js); err != nil {
+		e.t.Fatalf("Failed to get JobSet %s: %v", e.jobSetKey, err)
 	}
-	isSuspended := js.Spec.Suspend != nil && *js.Spec.Suspend
-	if isSuspended != wantSuspended {
-		e.t.Errorf("Expected JobSet.Spec.Suspend = %v, got %v", wantSuspended, isSuspended)
-	}
-	hasAnnotation := js.Annotations != nil && js.Annotations[AnnotationSuspendedBySlurmHold] == ValueTrue
-	if hasAnnotation != wantSuspendedBySlurmHoldAnnotation {
-		e.t.Errorf("Expected annotation %s = %v, got %v", AnnotationSuspendedBySlurmHold, wantSuspendedBySlurmHoldAnnotation, hasAnnotation)
+	return js
+}
+
+func (e *reconcileTestEnv) verifyJobSetUnchanged(before *jobsetv1alpha2.JobSet) {
+	e.t.Helper()
+	if diff := cmp.Diff(before, e.getJobSet()); diff != "" {
+		e.t.Errorf("Reconcile changed the JobSet (-before +after):\n%s", diff)
 	}
 }
 
