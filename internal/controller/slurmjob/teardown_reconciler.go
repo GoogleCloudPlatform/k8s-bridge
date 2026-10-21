@@ -187,7 +187,7 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 	if wm != nil && partition != "" {
 		count, err := CountActiveJobSets(ctx, r.Client, wm, partition, js.Name)
 		if err != nil {
-			logger.V(1).Info("Failed to count active JobSets for metric", "partition", partition, "error", err)
+			logger.Error(err, "Failed to count active JobSets for metric", "partition", partition)
 		} else {
 			metrics.SetActiveJobs(wm.Name, partition, count)
 		}
@@ -214,7 +214,7 @@ func (r *JobTeardownReconciler) slurmClientForCleanup(ctx context.Context, wm *k
 	if !gone {
 		return nil, fmt.Errorf("no Slurm client in ClientMap for controller %s", controllerKey)
 	}
-	log.FromContext(ctx).Info("Slurm Controller not found, skipping dynamic node cleanup", "controller", controllerKey)
+	log.FromContext(ctx).Info("Slurm Controller not found, skipping dynamic node cleanup", "slurmController", controllerKey)
 	return nil, nil
 }
 

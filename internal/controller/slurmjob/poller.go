@@ -134,7 +134,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 	for controllerKey, wms := range wmByController {
 		cli := p.ClientMap.Get(controllerKey)
 		if cli == nil {
-			logger.V(1).Info("Slurm client not ready yet, skipping controller", "controller", controllerKey)
+			logger.V(1).Info("Slurm client not ready yet, skipping controller", "slurmController", controllerKey)
 			metrics.SetSlurmClientStatus(controllerKey.Name, false)
 			continue
 		}
@@ -154,7 +154,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 			}
 			metrics.RecordPollerError(controllerKey.Name)
 			metrics.SetSlurmClientStatus(controllerKey.Name, false)
-			logger.Error(err, "Failed to list jobs for controller", "controller", controllerKey)
+			logger.Error(err, "Failed to list jobs for controller", "slurmController", controllerKey)
 			continue
 		}
 
@@ -174,7 +174,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			logger.Error(err, "Failed to list JobSets for controller namespace", "controller", controllerKey)
+			logger.Error(err, "Failed to list JobSets for controller namespace", "slurmController", controllerKey)
 			continue
 		}
 
@@ -183,7 +183,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				logger.Error(err, "Failed to process pending jobs for WorkloadMixing", "controller", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
+				logger.Error(err, "Failed to process pending jobs for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
 				continue
 			}
 
@@ -191,7 +191,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				logger.Error(err, "Failed to reconcile workloads for WorkloadMixing", "controller", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
+				logger.Error(err, "Failed to reconcile workloads for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
 				continue
 			}
 		}

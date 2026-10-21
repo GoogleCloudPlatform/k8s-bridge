@@ -25,12 +25,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -152,9 +154,13 @@ func (r *SlurmJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("failed to add SlurmJobReconciler as Runnable: %w", err)
 	}
 
+	baseLogger := mgr.GetLogger().WithValues("controller", "slurmjob-controller")
 	c, err := controller.New("slurmjob-controller", mgr, controller.Options{
 		Reconciler:            r,
 		ReconciliationTimeout: r.getReconciliationTimeout(),
+		LogConstructor: func(req *reconcile.Request) logr.Logger {
+			return requestLogger(baseLogger, req)
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create controller: %w", err)
@@ -283,21 +289,39 @@ type slurmJobState struct {
 // +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets/finalizers,verbs=update
 
+// requestLogger builds the per-request logger used by controller-runtime for
+// both the Reconcile context and its "Reconciler error" log lines. It keeps the
+// default controller-runtime fields and adds the Slurm jobID and WorkloadMixing
+// parsed from the request name.
+func requestLogger(base logr.Logger, req *reconcile.Request) logr.Logger {
+	if req == nil {
+		return base
+	}
+	logger := base.WithValues(
+		"object", klog.KRef(req.Namespace, req.Name),
+		"namespace", req.Namespace,
+		"name", req.Name,
+	)
+	wmName, jobID, err := parseRequestName(req.Name)
+	if err != nil {
+		return logger
+	}
+	logger = logger.WithValues("jobID", jobID)
+	if wmName != "" {
+		logger = logger.WithValues("workloadMixing", types.NamespacedName{Namespace: req.Namespace, Name: wmName})
+	}
+	return logger
+}
+
 // Reconcile reconciles a Slurm job.
 func (r *SlurmJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	wmName, jobID, err := parseRequestName(req.Name)
 	if err != nil {
-		logger.Error(err, "Failed to parse request name", "name", req.Name)
+		logger.Error(err, "Failed to parse request name")
 		return ctrl.Result{}, nil
 	}
-
-	logger = logger.WithValues("jobID", jobID)
-	if wmName != "" {
-		logger = logger.WithValues("workloadMixing", types.NamespacedName{Namespace: req.Namespace, Name: wmName})
-	}
-	ctx = log.IntoContext(ctx, logger)
 
 	if r.verifyWMName(ctx, wmName) {
 		return ctrl.Result{}, nil
@@ -380,10 +404,10 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 		if gone {
 			// The Slurm cluster is gone together with its dynamic nodes, so a deleting JobSet is finalized
 			// without node cleanup instead of blocking its deletion forever.
-			logger.Info("Slurm Controller not found, skipping reconciliation", "controller", controllerKey)
+			logger.Info("Slurm Controller not found, skipping reconciliation", "slurmController", controllerKey)
 			return slurmJobState{FinalizeDeletingJobSet: true}, ReconciliationDone, nil
 		}
-		logger.Info("Slurm client not found in ClientMap, requeuing Slurm job", "controller", controllerKey, "requeueAfter", 5*time.Second)
+		logger.Info("Slurm client not found in ClientMap, requeuing Slurm job", "slurmController", controllerKey, "requeueAfter", 5*time.Second)
 		return slurmJobState{Result: ctrl.Result{RequeueAfter: 5 * time.Second}}, ReconciliationDone, nil
 	}
 

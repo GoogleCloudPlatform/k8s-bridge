@@ -230,7 +230,7 @@ func (r *WorkloadMixingReconciler) getController(ctx context.Context, workloadMi
 
 	if err := r.Get(ctx, controllerKey, controllerCR); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.V(1).Info("Referenced Controller not found", "controller", controllerKey)
+			logger.V(1).Info("Referenced Controller not found", "slurmController", controllerKey)
 			return nil, nil
 		}
 		return nil, err
@@ -249,7 +249,7 @@ func (r *WorkloadMixingReconciler) getRestAPI(ctx context.Context, controllerCR 
 	}
 
 	if len(restAPIList.Items) == 0 {
-		logger.V(1).Info("No RestApi found for Controller", "controller", controllerKey)
+		logger.V(1).Info("No RestApi found for Controller", "slurmController", controllerKey)
 		return nil, nil
 	}
 
