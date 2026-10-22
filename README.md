@@ -69,10 +69,20 @@ To uninstall the controller:
 helm uninstall k8s-bridge --namespace k8s-bridge-system
 ```
 
-If a JobSet is stuck in `Terminating` because `k8s-bridge` is no longer running, remove its finalizers manually:
+If a JobSet is stuck in `Terminating` because `k8s-bridge` is no longer running, remove only the `k8s-bridge` finalizer. Keep the other finalizers, such as `foregroundDeletion` or `orphan`, so the requested cascade still happens. `kubectl replace` sends the `resourceVersion`, so it fails instead of overwriting the JobSet if it changed in the meantime:
 ```sh
-kubectl patch jobset <name> -n <namespace> --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+kubectl get jobset <name> -n <namespace> -o json \
+  | jq '.metadata.finalizers -= ["k8s-bridge.x-k8s.io/slurm-node-cleanup"]' \
+  | kubectl replace -f -
 ```
+Alternatively, run `kubectl edit jobset <name> -n <namespace>` and delete only that entry from `metadata.finalizers`.
+
+### JobSet finalizer behavior
+
+- **Deleting a JobSet**: With the default background cascade, a deleted JobSet stays in `Terminating`, and its slurmd Pods keep running until `k8s-bridge` has cancelled the Slurm job and deregistered the dynamic Slurm nodes. If slurmrestd is unreachable, this lasts until it is reachable again.
+- **Deleting a WorkloadMixing with `--cascade=orphan`**: This removes the WorkloadMixing owner reference from its JobSets, so `k8s-bridge` no longer manages them and does not release their finalizer. If such a JobSet is deleted later, remove the finalizer manually as shown above.
+- **Upgrading**: JobSets created before the upgrade have no finalizer and are cleaned up as before.
+- **Rolling back**: Versions without finalizer support never remove the finalizer, so JobSets created by this version stay in `Terminating` when they are deleted after a rollback. Remove the finalizer manually as shown above.
 
 ## Metrics & Monitoring
 

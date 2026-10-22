@@ -20,12 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1140,20 +1141,22 @@ func TestJobTeardownReconciler_HandleTeardown_MissingSlurmClient(t *testing.T) {
 	const controllerName = "missing-client-controller"
 
 	tests := []struct {
-		name              string
-		controllerExists  bool
-		wantErr           bool
-		wantJobSetDeleted bool
+		name       string
+		extraObjs  []client.Object
+		wantErr    bool
+		wantJobSet jobSetState
 	}{
 		{
-			name:             "retains finalizer while Slurm Controller exists",
-			controllerExists: true,
-			wantErr:          true,
+			name: "retains finalizer and does not delete JobSet while Slurm Controller exists",
+			extraObjs: []client.Object{&slinkyv1beta1.Controller{
+				ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: testNamespace},
+			}},
+			wantErr:    true,
+			wantJobSet: jobSetState{Exists: true, Deleting: false, Finalizers: []string{FinalizerJobSet}},
 		},
 		{
-			name:              "releases finalizer and deletes JobSet when Slurm Controller is gone",
-			controllerExists:  false,
-			wantJobSetDeleted: true,
+			name:       "releases finalizer and deletes JobSet when Slurm Controller is gone",
+			wantJobSet: jobSetState{},
 		},
 	}
 
@@ -1165,65 +1168,32 @@ func TestJobTeardownReconciler_HandleTeardown_MissingSlurmClient(t *testing.T) {
 			_ = jobsetv1alpha2.AddToScheme(scheme)
 			_ = slinkyv1beta1.AddToScheme(scheme)
 
-			wm := &k8sbridgev1alpha1.WorkloadMixing{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      reconWmName,
-					Namespace: testNamespace,
-				},
-				Spec: k8sbridgev1alpha1.WorkloadMixingSpec{
-					ControllerRef: corev1.LocalObjectReference{
-						Name: controllerName,
-					},
-				},
-			}
-
+			wm := newTestWorkloadMixing(reconWmName, controllerName, "", "")
 			js := newTestJobSet(testJobSet101Name).
 				withNamespace(testNamespace).
 				withFinalizers(FinalizerJobSet).
 				withSlurmdReplicas(1).
 				build()
 
-			objs := []client.Object{wm, js}
-			if tc.controllerExists {
-				objs = append(objs, &slinkyv1beta1.Controller{
-					ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: testNamespace},
-				})
-			}
-
-			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm, js}, tc.extraObjs...)...).Build()
 			reconciler := &JobTeardownReconciler{
 				Client:    fakeClient,
 				ClientMap: clientmap.NewClientMap(),
 			}
 
 			ev := slurmtypes.SlurmJobTeardownEvent{
-				JobID: "101",
-				WorkloadMixing: types.NamespacedName{
-					Namespace: testNamespace,
-					Name:      reconWmName,
-				},
-				Partition: testBatchPartition,
-				Reason:    metrics.ReasonJobCompleted,
+				JobID:          "101",
+				WorkloadMixing: client.ObjectKeyFromObject(wm),
+				Partition:      testBatchPartition,
+				Reason:         metrics.ReasonJobCompleted,
 			}
 
-			err := reconciler.handleTeardown(context.Background(), ev)
+			err := reconciler.handleTeardown(t.Context(), ev)
 			if gotErr := err != nil; gotErr != tc.wantErr {
 				t.Fatalf("handleTeardown() error = %v, wantErr %v", err, tc.wantErr)
 			}
-
-			checkJS := &jobsetv1alpha2.JobSet{}
-			getErr := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: testJobSet101Name}, checkJS)
-			if tc.wantJobSetDeleted {
-				if !apierrors.IsNotFound(getErr) {
-					t.Errorf("Expected JobSet to be deleted, got: %v", getErr)
-				}
-				return
-			}
-			if getErr != nil {
-				t.Fatalf("Expected JobSet to remain, got: %v", getErr)
-			}
-			if !slices.Equal(checkJS.Finalizers, []string{FinalizerJobSet}) {
-				t.Errorf("Expected FinalizerJobSet to be retained on JobSet, got: %v", checkJS.Finalizers)
+			if diff := cmp.Diff(tc.wantJobSet, getJobSetState(t, fakeClient, client.ObjectKeyFromObject(js)), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

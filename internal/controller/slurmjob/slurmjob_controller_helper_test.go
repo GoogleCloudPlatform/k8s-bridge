@@ -427,6 +427,26 @@ func (e *reconcileTestEnv) getJobSet() *jobsetv1alpha2.JobSet {
 	return js
 }
 
+// jobSetState summarizes the parts of a JobSet that finalizer tests assert on.
+// The zero value means the JobSet does not exist.
+type jobSetState struct {
+	Exists     bool
+	Deleting   bool
+	Finalizers []string
+}
+
+func getJobSetState(t *testing.T, c client.Client, key types.NamespacedName) jobSetState {
+	t.Helper()
+	js := &jobsetv1alpha2.JobSet{}
+	if err := c.Get(t.Context(), key, js); err != nil {
+		if apierrors.IsNotFound(err) {
+			return jobSetState{}
+		}
+		t.Fatalf("Failed to get JobSet %s: %v", key, err)
+	}
+	return jobSetState{Exists: true, Deleting: isJobSetDeleting(js), Finalizers: js.Finalizers}
+}
+
 func (e *reconcileTestEnv) verifyJobSetHasFinalizer() {
 	e.t.Helper()
 	if js := e.getJobSet(); !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {

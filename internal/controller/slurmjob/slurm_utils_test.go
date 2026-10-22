@@ -18,10 +18,13 @@ package slurmjob
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -31,7 +34,58 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	slinkyv1beta1 "github.com/SlinkyProject/slurm-operator/api/v1beta1"
 )
+
+func TestIsSlurmControllerGone(t *testing.T) {
+	key := types.NamespacedName{Namespace: testNamespace, Name: "slurm"}
+
+	tests := []struct {
+		name     string
+		objs     []client.Object
+		getErr   error
+		wantGone bool
+		wantErr  bool
+	}{
+		{
+			name:     "Controller exists",
+			objs:     []client.Object{&slinkyv1beta1.Controller{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}},
+			wantGone: false,
+		},
+		{
+			name:     "Controller not found",
+			wantGone: true,
+		},
+		{
+			name:    "Get error other than NotFound",
+			getErr:  errors.New("apiserver unavailable"),
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = slinkyv1beta1.AddToScheme(scheme)
+			c := interceptor.NewClient(fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.objs...).Build(), interceptor.Funcs{
+				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if tc.getErr != nil {
+						return tc.getErr
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+			})
+
+			gone, err := isSlurmControllerGone(t.Context(), c, key)
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("isSlurmControllerGone() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if gone != tc.wantGone {
+				t.Errorf("isSlurmControllerGone() = %v, want %v", gone, tc.wantGone)
+			}
+		})
+	}
+}
 
 func TestRemoveJobSetFinalizer(t *testing.T) {
 	const otherFinalizer = "orphan"

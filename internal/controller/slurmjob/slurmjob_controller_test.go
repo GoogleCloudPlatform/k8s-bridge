@@ -53,6 +53,8 @@ import (
 	slurmclientinterceptor "github.com/SlinkyProject/slurm-client/pkg/client/interceptor"
 	"github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	uberzap "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -608,6 +610,53 @@ func TestReconcile_DeletingJobSet_FinalizerAndDynamicNodes(t *testing.T) {
 		env.verifyJobSetNotFound()
 		env.verifyNoSlurmUpdates()
 	})
+
+	t.Run("Live JobSet keeps finalizer when Slurm job is purged (NotFound)", func(t *testing.T) {
+		liveJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(liveJS))
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected no error when Slurm job is NotFound for live JobSet, got: %v", err)
+		}
+
+		want := jobSetState{Exists: true, Deleting: false, Finalizers: []string{FinalizerJobSet}}
+		if diff := cmp.Diff(want, getJobSetState(t, env.baseClient, env.jobSetKey)); diff != "" {
+			t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+		}
+		env.verifySlurmNodesDeleted()
+	})
+
+	t.Run("Finalizer patch failure returns error and keeps the finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withInterceptors(interceptor.Funcs{
+				Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+					return errors.New("apiserver unavailable")
+				},
+			}),
+		)
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error when the finalizer patch fails, got nil")
+		}
+
+		want := jobSetState{Exists: true, Deleting: true, Finalizers: []string{FinalizerJobSet}}
+		if diff := cmp.Diff(want, getJobSetState(t, env.baseClient, env.jobSetKey)); diff != "" {
+			t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+		}
+	})
 }
 
 func TestReconcile_InformerCacheLag_DoesNotCancelNewlyTranslatedJob(t *testing.T) {
@@ -855,21 +904,21 @@ func TestReconcile_Graceful_MissingClient(t *testing.T) {
 
 func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
 	tests := []struct {
-		name              string
-		opts              []reconcileEnvOpt
-		wantRequeueAfter  time.Duration
-		wantJobSetDeleted bool
+		name             string
+		opts             []reconcileEnvOpt
+		wantRequeueAfter time.Duration
+		wantJobSet       jobSetState
 	}{
 		{
-			name:              "retains finalizer while Slurm Controller exists",
-			wantRequeueAfter:  5 * time.Second,
-			wantJobSetDeleted: false,
+			name:             "retains finalizer while Slurm Controller exists",
+			wantRequeueAfter: 5 * time.Second,
+			wantJobSet:       jobSetState{Exists: true, Deleting: true, Finalizers: []string{FinalizerJobSet}},
 		},
 		{
-			name:              "releases finalizer without requeue when Slurm Controller is gone",
-			opts:              []reconcileEnvOpt{withWithoutController()},
-			wantRequeueAfter:  0,
-			wantJobSetDeleted: true,
+			name:             "releases finalizer without requeue when Slurm Controller is gone",
+			opts:             []reconcileEnvOpt{withWithoutController()},
+			wantRequeueAfter: 0,
+			wantJobSet:       jobSetState{},
 		},
 	}
 
@@ -888,12 +937,9 @@ func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
 			if res.RequeueAfter != tc.wantRequeueAfter {
 				t.Errorf("Expected requeue after %v, got %v", tc.wantRequeueAfter, res.RequeueAfter)
 			}
-
-			if tc.wantJobSetDeleted {
-				env.verifyJobSetNotFound()
-				return
+			if diff := cmp.Diff(tc.wantJobSet, getJobSetState(t, env.baseClient, env.jobSetKey), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
 			}
-			env.verifyJobSetHasFinalizer()
 		})
 	}
 }

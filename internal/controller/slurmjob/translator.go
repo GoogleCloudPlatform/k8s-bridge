@@ -92,7 +92,9 @@ const (
 	AppName           = "k8s-bridge"
 	ComponentJobSet   = "jobset"
 	ComponentWorker   = "worker"
+)
 
+const (
 	// FinalizerJobSet is added to every JobSet created by k8s-bridge. It keeps the JobSet, and its
 	// slurmd replica count, until k8s-bridge has deregistered the JobSet's dynamic Slurm nodes.
 	FinalizerJobSet = "k8s-bridge.x-k8s.io/slurm-node-cleanup"

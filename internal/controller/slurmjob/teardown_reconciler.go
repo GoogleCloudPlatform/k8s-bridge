@@ -206,7 +206,7 @@ func (r *JobTeardownReconciler) slurmClientForCleanup(ctx context.Context, wm *k
 		return nil, err
 	}
 	if !gone {
-		return nil, fmt.Errorf("slurm client not found in ClientMap for controller %s", controllerKey)
+		return nil, fmt.Errorf("no Slurm client in ClientMap for controller %s", controllerKey)
 	}
 	log.FromContext(ctx).Info("Slurm Controller not found, skipping dynamic node cleanup", "controller", controllerKey)
 	return nil, nil
