@@ -94,10 +94,23 @@ const (
 	ComponentWorker   = "worker"
 )
 
+const (
+	// FinalizerJobSet is added to every JobSet created by k8s-bridge. It keeps the JobSet, and its
+	// slurmd replica count, until k8s-bridge has deregistered the JobSet's dynamic Slurm nodes.
+	FinalizerJobSet = "k8s-bridge.x-k8s.io/slurm-node-cleanup"
+
+	jobSetNamePrefix = "slurm-job-"
+)
+
 var (
 	invalidLabelCharsRegex = regexp.MustCompile(`[^a-z0-9_.-]+`)
 	repeatedDashRegex      = regexp.MustCompile(`-{2,}`)
 )
+
+// jobSetNameForJobID returns the name of the JobSet created for the given Slurm job ID.
+func jobSetNameForJobID(jobID string) string {
+	return jobSetNamePrefix + jobID
+}
 
 // JobTranslator defines the interface for translating Slurm jobs into Kubernetes resources.
 type JobTranslator interface {
@@ -509,7 +522,7 @@ func buildJobSet(
 	labels map[string]string,
 	podTemplate corev1.PodTemplateSpec,
 ) *jobsetv1alpha2.JobSet {
-	jobSetName := fmt.Sprintf("slurm-job-%s", jobIDStr)
+	jobSetName := jobSetNameForJobID(jobIDStr)
 	var podFailurePolicy *batchv1.PodFailurePolicy
 	if findContainer(&podTemplate.Spec, ContainerSlurmd) != nil &&
 		(podTemplate.Spec.RestartPolicy == "" || podTemplate.Spec.RestartPolicy == corev1.RestartPolicyNever) {
@@ -529,8 +542,9 @@ func buildJobSet(
 
 	return &jobsetv1alpha2.JobSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   jobSetName,
-			Labels: labels,
+			Name:       jobSetName,
+			Labels:     labels,
+			Finalizers: []string{FinalizerJobSet},
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
 			Suspend: ptr.To(true),

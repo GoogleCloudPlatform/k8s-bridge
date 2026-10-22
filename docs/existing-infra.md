@@ -149,6 +149,10 @@ To remove workload mixing without disrupting Slurm or Kueue:
    ```bash
    kubectl delete -f workloadmixing.yaml
    ```
+   Wait until `k8s-bridge` has removed its finalizer from all JobSets, i.e. the following command returns no resources:
+   ```bash
+   kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
+   ```
 2. Uninstall `k8s-bridge`:
    ```bash
    helm uninstall k8s-bridge -n k8s-bridge-system

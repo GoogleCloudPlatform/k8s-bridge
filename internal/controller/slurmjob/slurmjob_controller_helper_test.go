@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
@@ -133,6 +134,7 @@ func newTestJobSet(name string) *testJobSetBuilder {
 
 func newReconTestJobSet() *testJobSetBuilder {
 	return newTestJobSet("slurm-job-" + reconJobIDStr).
+		withFinalizers(FinalizerJobSet).
 		withLabels(map[string]string{
 			LabelKueueQueue:     "some-queue",
 			LabelSlurmJobID:     reconJobIDStr,
@@ -162,6 +164,7 @@ func newReconTestJob() *testJobBuilder {
 	return newEmptyTestJob().withDefaultReconFields()
 }
 
+//nolint:unparam
 func (b *testJobSetBuilder) withNamespace(namespace string) *testJobSetBuilder {
 	b.jobSet.Namespace = namespace
 	return b
@@ -185,6 +188,13 @@ func (b *testJobSetBuilder) withSuspend(suspend bool) *testJobSetBuilder {
 	return b
 }
 
+func (b *testJobSetBuilder) withFinalizers(finalizers ...string) *testJobSetBuilder {
+	b.jobSet.Finalizers = slices.Clone(finalizers)
+	return b
+}
+
+// withDeletionTimestamp marks the JobSet as deleting. The fake client rejects deleting objects without
+// finalizers, so testFinalizer is added if none are set; use withFinalizers to control them explicitly.
 func (b *testJobSetBuilder) withDeletionTimestamp() *testJobSetBuilder {
 	now := metav1.Now()
 	b.jobSet.DeletionTimestamp = &now
@@ -388,6 +398,9 @@ func (e *reconcileTestEnv) verifyJobSetCreated(wantQueue string, wantJobID strin
 		e.t.Fatalf("Expected JobSet to be created, but got error: %v", err)
 		return nil
 	}
+	if !slices.Contains(js.Finalizers, FinalizerJobSet) {
+		e.t.Errorf("Expected JobSet to contain finalizer %q, got %v", FinalizerJobSet, js.Finalizers)
+	}
 	if wantQueue != "" && js.Labels[LabelKueueQueue] != wantQueue {
 		e.t.Errorf("Expected JobSet queue label %q, got %q", wantQueue, js.Labels[LabelKueueQueue])
 	}
@@ -423,6 +436,33 @@ func (e *reconcileTestEnv) getJobSet() *jobsetv1alpha2.JobSet {
 		e.t.Fatalf("Failed to get JobSet %s: %v", e.jobSetKey, err)
 	}
 	return js
+}
+
+// jobSetState summarizes the parts of a JobSet that finalizer tests assert on.
+// The zero value means the JobSet does not exist.
+type jobSetState struct {
+	Exists     bool
+	Deleting   bool
+	Finalizers []string
+}
+
+func getJobSetState(t *testing.T, c client.Client, key types.NamespacedName) jobSetState {
+	t.Helper()
+	js := &jobsetv1alpha2.JobSet{}
+	if err := c.Get(t.Context(), key, js); err != nil {
+		if apierrors.IsNotFound(err) {
+			return jobSetState{}
+		}
+		t.Fatalf("Failed to get JobSet %s: %v", key, err)
+	}
+	return jobSetState{Exists: true, Deleting: isJobSetDeleting(js), Finalizers: js.Finalizers}
+}
+
+func (e *reconcileTestEnv) verifyJobSetHasFinalizer() {
+	e.t.Helper()
+	if js := e.getJobSet(); !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
+		e.t.Errorf("Expected JobSet to retain finalizer %q, got %v", FinalizerJobSet, js.Finalizers)
+	}
 }
 
 func (e *reconcileTestEnv) verifyJobSetUnchanged(before *jobsetv1alpha2.JobSet) {
