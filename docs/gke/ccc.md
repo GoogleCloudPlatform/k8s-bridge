@@ -226,6 +226,9 @@ kubectl delete -f docs/examples/quickstart/workloadmixing.yaml
 kubectl delete -f docs/examples/ccc/kueue-resources.yaml
 kubectl delete -f docs/examples/ccc/computeclass.yaml
 
+# Wait until this returns no resources before uninstalling k8s-bridge
+kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
+
 helm uninstall k8s-bridge -n k8s-bridge-system
 helm uninstall slurm -n slurm
 ```

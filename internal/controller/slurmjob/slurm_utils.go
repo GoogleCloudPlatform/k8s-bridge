@@ -17,7 +17,9 @@ limitations under the License.
 package slurmjob
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -26,8 +28,15 @@ import (
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
+	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	slinkyv1beta1 "github.com/SlinkyProject/slurm-operator/api/v1beta1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 )
 
@@ -159,4 +168,64 @@ func classifyTerminalSlurmState(jobInfo *slurmclienttypes.V0044JobInfo) (bool, s
 		return true, metrics.ReasonJobFailed
 	}
 	return false, ""
+}
+
+// isJobSetFinalized reports whether the JobSet is being deleted and FinalizerJobSet was already released,
+// i.e. k8s-bridge has no cleanup left to do for it.
+func isJobSetFinalized(js *jobsetv1alpha2.JobSet) bool {
+	return isJobSetDeleting(js) && !controllerutil.ContainsFinalizer(js, FinalizerJobSet)
+}
+
+// finalizeJobSet deregisters the JobSet's dynamic slurmd nodes and then removes FinalizerJobSet.
+// Nodes must be deleted first because the finalizer keeps the JobSet spec that node names are derived from.
+// A nil slurmClient skips node cleanup when the Slurm cluster can no longer be reached.
+func finalizeJobSet(ctx context.Context, c client.Client, slurmClient slurmclient.Client, js *jobsetv1alpha2.JobSet, callTimeout time.Duration) error {
+	if js == nil {
+		return nil
+	}
+	if err := cleanupDynamicNodes(ctx, slurmClient, js, callTimeout); err != nil {
+		return fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s/%s: %w", js.Namespace, js.Name, err)
+	}
+	return removeJobSetFinalizer(ctx, c, js)
+}
+
+// removeJobSetFinalizer removes FinalizerJobSet from the given JobSet if present.
+// The patch uses optimistic locking because a JSON merge patch replaces the whole finalizers list,
+// which could otherwise drop finalizers added concurrently (e.g. foregroundDeletion or orphan).
+// On conflict the JobSet is re-read and the removal retried, so a concurrent finalization of the same
+// JobSet by the other reconciler is not reported as an error.
+func removeJobSetFinalizer(ctx context.Context, c client.Client, js *jobsetv1alpha2.JobSet) error {
+	if js == nil {
+		return nil
+	}
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		if !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
+			return nil
+		}
+		patch := client.MergeFromWithOptions(js.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		controllerutil.RemoveFinalizer(js, FinalizerJobSet)
+		err := c.Patch(ctx, js, patch)
+		if !apierrors.IsConflict(err) {
+			return client.IgnoreNotFound(err)
+		}
+		if getErr := c.Get(ctx, client.ObjectKeyFromObject(js), js); getErr != nil {
+			return client.IgnoreNotFound(getErr)
+		}
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", js.Namespace, js.Name, err)
+	}
+	return nil
+}
+
+// isSlurmControllerGone reports whether the Slurm Controller CR identified by key no longer exists.
+func isSlurmControllerGone(ctx context.Context, c client.Reader, key types.NamespacedName) (bool, error) {
+	if err := c.Get(ctx, key, &slinkyv1beta1.Controller{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to get Slurm Controller %s: %w", key, err)
+	}
+	return false, nil
 }
