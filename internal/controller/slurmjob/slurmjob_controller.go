@@ -1021,7 +1021,7 @@ func (r *SlurmJobReconciler) updateActiveJobsMetric(ctx context.Context, wm *k8s
 	}
 	count, err := CountActiveJobSets(ctx, r.Client, wm, partition)
 	if err != nil {
-		log.FromContext(ctx).V(1).Info("Failed to count active JobSets for metric", "workloadMixing", wm.Name, "partition", partition, "error", err)
+		log.FromContext(ctx).Error(err, "Failed to count active JobSets for metric", "partition", partition)
 		return
 	}
 	metrics.SetActiveJobs(wm.Name, partition, count)

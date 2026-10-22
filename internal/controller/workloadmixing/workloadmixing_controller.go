@@ -111,7 +111,7 @@ func (r *WorkloadMixingReconciler) updateActiveJobsMetrics(ctx context.Context, 
 	for _, pm := range wm.Spec.PartitionsMapping {
 		count, err := slurmjob.CountActiveJobSets(ctx, r.Client, wm, pm.Partition)
 		if err != nil {
-			log.FromContext(ctx).V(1).Info("Failed to count active JobSets for metric", "workloadMixing", wm.Name, "partition", pm.Partition, "error", err)
+			log.FromContext(ctx).Error(err, "Failed to count active JobSets for metric", "partition", pm.Partition)
 			continue
 		}
 		metrics.SetActiveJobs(wm.Name, pm.Partition, count)
