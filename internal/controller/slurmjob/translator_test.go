@@ -336,6 +336,68 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 		)
 	})
 
+	// slurmrestd reports cpus_per_task as set to 1 for every job without -c.
+	// TresPerNode and CpusPerTres use the format of a real job record.
+	t.Run("Success - Resource Calculation - CpusPerTres (GPU) with reported CpusPerTask", func(t *testing.T) {
+		tests := []struct {
+			name        string
+			tasks       int32
+			tresPerNode string
+			cpusPerTres string
+			wantCPU     resource.Quantity
+			wantMem     resource.Quantity
+			wantGPU     resource.Quantity
+		}{
+			{
+				name:        "cpus per GPU above task CPUs",
+				tasks:       1,
+				tresPerNode: "gres/gpu:l4:1",
+				cpusPerTres: "gres/gpu:4",
+				wantCPU:     resource.MustParse("4"),      // max(1 task * 1, 1 GPU * 4)
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+			{
+				name:        "two GPUs per node",
+				tasks:       1,
+				tresPerNode: "gres/gpu:l4:2",
+				cpusPerTres: "gres/gpu:4",
+				wantCPU:     resource.MustParse("8"),       // max(1 task * 1, 2 GPUs * 4)
+				wantMem:     resource.MustParse("16384Mi"), // fallback 8 * 2048 MiB
+				wantGPU:     resource.MustParse("2"),
+			},
+			{
+				name:        "task CPUs above cpus per GPU",
+				tasks:       8,
+				tresPerNode: "gres/gpu:l4:1",
+				cpusPerTres: "gres/gpu:2",
+				wantCPU:     resource.MustParse("8"),       // max(8 tasks * 1, 1 GPU * 2)
+				wantMem:     resource.MustParse("16384Mi"), // fallback 8 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				job := newTestJob().
+					withTasks(tt.tasks).
+					withCpusPerTask(1).
+					withTresPerNode(tt.tresPerNode).
+					withCpusPerTres(tt.cpusPerTres).
+					build()
+
+				obj, err := translator.Translate(job, wmSpec, controller)
+
+				verifyJobSet(t, obj, err, "123", 1,
+					withRequests(corev1.ResourceList{
+						corev1.ResourceCPU:                       tt.wantCPU,
+						corev1.ResourceMemory:                    tt.wantMem,
+						corev1.ResourceName(testGpuResourceName): tt.wantGPU,
+					}),
+				)
+			})
+		}
+	})
+
 	t.Run("Success - Resource Calculation - Fallback CPU and MemoryPerCpu", func(t *testing.T) {
 		job := newTestJob().
 			withNodes(2).
