@@ -74,6 +74,8 @@ var (
 	// requeueRegex matches Slurm's "Requeue=0|1" field: 0 when the job was submitted
 	// with --no-requeue (or JobRequeue=0 is configured), 1 otherwise.
 	requeueRegex = regexp.MustCompile(`\bRequeue=(\S+)`)
+	// numCPUsRegex matches the CPU count of the job, e.g. NumCPUs=2.
+	numCPUsRegex = regexp.MustCompile(`\bNumCPUs=(\S+)`)
 	// userIDRegex splits Slurm's "name(uid)" rendering, e.g. UserId=foo(2000),
 	// into the account name and its numeric UID.
 	userIDRegex         = regexp.MustCompile(`\bUserId=([^(\s]+)\((\d+)\)`)
@@ -646,6 +648,9 @@ type SlurmJobState struct {
 	// Requeue is Slurm's "Requeue=0|1" flag: "0" when the job may not be requeued
 	// (sbatch --no-requeue or JobRequeue=0), "1" otherwise.
 	Requeue string
+	// NumCPUs is Slurm's "NumCPUs" field. For a job that started, it is the
+	// number of CPUs that Slurm allocated to the job.
+	NumCPUs string
 	// UserName and UserID are the job's owner, parsed from Slurm's
 	// "UserId=name(uid)" rendering.
 	UserName string
@@ -706,6 +711,7 @@ func QuerySlurmJobState(slurmNamespace, jobID string) (SlurmJobState, error) {
 		NodeList:   extractRegexField(nodeListRegex, output),
 		AllocNodes: extractRegexField(allocNodesRegex, output),
 		Requeue:    extractRegexField(requeueRegex, output),
+		NumCPUs:    extractRegexField(numCPUsRegex, output),
 		UserName:   userName,
 		UserID:     userID,
 	}, nil
@@ -721,6 +727,7 @@ type SlurmJobVerifier struct {
 	expectedComment  string
 	expectedUserName string
 	expectedNodeList string
+	expectedNumCPUs  string
 	timeout          time.Duration
 	invariants       []func(g gomega.Gomega)
 }
@@ -759,6 +766,12 @@ func (v *SlurmJobVerifier) WithUser(username string) *SlurmJobVerifier {
 
 func (v *SlurmJobVerifier) WithNodeList(nodeList string) *SlurmJobVerifier {
 	v.expectedNodeList = nodeList
+	return v
+}
+
+// WithNumCPUs expects Slurm to report numCPUs in the NumCPUs field of the job.
+func (v *SlurmJobVerifier) WithNumCPUs(numCPUs string) *SlurmJobVerifier {
+	v.expectedNumCPUs = numCPUs
 	return v
 }
 
@@ -802,6 +815,9 @@ func (v *SlurmJobVerifier) Verify() {
 		}
 		if v.expectedNodeList != "" {
 			g.Expect(js.NodeList).To(gomega.Equal(v.expectedNodeList), "Slurm job NodeList mismatch")
+		}
+		if v.expectedNumCPUs != "" {
+			g.Expect(js.NumCPUs).To(gomega.Equal(v.expectedNumCPUs), "Slurm job NumCPUs mismatch")
 		}
 	}, timeout, time.Second).Should(gomega.Succeed())
 }

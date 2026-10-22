@@ -94,6 +94,47 @@ var _ = Describe("GPU Manager", Ordered, func() {
 			Entry("--gpus-per-task=nvidia_l4:1", "--ntasks=1", "--gpus-per-task=nvidia_l4:1"),
 		)
 
+		// slurmrestd reports cpus_per_task=1 for a job without -c, so the slurmd pod
+		// must take its CPU request from --cpus-per-gpu. Each entry asks for 1 GPU.
+		// The CPU count is even because Slurm allocates whole cores and rounds an odd
+		// count up on nodes with 2 threads per core.
+		DescribeTable("should request the CPUs that Slurm allocates for --cpus-per-gpu",
+			func(args ...string) {
+				const (
+					configPath = "test/e2e/testdata/workloadmixing_gpu.yaml"
+					cpusPerGPU = "2"
+				)
+
+				By("applying the WorkloadMixing GPU CR")
+				utils.ApplyManifestWithCleanup(configPath)
+
+				By("submitting a batch job with --cpus-per-gpu and without --cpus-per-task")
+				jobID := utils.NewBatchJobBuilder(slurmNamespace).
+					WithPartition(defaultSlurmPartition).
+					WithMem(4096).
+					WithArgs(args...).
+					WithArgs("--cpus-per-gpu=" + cpusPerGPU).
+					WithWrap("sleep 1").
+					Submit()
+				jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+
+				utils.VerifyJobSetCreatedWithGPU(jobSetName, slurmNamespace, jobID, "1")
+				utils.VerifySlurmdCPURequest(jobSetName, slurmNamespace, cpusPerGPU)
+
+				By("verifying that Slurm allocated the same number of CPUs to the job")
+				utils.NewSlurmJobVerifier(slurmNamespace, jobID).
+					WithState("COMPLETED").
+					WithNumCPUs(cpusPerGPU).
+					Verify()
+
+				By("verifying the JobSet is deleted")
+				utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
+			},
+			Entry("--gpus-per-node=nvidia_l4:1", "--gpus-per-node=nvidia_l4:1"),
+			Entry("--gpus-per-task=nvidia_l4:1", "--ntasks=1", "--gpus-per-task=nvidia_l4:1"),
+			Entry("--gpus=nvidia_l4:1", "--gpus=nvidia_l4:1"),
+		)
+
 		It("should cancel Slurm job if translation fails due to unmapped GRES", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
 
