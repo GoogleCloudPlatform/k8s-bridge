@@ -16,6 +16,7 @@ package slurmjob
 
 import (
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -508,6 +509,9 @@ func verifyJobSet(t *testing.T, obj client.Object, err error, wantJobID string, 
 
 func verifyJobSetBasics(t *testing.T, js *jobsetv1alpha2.JobSet, wantJobID string, wantReplicas int32) (*corev1.PodSpec, *corev1.Container) {
 	t.Helper()
+	if !slices.Equal(js.Finalizers, []string{FinalizerJobSet}) {
+		t.Errorf("Translate() returned JobSet.Finalizers = %v, want [%s]", js.Finalizers, FinalizerJobSet)
+	}
 	if js.Spec.Suspend == nil || !*js.Spec.Suspend {
 		t.Error("Translate() returned JobSet.Suspend = false, want true")
 	}

@@ -53,6 +53,8 @@ import (
 	slurmclientinterceptor "github.com/SlinkyProject/slurm-client/pkg/client/interceptor"
 	"github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	uberzap "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -457,11 +459,204 @@ func TestReconcile_DeletingJobSet_CancelsSlurmJob(t *testing.T) {
 				env.verifySlurmCancellation(tc.wantCancelReason)
 			}
 
+			env.verifyJobSetNotFound()
+
 			if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+tc.wantFailedDelta {
 				t.Errorf("Expected JobsSync(jobset_failed) delta %f, got %f", tc.wantFailedDelta, got-initFailed)
 			}
 		})
 	}
+}
+
+func TestReconcile_DeletingJobSet_FinalizerAndDynamicNodes(t *testing.T) {
+	const (
+		dynamicNode0 = "slurm-job-12345-slurmd-0-0"
+		dynamicNode1 = "slurm-job-12345-slurmd-1-0"
+	)
+
+	t.Run("JobSet deleted during slurmrestd outage cleans up dynamic nodes and removes finalizer once job is COMPLETED", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		completedJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateCOMPLETED).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withPendingSlurmJobs(completedJob),
+		)
+
+		// 1. Simulate slurmrestd outage when the JobSet deletion watch event first arrives
+		env.mockSlurm.GetError = errors.New("connection refused")
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error during slurmrestd outage, got nil")
+		}
+
+		// Finalizer must keep the JobSet in Kubernetes so cleanup is not lost
+		env.verifyJobSetHasFinalizer()
+		env.verifyNoSlurmUpdates()
+
+		// 2. slurmrestd recovers and reports the Slurm job is now COMPLETED
+		env.mockSlurm.GetError = nil
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected second reconcile to succeed after slurmrestd recovery, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+	})
+
+	t.Run("Transient dynamic node deletion error on deleting JobSet retains finalizer for retry", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		runningJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withPendingSlurmJobs(runningJob),
+		)
+		env.mockSlurm.DeleteNodeError = errors.New("Nodes busy")
+
+		initFailed := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed)
+
+		// 1. First reconcile cancels the RUNNING Slurm job, fails node deletion, and retains the finalizer
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error when dynamic node deletion fails with Nodes busy, got nil")
+		}
+		env.verifySlurmCancellation(ReasonJobSetMissing)
+		env.verifyJobSetHasFinalizer()
+
+		// 2. On retry, the Slurm job is now CANCELLED and nodes are no longer busy
+		cancelledJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateCANCELLED).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+		env.mockSlurm.SetPendingJobs(reconPartitionName, []slurmclienttypes.V0044JobInfo{*cancelledJob})
+		env.mockSlurm.DeleteNodeError = nil
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected retry reconcile to succeed, got: %v", err)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1, dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+
+		if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+1 {
+			t.Errorf("Expected JobsSync(jobset_failed) delta 1 across retries, got %f", got-initFailed)
+		}
+	})
+
+	t.Run("Deleting JobSet when Slurm job is purged (NotFound) cleans up dynamic nodes and removes finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(deletingJS))
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected no error when Slurm job is NotFound for deleting JobSet, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+	})
+
+	t.Run("Deleting JobSet when parent WorkloadMixing is NotFound removes finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(deletingJS))
+		if err := env.baseClient.Delete(t.Context(), env.wm); err != nil {
+			t.Fatalf("Failed to delete WorkloadMixing: %v", err)
+		}
+
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected no error when WorkloadMixing is NotFound for deleting JobSet, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifyJobSetNotFound()
+		env.verifyNoSlurmUpdates()
+	})
+
+	t.Run("Live JobSet keeps finalizer when Slurm job is purged (NotFound)", func(t *testing.T) {
+		liveJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(liveJS))
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected no error when Slurm job is NotFound for live JobSet, got: %v", err)
+		}
+
+		want := jobSetState{Exists: true, Deleting: false, Finalizers: []string{FinalizerJobSet}}
+		if diff := cmp.Diff(want, getJobSetState(t, env.baseClient, env.jobSetKey)); diff != "" {
+			t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+		}
+		env.verifySlurmNodesDeleted()
+	})
+
+	t.Run("Finalizer patch failure returns error and keeps the finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withInterceptors(interceptor.Funcs{
+				Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+					return errors.New("apiserver unavailable")
+				},
+			}),
+		)
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error when the finalizer patch fails, got nil")
+		}
+
+		want := jobSetState{Exists: true, Deleting: true, Finalizers: []string{FinalizerJobSet}}
+		if diff := cmp.Diff(want, getJobSetState(t, env.baseClient, env.jobSetKey)); diff != "" {
+			t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+		}
+	})
 }
 
 func TestReconcile_InformerCacheLag_DoesNotCancelNewlyTranslatedJob(t *testing.T) {
@@ -704,6 +899,48 @@ func TestReconcile_Graceful_MissingClient(t *testing.T) {
 	logOutput := buf.String()
 	if !strings.Contains(logOutput, "Slurm client not found in ClientMap") {
 		t.Errorf("Expected log message about missing client not found: %s", logOutput)
+	}
+}
+
+func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
+	tests := []struct {
+		name             string
+		opts             []reconcileEnvOpt
+		wantRequeueAfter time.Duration
+		wantJobSet       jobSetState
+	}{
+		{
+			name:             "retains finalizer while Slurm Controller exists",
+			wantRequeueAfter: 5 * time.Second,
+			wantJobSet:       jobSetState{Exists: true, Deleting: true, Finalizers: []string{FinalizerJobSet}},
+		},
+		{
+			name:             "releases finalizer without requeue when Slurm Controller is gone",
+			opts:             []reconcileEnvOpt{withWithoutController()},
+			wantRequeueAfter: 0,
+			wantJobSet:       jobSetState{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append([]reconcileEnvOpt{
+				withWithoutSlurmClient(),
+				withExtraObjects(newReconTestJobSet().withDeletionTimestamp().build()),
+			}, tc.opts...)
+			env := newReconcileTestEnv(t, opts...)
+
+			res, err := env.reconcile()
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res.RequeueAfter != tc.wantRequeueAfter {
+				t.Errorf("Expected requeue after %v, got %v", tc.wantRequeueAfter, res.RequeueAfter)
+			}
+			if diff := cmp.Diff(tc.wantJobSet, getJobSetState(t, env.baseClient, env.jobSetKey), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -2260,7 +2497,6 @@ func TestReconcile_SlurmCallTimeout_BlockedCallsAbort(t *testing.T) {
 
 func TestJobSetWatchPredicate(t *testing.T) {
 	pred := jobSetWatchPredicate()
-	now := metav1.Now()
 
 	t.Run("Create", func(t *testing.T) {
 		tests := []struct {
@@ -2388,19 +2624,31 @@ func TestJobSetWatchPredicate(t *testing.T) {
 				want: true,
 			},
 			{
-				name: "Transition in deletionTimestamp on already-terminal JobSet is ignored",
+				name: "Transition in deletionTimestamp on terminal JobSet carrying FinalizerJobSet is allowed",
 				oldObj: newReconTestJobSet().
 					withSuspend(false).
 					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
 					build(),
-				newObj: func() *jobsetv1alpha2.JobSet {
-					js := newReconTestJobSet().
-						withSuspend(false).
-						withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
-						build()
-					js.DeletionTimestamp = ptr.To(now)
-					return js
-				}(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					withDeletionTimestamp().
+					build(),
+				want: true,
+			},
+			{
+				name: "Transition in deletionTimestamp on terminal JobSet without FinalizerJobSet is ignored",
+				oldObj: newReconTestJobSet().
+					withFinalizers(testFinalizer).
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				newObj: newReconTestJobSet().
+					withFinalizers(testFinalizer).
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					withDeletionTimestamp().
+					build(),
 				want: false,
 			},
 			{
