@@ -692,22 +692,8 @@ func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int
 	return (tasks + int64(replicas) - 1) / int64(replicas)
 }
 
-// resolveCPUsPerPod returns the CPU request of one slurmd pod: the larger of
-// cpus_per_task * tasksPerNode and --cpus-per-gpu * GPUs per node.
-//
-// slurmctld stores cpus_per_task=1 for a job without -c, so slurmrestd reports
-// cpus_per_task as set for every pending job. Thus cpus_per_task cannot tell
-// whether the job uses --cpus-per-gpu. sbatch does not accept --cpus-per-gpu
-// together with -c, and Slurm raises the minimum CPUs of the job to
-// --cpus-per-gpu * GPUs.
-//
-// References (Slurm 26.05.5):
-//   - cpus_per_task default: _copy_job_desc_to_job_record() in src/slurmctld/job_mgr.c
-//     https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/slurmctld/job_mgr.c#L8994-L8996
-//   - minimum CPUs from --cpus-per-gpu: _foreach_job_state_validate() and
-//     gres_job_state_validate() in src/interfaces/gres.c
-//     https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/interfaces/gres.c#L6917-L6920
-//     https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/interfaces/gres.c#L7228-L7229
+// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs per node * --cpus-per-gpu),
+// because slurmrestd reports cpus_per_task=1 even for jobs that use --cpus-per-gpu.
 func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, gpu *resolvedGRES) int64 {
 	cpusPerTask := int64(1)
 	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
