@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
@@ -44,7 +43,6 @@ const (
 	// defaultOrphanGracePeriod defines the default duration an absent Slurm workload's
 	// corresponding JobSet must remain missing before being flagged as orphaned and torn down.
 	defaultOrphanGracePeriod = 1 * time.Minute
-	jobSetNameFormat         = "slurm-job-%d"
 )
 
 // SlurmPoller periodically queries the Slurm REST API for pending jobs
@@ -295,8 +293,7 @@ func (p *SlurmPoller) auditOrphanedJobSets(
 			continue
 		}
 
-		// If JobSet is already being deleted and no longer carries our finalizer, clean up missing tracking and skip
-		if !js.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
+		if isJobSetFinalized(js) {
 			p.mu.Lock()
 			delete(p.firstSeenMissing, key)
 			p.mu.Unlock()
@@ -392,8 +389,7 @@ func getTeardownEvent(
 	wm *k8sbridgev1alpha1.WorkloadMixing,
 	jobsByID map[string]*slurmclienttypes.V0044JobInfo,
 ) *slurmtypes.SlurmJobTeardownEvent {
-	// Guard against duplicate processing if already being deleted and our finalizer has been removed
-	if !js.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
+	if isJobSetFinalized(js) {
 		return nil
 	}
 
@@ -482,7 +478,7 @@ func (p *SlurmPoller) processPendingJobsForWM(
 
 			if matched {
 				jobID := ptr.Deref(job.JobId, 0)
-				jobSetName := fmt.Sprintf(jobSetNameFormat, jobID)
+				jobSetName := jobSetNameForJobID(strconv.Itoa(int(jobID)))
 				existingJS := jobSetsByName[jobSetName]
 				if !shouldEmitAdmissionEvent(job, existingJS) {
 					logger.V(1).Info("Skipping redundant SlurmJobAdmissionEvent", "jobID", jobID, "workloadMixing", client.ObjectKeyFromObject(wm))

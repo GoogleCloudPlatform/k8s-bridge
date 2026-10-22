@@ -78,6 +78,7 @@ func (r *JobTeardownReconciler) NeedLeaderElection() bool {
 // Start runs the teardown event consumption loop. It implements manager.Runnable.
 func (r *JobTeardownReconciler) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("slurmjob-teardown-reconciler")
+	ctx = log.IntoContext(ctx, logger)
 	logger.Info("Starting JobTeardownReconciler")
 
 	for {
@@ -105,9 +106,9 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 	ctx, cancel := context.WithTimeout(ctx, r.getReconciliationTimeout())
 	defer cancel()
 
-	logger := log.FromContext(ctx).WithName("slurmjob-teardown-reconciler")
+	logger := log.FromContext(ctx)
 
-	jobSetName := fmt.Sprintf("slurm-job-%s", ev.JobID)
+	jobSetName := jobSetNameForJobID(ev.JobID)
 	js := &jobsetv1alpha2.JobSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: jobSetName, Namespace: ev.WorkloadMixing.Namespace}, js)
 	if err != nil {
@@ -128,16 +129,13 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 		wm = nil
 	}
 
-	// Delete dynamic slurmd nodes in Slurm
-	if wm != nil && r.ClientMap != nil && wm.Spec.ControllerRef.Name != "" {
-		if err := r.cleanupDynamicNodesForWM(ctx, wm, js); err != nil {
-			return err
-		}
+	slurmClient, err := r.slurmClientForCleanup(ctx, wm)
+	if err != nil {
+		return err
 	}
-
-	isDeleting := !js.DeletionTimestamp.IsZero()
-	if err := removeJobSetFinalizer(ctx, r.Client, js); err != nil {
-		return fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", js.Namespace, js.Name, err)
+	isDeleting := isJobSetDeleting(js)
+	if err := finalizeJobSet(ctx, r.Client, slurmClient, js, r.getSlurmCallTimeout()); err != nil {
+		return err
 	}
 
 	// Skip duplicate deletion if JobSet is already terminating
@@ -192,30 +190,26 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 	return nil
 }
 
-// cleanupDynamicNodesForWM deletes the JobSet's dynamic slurmd nodes using the Slurm client of the
-// WorkloadMixing's Slurm Controller. Node cleanup is skipped if the Slurm Controller no longer exists,
-// and an error is returned if the Slurm client is not ready yet so the finalizer is retained.
-func (r *JobTeardownReconciler) cleanupDynamicNodesForWM(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing, js *jobsetv1alpha2.JobSet) error {
-	controllerKey := types.NamespacedName{
-		Namespace: wm.Namespace,
-		Name:      wm.Spec.ControllerRef.Name,
+// slurmClientForCleanup returns the Slurm client used to delete the JobSet's dynamic nodes. It returns nil
+// if node cleanup is impossible (no WorkloadMixing or Slurm Controller), and an error if the Slurm client
+// is not ready yet so the finalizer is retained.
+func (r *JobTeardownReconciler) slurmClientForCleanup(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) (slurmclient.Client, error) {
+	if wm == nil || r.ClientMap == nil || wm.Spec.ControllerRef.Name == "" {
+		return nil, nil
 	}
-	slurmClient := r.ClientMap.Get(controllerKey)
-	if slurmClient != nil {
-		if err := r.cleanupDynamicNodes(ctx, slurmClient, js); err != nil {
-			return fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", js.Name, err)
-		}
-		return nil
+	controllerKey := types.NamespacedName{Namespace: wm.Namespace, Name: wm.Spec.ControllerRef.Name}
+	if slurmClient := r.ClientMap.Get(controllerKey); slurmClient != nil {
+		return slurmClient, nil
 	}
 	gone, err := isSlurmControllerGone(ctx, r.Client, controllerKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !gone {
-		return fmt.Errorf("slurm client not found in ClientMap for controller %s", controllerKey)
+		return nil, fmt.Errorf("slurm client not found in ClientMap for controller %s", controllerKey)
 	}
-	log.FromContext(ctx).WithName("slurmjob-teardown-reconciler").Info("Slurm Controller not found, skipping dynamic node cleanup", "controller", controllerKey, "jobSet", js.Name)
-	return nil
+	log.FromContext(ctx).Info("Slurm Controller not found, skipping dynamic node cleanup", "controller", controllerKey)
+	return nil, nil
 }
 
 // deriveNodeNames derives dynamic slurmd node names directly from the Kubernetes JobSet

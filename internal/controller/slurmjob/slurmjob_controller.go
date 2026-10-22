@@ -198,13 +198,18 @@ func shouldReconcileJobSetCreate(e event.TypedCreateEvent[*jobsetv1alpha2.JobSet
 
 func shouldReconcileJobSetUpdate(e event.TypedUpdateEvent[*jobsetv1alpha2.JobSet]) bool {
 	oldJS, newJS := e.ObjectOld, e.ObjectNew
-	if oldJS == nil || newJS == nil || isJobSetTerminal(oldJS) {
+	if oldJS == nil || newJS == nil {
+		return false
+	}
+	if !isJobSetDeleting(oldJS) && isJobSetDeleting(newJS) {
+		// A deleting JobSet still carrying FinalizerJobSet needs a reconcile even if it is already terminal,
+		// otherwise its deletion stays blocked.
+		return !isJobSetTerminal(oldJS) || controllerutil.ContainsFinalizer(newJS, FinalizerJobSet)
+	}
+	if isJobSetTerminal(oldJS) {
 		return false
 	}
 	if isJobSetTerminal(newJS) {
-		return true
-	}
-	if !isJobSetDeleting(oldJS) && isJobSetDeleting(newJS) {
 		return true
 	}
 	return isJobSetSuspended(oldJS) != isJobSetSuspended(newJS)
@@ -267,6 +272,10 @@ type slurmJobState struct {
 	SlurmClient slurmclient.Client
 	JobInfo     *slurmclienttypes.V0044JobInfo
 	Result      ctrl.Result
+	// FinalizeDeletingJobSet is set when there is nothing left to reconcile against (the Slurm job,
+	// WorkloadMixing or Slurm Controller is gone), so a deleting JobSet must be finalized now.
+	// SlurmClient is nil if the dynamic nodes can no longer be cleaned up.
+	FinalizeDeletingJobSet bool
 }
 
 // +kubebuilder:rbac:groups=k8s-bridge.x-k8s.io,resources=workloadmixings,verbs=get;list;watch
@@ -288,8 +297,16 @@ func (r *SlurmJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	state, done, err := r.fetchState(ctx, req.Namespace, wmName, jobID)
-	if done || err != nil {
+	if err != nil {
 		return state.Result, err
+	}
+	if done {
+		if state.FinalizeDeletingJobSet {
+			if err := r.releaseFinalizerForDeletingJobSet(ctx, req.Namespace, jobID, state.SlurmClient); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return state.Result, nil
 	}
 
 	partition := ptr.Deref(state.JobInfo.Partition, "")
@@ -334,10 +351,7 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 			// TODO: Without the WorkloadMixing the Slurm client cannot be resolved, so the finalizer is released
 			// without dynamic node cleanup (only the slurmd PreStop hook deregisters nodes). Record the Slurm
 			// Controller reference on the JobSet so cleanup does not depend on the WorkloadMixing.
-			if finErr := r.releaseFinalizerForDeletingJobSet(ctx, namespace, jobID, nil); finErr != nil {
-				return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, finErr
-			}
-			return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, nil
+			return slurmJobState{FinalizeDeletingJobSet: true}, ReconciliationDone, nil
 		}
 		logger.Error(err, "Failed to fetch WorkloadMixing", "workloadMixing", wmKey)
 		return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, err
@@ -358,12 +372,10 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 			return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, err
 		}
 		if gone {
-			// The Slurm cluster is gone together with its dynamic nodes, so release the finalizer
-			// of a deleting JobSet instead of blocking its deletion forever.
-			logger.Info("Slurm Controller not found, releasing JobSet finalizer without node cleanup", "controller", controllerKey, "jobID", jobID)
-			if finErr := r.releaseFinalizerForDeletingJobSet(ctx, namespace, jobID, nil); finErr != nil {
-				return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, finErr
-			}
+			// The Slurm cluster is gone together with its dynamic nodes, so a deleting JobSet is finalized
+			// without node cleanup instead of blocking its deletion forever.
+			logger.Info("Slurm Controller not found, skipping reconciliation", "controller", controllerKey, "jobID", jobID)
+			return slurmJobState{FinalizeDeletingJobSet: true}, ReconciliationDone, nil
 		}
 		logger.Error(nil, "Slurm client not found in ClientMap", "controller", controllerKey)
 		return slurmJobState{Result: ctrl.Result{RequeueAfter: 5 * time.Second}}, ReconciliationDone, nil
@@ -374,15 +386,12 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 	defer cancel()
 	if err := slurmClient.Get(callCtx, object.ObjectKey(jobID), &jobInfo); err != nil {
 		if isSlurmNotFound(err) {
-			if finErr := r.releaseFinalizerForDeletingJobSet(ctx, namespace, jobID, slurmClient); finErr != nil {
-				return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, finErr
-			}
 			// A job may no longer exist in Slurmctld if it reached a terminal state and was
 			// purged after MinJobAge, while watch events on the associated JobSet still arrive.
-			// Return nil to avoid entering an infinite exponential backoff retry loop;
-			// JobTeardownReconciler handles cleaning up any orphaned JobSet resources.
+			// Return nil to avoid entering an infinite exponential backoff retry loop. A deleting
+			// JobSet is finalized by the caller; JobTeardownReconciler handles other orphaned JobSets.
 			logger.Info("Slurm job not found in Slurm, skipping reconciliation", "jobID", jobID)
-			return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, nil
+			return slurmJobState{SlurmClient: slurmClient, FinalizeDeletingJobSet: true}, ReconciliationDone, nil
 		}
 		logger.Error(err, "Failed to fetch job info from Slurm", "jobID", jobID)
 		return slurmJobState{Result: ctrl.Result{}}, ReconciliationDone, err
@@ -391,6 +400,8 @@ func (r *SlurmJobReconciler) fetchState(ctx context.Context, namespace, wmName, 
 	return slurmJobState{WM: wm, SlurmClient: slurmClient, JobInfo: &jobInfo, Result: ctrl.Result{}}, ReconciliationContinue, nil
 }
 
+// releaseFinalizerForDeletingJobSet finalizes the JobSet of the given Slurm job if it is being deleted.
+// A nil slurmClient skips dynamic node cleanup.
 func (r *SlurmJobReconciler) releaseFinalizerForDeletingJobSet(
 	ctx context.Context,
 	namespace string,
@@ -398,22 +409,14 @@ func (r *SlurmJobReconciler) releaseFinalizerForDeletingJobSet(
 	slurmClient slurmclient.Client,
 ) error {
 	js := &jobsetv1alpha2.JobSet{}
-	key := types.NamespacedName{Name: fmt.Sprintf("slurm-job-%s", jobID), Namespace: namespace}
+	key := types.NamespacedName{Name: jobSetNameForJobID(jobID), Namespace: namespace}
 	if err := r.Get(ctx, key, js); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	if js.DeletionTimestamp.IsZero() {
+	if !isJobSetDeleting(js) {
 		return nil
 	}
-	if slurmClient != nil {
-		if err := cleanupDynamicNodes(ctx, slurmClient, js, r.getSlurmCallTimeout()); err != nil {
-			return fmt.Errorf("failed to cleanup dynamic nodes for deleting JobSet %s: %w", js.Name, err)
-		}
-	}
-	if err := removeJobSetFinalizer(ctx, r.Client, js); err != nil {
-		return fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", js.Namespace, js.Name, err)
-	}
-	return nil
+	return finalizeJobSet(ctx, r.Client, slurmClient, js, r.getSlurmCallTimeout())
 }
 
 type ReconciliationStatus bool
@@ -432,6 +435,7 @@ const (
 	StatusJobSetCompleted K8sbridgeJobStatus = "JobSetCompleted"
 	StatusJobSetFailed    K8sbridgeJobStatus = "JobSetFailed"
 	StatusJobSetMissing   K8sbridgeJobStatus = "JobSetMissing"
+	StatusJobSetDeleting  K8sbridgeJobStatus = "JobSetDeleting"
 )
 
 func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) K8sbridgeJobStatus {
@@ -439,9 +443,8 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 		return status
 	}
 
-	// Treat a deleting JobSet as missing so its Slurm job is cancelled and dynamic nodes are cleaned up.
-	if existingJS != nil && !existingJS.DeletionTimestamp.IsZero() {
-		return StatusJobSetMissing
+	if isJobSetDeleting(existingJS) {
+		return StatusJobSetDeleting
 	}
 
 	if jobInfo == nil || hasTerminalSlurmState(jobInfo) {
@@ -547,7 +550,7 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 	partition string,
 ) (ReconciliationStatus, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+	jobSetName := jobSetNameForJobID(jobID)
 
 	existingJS, err := r.getExistingJobSet(ctx, wm.Namespace, jobSetName, jobInfo)
 	if err != nil {
@@ -563,25 +566,9 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 		return r.handleTerminalJobSet(ctx, wm, slurmClient, jobInfo, existingJS, jobID, partition, ReasonJobSetFailed)
 
 	case StatusJobSetMissing:
-		if jobInfo != nil && !hasTerminalSlurmState(jobInfo) {
-			logger.Info("JobSet missing for active Slurm job, cancelling job", "jobID", jobID)
-			if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, ReasonJobSetMissing); cancelErr != nil {
-				return ReconciliationDone, ctrl.Result{}, cancelErr
-			}
-			if partition != "" {
-				metrics.RecordJobSync(metrics.StatusError, metrics.ReasonJobSetFailed, wm.Name, partition)
-				r.updateActiveJobsMetric(ctx, wm, partition)
-			}
-		}
-		if existingJS != nil {
-			if err := cleanupDynamicNodes(ctx, slurmClient, existingJS, r.getSlurmCallTimeout()); err != nil {
-				return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", existingJS.Name, err)
-			}
-			if err := removeJobSetFinalizer(ctx, r.Client, existingJS); err != nil {
-				return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", existingJS.Namespace, existingJS.Name, err)
-			}
-		}
-		return ReconciliationDone, ctrl.Result{}, nil
+		return r.handleMissingJobSet(ctx, wm, slurmClient, jobInfo, jobID, partition)
+	case StatusJobSetDeleting:
+		return r.handleDeletingJobSet(ctx, wm, slurmClient, jobInfo, existingJS, jobID, partition)
 
 	case StatusShouldUnhold:
 		if unholdErr := r.releaseHold(ctx, slurmClient, jobInfo, existingJS); unholdErr != nil {
@@ -596,6 +583,47 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 	default:
 		return ReconciliationDone, ctrl.Result{}, nil
 	}
+}
+
+// handleMissingJobSet cancels an active translated Slurm job whose JobSet no longer exists.
+func (r *SlurmJobReconciler) handleMissingJobSet(
+	ctx context.Context,
+	wm *k8sbridgev1alpha1.WorkloadMixing,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	jobID string,
+	partition string,
+) (ReconciliationStatus, ctrl.Result, error) {
+	log.FromContext(ctx).Info("JobSet missing for active Slurm job, cancelling job", "jobID", jobID)
+	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, ReasonJobSetMissing); err != nil {
+		return ReconciliationDone, ctrl.Result{}, err
+	}
+	if partition != "" {
+		metrics.RecordJobSync(metrics.StatusError, metrics.ReasonJobSetFailed, wm.Name, partition)
+		r.updateActiveJobsMetric(ctx, wm, partition)
+	}
+	return ReconciliationDone, ctrl.Result{}, nil
+}
+
+// handleDeletingJobSet cancels the Slurm job of a deleting JobSet if it is still active, then finalizes the JobSet.
+func (r *SlurmJobReconciler) handleDeletingJobSet(
+	ctx context.Context,
+	wm *k8sbridgev1alpha1.WorkloadMixing,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	existingJS *jobsetv1alpha2.JobSet,
+	jobID string,
+	partition string,
+) (ReconciliationStatus, ctrl.Result, error) {
+	if jobInfo != nil && !hasTerminalSlurmState(jobInfo) {
+		if done, res, err := r.handleMissingJobSet(ctx, wm, slurmClient, jobInfo, jobID, partition); err != nil {
+			return done, res, err
+		}
+	}
+	if err := finalizeJobSet(ctx, r.Client, slurmClient, existingJS, r.getSlurmCallTimeout()); err != nil {
+		return ReconciliationDone, ctrl.Result{}, err
+	}
+	return ReconciliationDone, ctrl.Result{}, nil
 }
 
 func (r *SlurmJobReconciler) handleTerminalJobSet(
@@ -613,8 +641,8 @@ func (r *SlurmJobReconciler) handleTerminalJobSet(
 	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, reason); cancelErr != nil {
 		return ReconciliationDone, ctrl.Result{}, cancelErr
 	}
-	if err := cleanupDynamicNodes(ctx, slurmClient, existingJS, r.getSlurmCallTimeout()); err != nil {
-		return ReconciliationDone, ctrl.Result{}, fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", existingJS.Name, err)
+	if err := finalizeJobSet(ctx, r.Client, slurmClient, existingJS, r.getSlurmCallTimeout()); err != nil {
+		return ReconciliationDone, ctrl.Result{}, err
 	}
 	if errDelete := r.deleteJobSet(ctx, existingJS, reason); errDelete != nil {
 		return ReconciliationDone, ctrl.Result{}, errDelete
@@ -633,14 +661,11 @@ func (r *SlurmJobReconciler) handleTerminalJobSet(
 	return ReconciliationDone, ctrl.Result{}, nil
 }
 
+// deleteJobSet deletes the JobSet unless it is already being deleted. Callers must call finalizeJobSet first:
+// FinalizerJobSet must be removed before Delete, because Delete bumps the resourceVersion and the
+// optimistic-lock finalizer patch would then always conflict.
 func (r *SlurmJobReconciler) deleteJobSet(ctx context.Context, js *jobsetv1alpha2.JobSet, reason string) error {
-	if js == nil {
-		return nil
-	}
-	if err := removeJobSetFinalizer(ctx, r.Client, js); err != nil {
-		return fmt.Errorf("failed to remove finalizer from JobSet %s/%s: %w", js.Namespace, js.Name, err)
-	}
-	if !js.DeletionTimestamp.IsZero() {
+	if js == nil || isJobSetDeleting(js) {
 		return nil
 	}
 	logger := log.FromContext(ctx)

@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -498,7 +497,7 @@ func TestReconcile_DeletingJobSet_FinalizerAndDynamicNodes(t *testing.T) {
 		}
 
 		// Finalizer must keep the JobSet in Kubernetes so cleanup is not lost
-		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+		env.verifyJobSetHasFinalizer()
 		env.verifyNoSlurmUpdates()
 
 		// 2. slurmrestd recovers and reports the Slurm job is now COMPLETED
@@ -541,7 +540,7 @@ func TestReconcile_DeletingJobSet_FinalizerAndDynamicNodes(t *testing.T) {
 			t.Fatal("Expected error when dynamic node deletion fails with Nodes busy, got nil")
 		}
 		env.verifySlurmCancellation(ReasonJobSetMissing)
-		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+		env.verifyJobSetHasFinalizer()
 
 		// 2. On retry, the Slurm job is now CANCELLED and nodes are no longer busy
 		cancelledJob := newReconTestJob().
@@ -858,15 +857,18 @@ func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
 	tests := []struct {
 		name              string
 		opts              []reconcileEnvOpt
+		wantRequeueAfter  time.Duration
 		wantJobSetDeleted bool
 	}{
 		{
 			name:              "retains finalizer while Slurm Controller exists",
+			wantRequeueAfter:  5 * time.Second,
 			wantJobSetDeleted: false,
 		},
 		{
-			name:              "releases finalizer when Slurm Controller is gone",
+			name:              "releases finalizer without requeue when Slurm Controller is gone",
 			opts:              []reconcileEnvOpt{withWithoutController()},
+			wantRequeueAfter:  0,
 			wantJobSetDeleted: true,
 		},
 	}
@@ -883,18 +885,15 @@ func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Reconcile failed: %v", err)
 			}
-			if res.RequeueAfter != 5*time.Second {
-				t.Errorf("Expected requeue after 5s, got %v", res.RequeueAfter)
+			if res.RequeueAfter != tc.wantRequeueAfter {
+				t.Errorf("Expected requeue after %v, got %v", tc.wantRequeueAfter, res.RequeueAfter)
 			}
 
 			if tc.wantJobSetDeleted {
 				env.verifyJobSetNotFound()
 				return
 			}
-			js := env.getJobSet()
-			if !slices.Contains(js.Finalizers, FinalizerJobSet) {
-				t.Errorf("Expected JobSet to retain finalizer %q, got %v", FinalizerJobSet, js.Finalizers)
-			}
+			env.verifyJobSetHasFinalizer()
 		})
 	}
 }
@@ -2452,7 +2451,6 @@ func TestReconcile_SlurmCallTimeout_BlockedCallsAbort(t *testing.T) {
 
 func TestJobSetWatchPredicate(t *testing.T) {
 	pred := jobSetWatchPredicate()
-	now := metav1.Now()
 
 	t.Run("Create", func(t *testing.T) {
 		tests := []struct {
@@ -2580,19 +2578,31 @@ func TestJobSetWatchPredicate(t *testing.T) {
 				want: true,
 			},
 			{
-				name: "Transition in deletionTimestamp on already-terminal JobSet is ignored",
+				name: "Transition in deletionTimestamp on terminal JobSet carrying FinalizerJobSet is allowed",
 				oldObj: newReconTestJobSet().
 					withSuspend(false).
 					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
 					build(),
-				newObj: func() *jobsetv1alpha2.JobSet {
-					js := newReconTestJobSet().
-						withSuspend(false).
-						withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
-						build()
-					js.DeletionTimestamp = ptr.To(now)
-					return js
-				}(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					withDeletionTimestamp().
+					build(),
+				want: true,
+			},
+			{
+				name: "Transition in deletionTimestamp on terminal JobSet without FinalizerJobSet is ignored",
+				oldObj: newReconTestJobSet().
+					withFinalizers(testFinalizer).
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				newObj: newReconTestJobSet().
+					withFinalizers(testFinalizer).
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					withDeletionTimestamp().
+					build(),
 				want: false,
 			},
 			{

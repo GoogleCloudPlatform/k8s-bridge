@@ -964,171 +964,127 @@ func TestPoll_OrphanedJobSet_ReappearanceClearsTracking(t *testing.T) {
 	}
 }
 
-func TestPoll_OrphanedJobSet_AlreadyDeletingIgnored(t *testing.T) {
+type pollerTestEnv struct {
+	poller       *SlurmPoller
+	teardownChan chan slurmtypes.SlurmJobTeardownEvent
+	now          time.Time
+}
+
+func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, objs ...client.Object) *pollerTestEnv {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = jobsetv1alpha2.AddToScheme(scheme)
 
-	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	js := newPollerTestJobSet("205").
-		withDeletionTimestamp().
-		withFinalizers(testFinalizer).
-		build()
-
-	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
-	cMap := clientmap.NewClientMap()
 	mockSlurm := &utils.SlurmClient{}
-	controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
-	cMap.Add(context.Background(), controllerKey, mockSlurm)
+	mockSlurm.SetPendingJobs(testPartitionName, slurmJobs)
+	cMap := clientmap.NewClientMap()
+	cMap.Add(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
 
-	teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-	currentTime := now
-	poller := &SlurmPoller{
-		Client:            fakeK8sClient,
+	env := &pollerTestEnv{
+		teardownChan: make(chan slurmtypes.SlurmJobTeardownEvent, 10),
+		now:          time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
+	}
+	env.poller = &SlurmPoller{
+		Client:            fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm}, objs...)...).Build(),
 		ClientMap:         cMap,
-		TeardownEvents:    teardownChan,
+		TeardownEvents:    env.teardownChan,
 		PollInterval:      10 * time.Second,
-		OrphanGracePeriod: 1 * time.Minute,
-		nowFn:             func() time.Time { return currentTime },
+		OrphanGracePeriod: time.Minute,
+		nowFn:             func() time.Time { return env.now },
 	}
+	return env
+}
 
-	// Poll cycle 1 at now
-	if err := poller.Poll(context.Background()); err != nil {
+func (e *pollerTestEnv) poll(t *testing.T) {
+	t.Helper()
+	if err := e.poller.Poll(t.Context()); err != nil {
 		t.Fatalf("Poll failed: %v", err)
-	}
-
-	// Poll cycle 2 past grace period
-	currentTime = now.Add(70 * time.Second)
-	if err := poller.Poll(context.Background()); err != nil {
-		t.Fatalf("Poll failed: %v", err)
-	}
-
-	select {
-	case ev := <-teardownChan:
-		t.Fatalf("Expected no teardown event for JobSet with DeletionTimestamp, got: %v", ev)
-	default:
 	}
 }
 
-func TestPoll_DeletingJobSetWithFinalizer_EmitsTeardownEvents(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = k8sbridgev1alpha1.AddToScheme(scheme)
-	_ = jobsetv1alpha2.AddToScheme(scheme)
+func (e *pollerTestEnv) drainTeardownEvents() []slurmtypes.SlurmJobTeardownEvent {
+	var events []slurmtypes.SlurmJobTeardownEvent
+	for {
+		select {
+		case ev := <-e.teardownChan:
+			events = append(events, ev)
+		default:
+			return events
+		}
+	}
+}
 
-	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+func TestPoll_DeletingJobSet_TeardownEvents(t *testing.T) {
+	completedJob := func(id int32) []slurmclienttypes.V0044JobInfo {
+		return []slurmclienttypes.V0044JobInfo{
+			*newEmptyTestJob().
+				withJobID(id).
+				withPartition(testPartitionName).
+				withJobState(slurmapi.V0044JobInfoJobStateCOMPLETED).
+				build(),
+		}
+	}
 
-	t.Run("Terminal Slurm job with deleting JobSet carrying FinalizerJobSet emits teardown event", func(t *testing.T) {
-		wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-		wm.UID = testWMUID
+	tests := []struct {
+		name      string
+		jobSet    *jobsetv1alpha2.JobSet
+		slurmJobs []slurmclienttypes.V0044JobInfo
+		// afterGracePeriod polls a second time after the orphan grace period has elapsed.
+		afterGracePeriod bool
+		// wantReason is the expected teardown reason; empty means no teardown event.
+		wantReason string
+	}{
+		{
+			name:       "Terminal Slurm job with deleting JobSet carrying FinalizerJobSet emits teardown event",
+			jobSet:     newPollerTestJobSet("210").withFinalizers(FinalizerJobSet).withDeletionTimestamp().build(),
+			slurmJobs:  completedJob(210),
+			wantReason: metrics.ReasonJobCompleted,
+		},
+		{
+			name:      "Terminal Slurm job with deleting JobSet without FinalizerJobSet is ignored",
+			jobSet:    newPollerTestJobSet("211").withFinalizers(testFinalizer).withDeletionTimestamp().build(),
+			slurmJobs: completedJob(211),
+		},
+		{
+			name:             "Orphaned deleting JobSet carrying FinalizerJobSet emits teardown event after grace period",
+			jobSet:           newPollerTestJobSet("212").withFinalizers(FinalizerJobSet).withDeletionTimestamp().build(),
+			afterGracePeriod: true,
+			wantReason:       metrics.ReasonJobOrphaned,
+		},
+		{
+			name:             "Orphaned deleting JobSet without FinalizerJobSet is ignored",
+			jobSet:           newPollerTestJobSet("205").withFinalizers(testFinalizer).withDeletionTimestamp().build(),
+			afterGracePeriod: true,
+		},
+	}
 
-		jsWithFinalizer := newPollerTestJobSet("210").
-			withDeletionTimestamp().
-			withFinalizers(FinalizerJobSet).
-			build()
-		jsWithoutBridgeFinalizer := newPollerTestJobSet("211").
-			withDeletionTimestamp().
-			withFinalizers(testFinalizer).
-			build()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newPollerTestEnv(t, tc.slurmJobs, tc.jobSet)
+			env.poll(t)
+			if tc.afterGracePeriod {
+				env.now = env.now.Add(70 * time.Second)
+				env.poll(t)
+			}
 
-		fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, jsWithFinalizer, jsWithoutBridgeFinalizer).Build()
-		cMap := clientmap.NewClientMap()
-		mockSlurm := &utils.SlurmClient{}
-		mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{
-			{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:     ptr.To[int32](210),
-					Partition: ptr.To(testPartitionName),
-					JobState:  ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateCOMPLETED}),
-				},
-			},
-			{
-				V0044JobInfo: slurmapi.V0044JobInfo{
-					JobId:     ptr.To[int32](211),
-					Partition: ptr.To(testPartitionName),
-					JobState:  ptr.To([]slurmapi.V0044JobInfoJobState{slurmapi.V0044JobInfoJobStateCOMPLETED}),
-				},
-			},
+			events := env.drainTeardownEvents()
+			if tc.wantReason == "" {
+				if len(events) != 0 {
+					t.Fatalf("Expected no teardown events, got %+v", events)
+				}
+				return
+			}
+			wantJobID := tc.jobSet.Labels[LabelSlurmJobID]
+			if len(events) != 1 || events[0].JobID != wantJobID || events[0].Reason != tc.wantReason {
+				t.Fatalf("Expected one teardown event for JobID %s with reason %s, got %+v", wantJobID, tc.wantReason, events)
+			}
 		})
-		controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
-		cMap.Add(context.Background(), controllerKey, mockSlurm)
-
-		teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-		poller := &SlurmPoller{
-			Client:         fakeK8sClient,
-			ClientMap:      cMap,
-			TeardownEvents: teardownChan,
-			PollInterval:   10 * time.Second,
-		}
-
-		if err := poller.Poll(context.Background()); err != nil {
-			t.Fatalf("Poll failed: %v", err)
-		}
-
-		select {
-		case ev := <-teardownChan:
-			if ev.JobID != "210" || ev.Reason != metrics.ReasonJobCompleted {
-				t.Errorf("Expected teardown event for JobID 210 with reason %s, got %+v", metrics.ReasonJobCompleted, ev)
-			}
-		default:
-			t.Fatal("Expected teardown event for deleting JobSet carrying FinalizerJobSet, got none")
-		}
-
-		select {
-		case ev := <-teardownChan:
-			t.Fatalf("Expected no teardown event for JobID 211 without FinalizerJobSet, got %+v", ev)
-		default:
-		}
-	})
-
-	t.Run("Orphaned deleting JobSet carrying FinalizerJobSet emits teardown event after grace period", func(t *testing.T) {
-		wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-		wm.UID = testWMUID
-
-		js := newPollerTestJobSet("212").
-			withDeletionTimestamp().
-			withFinalizers(FinalizerJobSet).
-			build()
-
-		fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
-		cMap := clientmap.NewClientMap()
-		mockSlurm := &utils.SlurmClient{}
-		controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
-		cMap.Add(context.Background(), controllerKey, mockSlurm)
-
-		teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-		currentTime := now
-		poller := &SlurmPoller{
-			Client:            fakeK8sClient,
-			ClientMap:         cMap,
-			TeardownEvents:    teardownChan,
-			PollInterval:      10 * time.Second,
-			OrphanGracePeriod: 1 * time.Minute,
-			nowFn:             func() time.Time { return currentTime },
-		}
-
-		if err := poller.Poll(context.Background()); err != nil {
-			t.Fatalf("Poll cycle 1 failed: %v", err)
-		}
-
-		currentTime = now.Add(70 * time.Second)
-		if err := poller.Poll(context.Background()); err != nil {
-			t.Fatalf("Poll cycle 2 failed: %v", err)
-		}
-
-		select {
-		case ev := <-teardownChan:
-			if ev.JobID != "212" || ev.Reason != metrics.ReasonJobOrphaned {
-				t.Errorf("Expected orphan teardown event for JobID 212, got %+v", ev)
-			}
-		default:
-			t.Fatal("Expected orphan teardown event for deleting JobSet carrying FinalizerJobSet, got none")
-		}
-	})
+	}
 }
 
 func TestPoll_OrphanedJobSet_ChannelFull_RetriesOnNextPoll(t *testing.T) {

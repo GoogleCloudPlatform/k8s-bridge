@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
@@ -192,11 +193,13 @@ func (b *testJobSetBuilder) withFinalizers(finalizers ...string) *testJobSetBuil
 	return b
 }
 
+// withDeletionTimestamp marks the JobSet as deleting. The fake client rejects deleting objects without
+// finalizers, so testFinalizer is added if none are set; use withFinalizers to control them explicitly.
 func (b *testJobSetBuilder) withDeletionTimestamp() *testJobSetBuilder {
 	now := metav1.Now()
 	b.jobSet.DeletionTimestamp = &now
 	if len(b.jobSet.Finalizers) == 0 {
-		b.jobSet.Finalizers = []string{FinalizerJobSet}
+		b.jobSet.Finalizers = []string{testFinalizer}
 	}
 	return b
 }
@@ -422,6 +425,13 @@ func (e *reconcileTestEnv) getJobSet() *jobsetv1alpha2.JobSet {
 		e.t.Fatalf("Failed to get JobSet %s: %v", e.jobSetKey, err)
 	}
 	return js
+}
+
+func (e *reconcileTestEnv) verifyJobSetHasFinalizer() {
+	e.t.Helper()
+	if js := e.getJobSet(); !controllerutil.ContainsFinalizer(js, FinalizerJobSet) {
+		e.t.Errorf("Expected JobSet to retain finalizer %q, got %v", FinalizerJobSet, js.Finalizers)
+	}
 }
 
 func (e *reconcileTestEnv) verifyJobSetUnchanged(before *jobsetv1alpha2.JobSet) {

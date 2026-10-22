@@ -21,12 +21,11 @@ import (
 	"slices"
 	"testing"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
@@ -37,69 +36,98 @@ import (
 func TestRemoveJobSetFinalizer(t *testing.T) {
 	const otherFinalizer = "orphan"
 
-	newClient := func(t *testing.T) (*jobsetv1alpha2.JobSet, client.Client) {
-		t.Helper()
-		scheme := runtime.NewScheme()
-		_ = jobsetv1alpha2.AddToScheme(scheme)
-		js := newTestJobSet(testJobSet101Name).withFinalizers(FinalizerJobSet).build()
-		return js, fake.NewClientBuilder().WithScheme(scheme).WithObjects(js).Build()
+	tests := []struct {
+		name string
+		// stored is the JobSet in the API server; nil means it does not exist.
+		stored *jobsetv1alpha2.JobSet
+		// arg is the copy passed to removeJobSetFinalizer; it is stale when it differs from stored.
+		arg            *jobsetv1alpha2.JobSet
+		wantFinalizers []string
+		wantPatches    int
+	}{
+		{
+			name:           "Removes only FinalizerJobSet from an up-to-date JobSet",
+			stored:         newTestJobSet(testJobSet101Name).withFinalizers(FinalizerJobSet, otherFinalizer).build(),
+			wantFinalizers: []string{otherFinalizer},
+			wantPatches:    1,
+		},
+		{
+			name:           "Retries on conflict and keeps concurrently added finalizers",
+			stored:         newTestJobSet(testJobSet101Name).withFinalizers(FinalizerJobSet, otherFinalizer).build(),
+			arg:            newTestJobSet(testJobSet101Name).withFinalizers(FinalizerJobSet).build(),
+			wantFinalizers: []string{otherFinalizer},
+			wantPatches:    2,
+		},
+		{
+			name:           "Concurrently finalized JobSet is not an error",
+			stored:         newTestJobSet(testJobSet101Name).withFinalizers(otherFinalizer).build(),
+			arg:            newTestJobSet(testJobSet101Name).withFinalizers(FinalizerJobSet, otherFinalizer).build(),
+			wantFinalizers: []string{otherFinalizer},
+			wantPatches:    1,
+		},
+		{
+			name:           "JobSet without FinalizerJobSet is a no-op",
+			stored:         newTestJobSet(testJobSet101Name).withFinalizers(otherFinalizer).build(),
+			wantFinalizers: []string{otherFinalizer},
+			wantPatches:    0,
+		},
+		{
+			name:        "JobSet that no longer exists returns nil",
+			arg:         newTestJobSet(testJobSet101Name).withFinalizers(FinalizerJobSet).build(),
+			wantPatches: 1,
+		},
 	}
 
-	t.Run("Removes only FinalizerJobSet from an up-to-date JobSet", func(t *testing.T) {
-		js, c := newClient(t)
-		ctx := context.Background()
-		key := types.NamespacedName{Namespace: js.Namespace, Name: js.Name}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			scheme := runtime.NewScheme()
+			_ = jobsetv1alpha2.AddToScheme(scheme)
 
-		current := &jobsetv1alpha2.JobSet{}
-		if err := c.Get(ctx, key, current); err != nil {
-			t.Fatalf("Get() failed: %v", err)
-		}
-		current.Finalizers = append(current.Finalizers, otherFinalizer)
-		if err := c.Update(ctx, current); err != nil {
-			t.Fatalf("Update() failed: %v", err)
-		}
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tc.stored != nil {
+				builder = builder.WithObjects(tc.stored)
+			}
+			patches := 0
+			c := interceptor.NewClient(builder.Build(), interceptor.Funcs{
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					patches++
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+			})
 
-		if err := removeJobSetFinalizer(ctx, c, current); err != nil {
-			t.Fatalf("removeJobSetFinalizer() failed: %v", err)
-		}
+			arg := tc.arg
+			if tc.stored != nil {
+				// Read the stored JobSet so its resourceVersion is known, then make arg stale if requested.
+				current := &jobsetv1alpha2.JobSet{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(tc.stored), current); err != nil {
+					t.Fatalf("Get() failed: %v", err)
+				}
+				if arg == nil {
+					arg = current
+				} else {
+					arg.ResourceVersion = "1"
+				}
+			}
 
-		got := &jobsetv1alpha2.JobSet{}
-		if err := c.Get(ctx, key, got); err != nil {
-			t.Fatalf("Get() failed: %v", err)
-		}
-		if !slices.Equal(got.Finalizers, []string{otherFinalizer}) {
-			t.Errorf("Finalizers = %v, want [%s]", got.Finalizers, otherFinalizer)
-		}
-	})
-
-	t.Run("Returns conflict and keeps concurrently added finalizers when JobSet is stale", func(t *testing.T) {
-		js, c := newClient(t)
-		ctx := context.Background()
-		key := types.NamespacedName{Namespace: js.Namespace, Name: js.Name}
-
-		stale := &jobsetv1alpha2.JobSet{}
-		if err := c.Get(ctx, key, stale); err != nil {
-			t.Fatalf("Get() failed: %v", err)
-		}
-		current := stale.DeepCopy()
-		current.Finalizers = append(current.Finalizers, otherFinalizer)
-		if err := c.Update(ctx, current); err != nil {
-			t.Fatalf("Update() failed: %v", err)
-		}
-
-		err := removeJobSetFinalizer(ctx, c, stale)
-		if !apierrors.IsConflict(err) {
-			t.Fatalf("removeJobSetFinalizer() error = %v, want Conflict", err)
-		}
-
-		got := &jobsetv1alpha2.JobSet{}
-		if err := c.Get(ctx, key, got); err != nil {
-			t.Fatalf("Get() failed: %v", err)
-		}
-		if !slices.Equal(got.Finalizers, []string{FinalizerJobSet, otherFinalizer}) {
-			t.Errorf("Finalizers = %v, want [%s %s]", got.Finalizers, FinalizerJobSet, otherFinalizer)
-		}
-	})
+			if err := removeJobSetFinalizer(ctx, c, arg); err != nil {
+				t.Fatalf("removeJobSetFinalizer() failed: %v", err)
+			}
+			if patches != tc.wantPatches {
+				t.Errorf("Patch calls = %d, want %d", patches, tc.wantPatches)
+			}
+			if tc.stored == nil {
+				return
+			}
+			got := &jobsetv1alpha2.JobSet{}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(tc.stored), got); err != nil {
+				t.Fatalf("Get() failed: %v", err)
+			}
+			if !slices.Equal(got.Finalizers, tc.wantFinalizers) {
+				t.Errorf("Finalizers = %v, want %v", got.Finalizers, tc.wantFinalizers)
+			}
+		})
+	}
 }
 
 func TestIsTerminalSlurmJob(t *testing.T) {
