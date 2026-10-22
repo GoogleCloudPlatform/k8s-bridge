@@ -59,7 +59,7 @@ To remove the WorkloadMixing configurations:
 kubectl delete -f config/samples/k8s-bridge_v1alpha1_workloadmixing.yaml
 ```
 
-JobSets created by `k8s-bridge` carry the `k8s-bridge.x-k8s.io/slurm-node-cleanup` finalizer, which `k8s-bridge` removes after deregistering the JobSet's dynamic Slurm nodes. Before uninstalling the controller, wait until the following command returns no resources:
+JobSets created by `k8s-bridge` carry the `k8s-bridge.x-k8s.io/slurm-node-cleanup` finalizer. A deleted JobSet stays `Terminating`, and its Pods keep running, until `k8s-bridge` deregisters its dynamic Slurm nodes. Before uninstalling, wait until this returns no resources:
 ```sh
 kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
 ```
@@ -69,20 +69,12 @@ To uninstall the controller:
 helm uninstall k8s-bridge --namespace k8s-bridge-system
 ```
 
-If a JobSet is stuck in `Terminating` because `k8s-bridge` is no longer running, remove only the `k8s-bridge` finalizer. Keep the other finalizers, such as `foregroundDeletion` or `orphan`, so the requested cascade still happens. `kubectl replace` sends the `resourceVersion`, so it fails instead of overwriting the JobSet if it changed in the meantime:
+If no running `k8s-bridge` manages a JobSet anymore (uninstalled, rolled back to a version without the finalizer, or WorkloadMixing deleted with `--cascade=orphan`), remove only this finalizer:
 ```sh
 kubectl get jobset <name> -n <namespace> -o json \
   | jq '.metadata.finalizers -= ["k8s-bridge.x-k8s.io/slurm-node-cleanup"]' \
   | kubectl replace -f -
 ```
-Alternatively, run `kubectl edit jobset <name> -n <namespace>` and delete only that entry from `metadata.finalizers`.
-
-### JobSet finalizer behavior
-
-- **Deleting a JobSet**: With the default background cascade, a deleted JobSet stays in `Terminating`, and its slurmd Pods keep running until `k8s-bridge` has cancelled the Slurm job and deregistered the dynamic Slurm nodes. If slurmrestd is unreachable, this lasts until it is reachable again.
-- **Deleting a WorkloadMixing with `--cascade=orphan`**: This removes the WorkloadMixing owner reference from its JobSets, so `k8s-bridge` no longer manages them and does not release their finalizer. If such a JobSet is deleted later, remove the finalizer manually as shown above.
-- **Upgrading**: JobSets created before the upgrade have no finalizer and are cleaned up as before.
-- **Rolling back**: Versions without finalizer support never remove the finalizer, so JobSets created by this version stay in `Terminating` when they are deleted after a rollback. Remove the finalizer manually as shown above.
 
 ## Metrics & Monitoring
 
