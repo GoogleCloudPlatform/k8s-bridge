@@ -43,7 +43,7 @@ make manifests generate
 ```
 
 ### Step 3: Synchronize Paired Artifacts & Audit Pre-PR Repository Parity
-Walk through every modified row in [references/parity-checklist.md](references/parity-checklist.md) (`helm/templates/clusterrole.yaml`, `cmd/main.go` flags across `config/` and `helm/`, sample/example/testdata `WorkloadMixing` manifests, Kueue API versions, and `make version-sync`).
+Walk through every modified row in [references/parity-checklist.md](references/parity-checklist.md) (`helm/templates/clusterrole.yaml`, `cmd/main.go` flags across `config/` and `helm/`, sample/example/testdata `WorkloadMixing` manifests, repository discrepancies, and `make version-sync`).
 
 ---
 

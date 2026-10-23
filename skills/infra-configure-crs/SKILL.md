@@ -27,8 +27,8 @@ description: >-
 | **Existing Kueue / Slurm Infra** | [docs/existing-infra.md](../../docs/existing-infra.md) | Existing Kueue queues ([docs/existing-infra.md](../../docs/existing-infra.md)) | Inline manifest in [docs/existing-infra.md](../../docs/existing-infra.md) |
 | **GKE Custom Compute Classes (CCC)** | [docs/gke/ccc.md](../../docs/gke/ccc.md) | `docs/examples/ccc/computeclass.yaml` + `docs/examples/ccc/kueue-resources.yaml` | `docs/examples/quickstart/workloadmixing.yaml` |
 | **Priority & Preemption (`prod` / `batch`)** | [docs/priorities-and-preemption.md](../../docs/priorities-and-preemption.md) | `docs/examples/priority-preemption/kueue-resources.yaml` | `docs/examples/priority-preemption/workloadmixing-priority.yaml` |
-| **Pre-Provisioned GPU Workloads** | [docs/gpu-workloads.md](../../docs/gpu-workloads.md) | `docs/examples/gpu/kueue-resources.yaml` (convert `v1beta1` -> `v1beta2`) | `docs/examples/gpu/workloadmixing-gpu.yaml` |
-| **GKE DWS Flex-Start GPU Workloads** | [docs/gke/gpu-dws-workloads.md](../../docs/gke/gpu-dws-workloads.md) | `docs/examples/gpu-dws/kueue-resources.yaml` (convert `v1beta1` -> `v1beta2`) | `docs/examples/gpu-dws/workloadmixing-gpu.yaml` |
+| **Pre-Provisioned GPU Workloads** | [docs/gpu-workloads.md](../../docs/gpu-workloads.md) | `docs/examples/gpu/kueue-resources.yaml` | `docs/examples/gpu/workloadmixing-gpu.yaml` |
+| **GKE DWS Flex-Start GPU Workloads** | [docs/gke/gpu-dws-workloads.md](../../docs/gke/gpu-dws-workloads.md) | `docs/examples/gpu-dws/kueue-resources.yaml` | `docs/examples/gpu-dws/workloadmixing-gpu.yaml` |
 
 ---
 
