@@ -30,7 +30,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
@@ -217,7 +216,21 @@ func (t *JobSetTranslator) Translate(
 	injectPreStopHook(&podTemplate.Spec)
 	injectSlurmdProbes(&podTemplate.Spec, jobIDStr)
 
-	return buildJobSet(jobIDStr, replicas, resolveMaxRestarts(job), labels, podTemplate), nil
+	maxRestarts := resolveMaxRestarts(job)
+	log.Log.WithName("translator").V(1).Info("Translated Slurm job to JobSet",
+		"jobID", jobIDStr,
+		"partition", mapping.Partition,
+		"localQueue", mapping.LocalQueue,
+		"priorityClass", mapping.WorkloadPriorityClass,
+		"dynamicNodeFeature", mapping.DynamicNodeFeature,
+		"replicas", replicas,
+		"maxRestarts", maxRestarts,
+		"requests", resources.Requests,
+		"limits", resources.Limits,
+		"nodeSelectors", podTemplate.Spec.NodeSelector,
+		"confServer", confServer)
+
+	return buildJobSet(jobIDStr, replicas, maxRestarts, labels, podTemplate), nil
 }
 
 // resolveMaxRestarts returns the JobSet restart budget for a Slurm job.
@@ -250,7 +263,7 @@ func applyPodTemplateOverrides(
 	foundSlurmd := false
 	for i := range template.Spec.Containers {
 		if template.Spec.Containers[i].Name == ContainerSlurmd {
-			mergeContainerResources(&template.Spec.Containers[i], resources)
+			mergeContainerResources(&template.Spec.Containers[i], resources, jobIDStr)
 			foundSlurmd = true
 			break
 		}
@@ -282,7 +295,7 @@ func applyPodTemplateOverrides(
 // mergeContainerResources applies Slurm-calculated resources onto the slurmd container
 // from podTemplate while preserving unrelated custom resources (e.g. ephemeral-storage)
 // and any limits explicitly configured in podTemplate.
-func mergeContainerResources(container *corev1.Container, calculated corev1.ResourceRequirements) {
+func mergeContainerResources(container *corev1.Container, calculated corev1.ResourceRequirements, jobIDStr string) {
 	logger := log.Log.WithName("translator")
 
 	if container.Resources.Requests == nil {
@@ -290,8 +303,8 @@ func mergeContainerResources(container *corev1.Container, calculated corev1.Reso
 	}
 	for resName, calcQty := range calculated.Requests {
 		if prevQty, ok := container.Resources.Requests[resName]; ok {
-			logger.Info("Warning: overwriting user-provided slurmd resource request from podTemplate",
-				"resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
+			logger.V(1).Info("Overwriting user-provided slurmd resource request from podTemplate",
+				"jobID", jobIDStr, "resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
 		}
 		container.Resources.Requests[resName] = calcQty
 	}
@@ -301,8 +314,8 @@ func mergeContainerResources(container *corev1.Container, calculated corev1.Reso
 			container.Resources.Limits = make(corev1.ResourceList)
 		}
 		if prevQty, ok := container.Resources.Limits[resName]; ok {
-			logger.Info("Warning: overwriting user-provided slurmd resource limit from podTemplate",
-				"resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
+			logger.V(1).Info("Overwriting user-provided slurmd resource limit from podTemplate",
+				"jobID", jobIDStr, "resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
 		}
 		container.Resources.Limits[resName] = calcQty
 	}
@@ -517,18 +530,18 @@ func injectPreStopHook(spec *corev1.PodSpec) {
 }
 
 func injectSlurmdProbes(spec *corev1.PodSpec, jobIDStr string) {
-	logger := ctrl.Log.WithName("translator")
+	logger := log.Log.WithName("translator")
 	for i := range spec.Containers {
 		if spec.Containers[i].Name == ContainerSlurmd {
 			if spec.Containers[i].StartupProbe == nil {
 				spec.Containers[i].StartupProbe = defaultSlurmdStartupProbe()
 			} else {
-				logger.Info("Custom startupProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
+				logger.V(1).Info("Custom startupProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
 			}
 			if spec.Containers[i].LivenessProbe == nil {
 				spec.Containers[i].LivenessProbe = defaultSlurmdLivenessProbe()
 			} else {
-				logger.Info("Custom livenessProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
+				logger.V(1).Info("Custom livenessProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
 			}
 			break
 		}
@@ -645,8 +658,8 @@ func resolveReplicas(job *slurmclienttypes.V0044JobInfo) (int32, error) {
 		return nodes, nil
 	}
 
-	log.Log.WithName("translator").Info("Could not determine requested node count from TresReqStr, falling back to NodeCount",
-		"jobID", ptr.Deref(job.JobId, 0), "tresReqStr", ptr.Deref(job.TresReqStr, ""))
+	log.Log.WithName("translator").V(1).Info("Could not determine requested node count from TresReqStr, falling back to NodeCount",
+		"jobID", strconv.Itoa(int(ptr.Deref(job.JobId, 0))), "tresReqStr", ptr.Deref(job.TresReqStr, ""))
 	// Check Infinite before Set. slurmrestd sends an infinite value with set=false and number=0.
 	// Reference: DUMP_FUNC(UINT32_NO_VAL) in src/plugins/data_parser/v0.0.44/parsers.c
 	// https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/plugins/data_parser/v0.0.44/parsers.c#L3106-L3132

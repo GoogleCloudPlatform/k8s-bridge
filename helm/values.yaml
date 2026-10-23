@@ -29,6 +29,8 @@ manager:
     enabled: true
   healthProbeBindAddress: ":8081"
   metricsBindAddress: ":8080"
+  # Log level passed to --zap-log-level: debug, info, error, or an integer verbosity.
+  logLevel: info
 
 serviceAccount:
   # Specifies whether a service account should be created

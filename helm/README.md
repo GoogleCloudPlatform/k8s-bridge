@@ -28,7 +28,7 @@ helm install k8s-bridge . --namespace k8s-bridge-system --create-namespace
 
 ## Uninstalling the Chart
 
-JobSets created by `k8s-bridge` carry the `k8s-bridge.x-k8s.io/slurm-node-cleanup` finalizer, which `k8s-bridge` removes after deregistering the JobSet's dynamic Slurm nodes. Delete your WorkloadMixing resources first, and wait until the following command returns no resources:
+JobSets created by `k8s-bridge` carry the `k8s-bridge.x-k8s.io/slurm-node-cleanup` finalizer. Delete your WorkloadMixing resources first and wait until this returns no resources:
 
 ```console
 kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
@@ -40,13 +40,13 @@ To uninstall/delete the `k8s-bridge` deployment:
 helm uninstall k8s-bridge --namespace k8s-bridge-system
 ```
 
-If a JobSet is stuck in `Terminating` because `k8s-bridge` is no longer running, remove only the `k8s-bridge` finalizer. Keep the other finalizers, such as `foregroundDeletion` or `orphan`, so the requested cascade still happens. `kubectl replace` sends the `resourceVersion`, so it fails instead of overwriting the JobSet if it changed in the meantime:
+If a JobSet is stuck in `Terminating` after uninstalling, remove only this finalizer:
+
 ```console
 kubectl get jobset <name> -n <namespace> -o json \
   | jq '.metadata.finalizers -= ["k8s-bridge.x-k8s.io/slurm-node-cleanup"]' \
   | kubectl replace -f -
 ```
-Alternatively, run `kubectl edit jobset <name> -n <namespace>` and delete only that entry from `metadata.finalizers`.
 
 ## Configuration
 

@@ -73,12 +73,12 @@ type SlurmClientReconciler struct {
 // Reconcile reconciles the SlurmClient.
 func (r *SlurmClientReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.V(1).Info("Starting reconcile for Controller", "controller", req)
+	logger.V(1).Info("Reconciling SlurmClient")
 
 	controllerCR := &slinkyv1beta1.Controller{}
 	if err := r.Get(ctx, req.NamespacedName, controllerCR); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("Controller deleted, removing from ClientMap", "controller", req)
+			logger.Info("Controller deleted, removing from ClientMap")
 			r.ClientMap.Remove(req.NamespacedName)
 			metrics.DeleteSlurmClientMetrics(req.Name)
 			return ctrl.Result{}, nil
@@ -89,7 +89,10 @@ func (r *SlurmClientReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	server, err := r.getRestApiServer(ctx, controllerCR)
 	if err != nil {
 		if apierrors.IsNotFound(err) || errors.Is(err, ErrRestApiNotFound) {
-			r.ClientMap.Remove(req.NamespacedName)
+			if r.ClientMap.Has(req.NamespacedName) {
+				logger.Info("RestApi not found for Controller, removing from ClientMap")
+				r.ClientMap.Remove(req.NamespacedName)
+			}
 			metrics.SetSlurmClientStatus(req.Name, false)
 			return ctrl.Result{}, nil
 		}
@@ -108,20 +111,10 @@ func (r *SlurmClientReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	isTokenFresh := !expiration.IsZero() && time.Now().Add(StalenessBuffer).Before(expiration)
 	isServerCorrect := existingClient != nil && existingClient.GetServer() == server
 
-	isTokenValid := true
-	if isTokenFresh && isServerCorrect {
-		signingKey, err := slurmjwt.GetSigningKey(ctx, r.Client, controllerCR.Namespace, controllerCR.Name)
-		if err == nil && len(signingKey) > 0 {
-			valid, err := slurmjwt.VerifyToken(existingClient.GetToken(), signingKey)
-			if err != nil || !valid {
-				logger.Info("Token is invalid or verification failed, forcing regeneration", "controller", req)
-				isTokenValid = false
-			}
-		}
-	}
+	isTokenValid := r.verifyExistingClientToken(ctx, controllerCR, existingClient, isTokenFresh && isServerCorrect)
 
 	if isTokenFresh && isServerCorrect && isTokenValid {
-		logger.Info("Active token is fresh and server is unchanged, skipping regeneration", "expiration", expiration)
+		logger.V(1).Info("Active token is fresh and server is unchanged, skipping regeneration", "expiration", expiration)
 		metrics.SetSlurmClientStatus(req.Name, true)
 		// Requeue for the remaining duration before expiration minus staleness buffer
 		requeueTime := time.Until(expiration) - StalenessBuffer
@@ -129,7 +122,8 @@ func (r *SlurmClientReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if existingClient != nil && (!isServerCorrect || !isTokenValid) {
-		logger.Info("Server URL changed or token invalid, removing old client", "controller", req)
+		logger.Info("Server URL changed or token invalid, removing old client",
+			"serverChanged", !isServerCorrect, "tokenValid", isTokenValid)
 		r.ClientMap.Remove(req.NamespacedName)
 	}
 
@@ -141,11 +135,11 @@ func (r *SlurmClientReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if token == "" {
 		// Missing secret or token data
+		logger.Info("Slurm JWT signing key is empty or missing, requeuing", "requeueAfter", 10*time.Second)
 		metrics.SetSlurmClientStatus(req.Name, false)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	logger.Info("Creating/Updating Slurm client", "controller", req)
 	config := &slurmclient.Config{
 		Server:    server,
 		AuthToken: token,
@@ -169,8 +163,35 @@ func (r *SlurmClientReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	r.ClientMap.AddWithExpiration(ctx, req.NamespacedName, newClient, expiresAt)
 	metrics.SetSlurmClientStatus(req.Name, true)
+	logger.Info("Configured Slurm client", "server", server, "expiresAt", expiresAt, "refreshAfter", refresh)
 
 	return ctrl.Result{RequeueAfter: refresh}, nil
+}
+
+func (r *SlurmClientReconciler) verifyExistingClientToken(
+	ctx context.Context,
+	controllerCR *slinkyv1beta1.Controller,
+	existingClient slurmclient.Client,
+	shouldVerify bool,
+) bool {
+	if !shouldVerify {
+		return true
+	}
+	logger := log.FromContext(ctx)
+	signingKey, err := slurmjwt.GetSigningKey(ctx, r.Client, controllerCR.Namespace, controllerCR.Name)
+	if err != nil {
+		logger.V(1).Info("Failed to read JWT signing key during token verification", "error", err)
+		return true
+	}
+	if len(signingKey) == 0 {
+		return true
+	}
+	valid, err := slurmjwt.VerifyToken(existingClient.GetToken(), signingKey)
+	if err != nil || !valid {
+		logger.Info("Token is invalid or verification failed, forcing regeneration")
+		return false
+	}
+	return true
 }
 
 func (r *SlurmClientReconciler) getRestApiServer(ctx context.Context, controllerCR *slinkyv1beta1.Controller) (string, error) {
@@ -186,8 +207,8 @@ func (r *SlurmClientReconciler) getRestApiServer(ctx context.Context, controller
 
 	server := fmt.Sprintf("http://%s:%d", restapiList.Items[0].ServiceFQDNShort(), SlurmrestdPort)
 	if r.Debug {
-		logger.Info("overriding restapi URL with localhost")
 		server = fmt.Sprintf("http://localhost:%d", SlurmrestdPort)
+		logger.V(1).Info("Overriding RestApi URL with localhost", "server", server)
 	}
 
 	return server, nil
@@ -234,6 +255,7 @@ func (r *SlurmClientReconciler) mapSecretToController(ctx context.Context, obj c
 	}
 	controllerList := &slinkyv1beta1.ControllerList{}
 	if err := r.List(ctx, controllerList, client.InNamespace(secret.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list Controllers", "namespace", secret.Namespace)
 		return nil
 	}
 	var requests []reconcile.Request

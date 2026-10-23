@@ -134,7 +134,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 	for controllerKey, wms := range wmByController {
 		cli := p.ClientMap.Get(controllerKey)
 		if cli == nil {
-			logger.V(1).Info("Slurm client not ready yet, skipping controller", "controller", controllerKey)
+			logger.V(1).Info("Slurm client not ready yet, skipping controller", "slurmController", controllerKey)
 			metrics.SetSlurmClientStatus(controllerKey.Name, false)
 			continue
 		}
@@ -154,7 +154,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 			}
 			metrics.RecordPollerError(controllerKey.Name)
 			metrics.SetSlurmClientStatus(controllerKey.Name, false)
-			logger.Error(err, "Failed to list jobs for controller", "controller", controllerKey)
+			logger.Error(err, "Failed to list jobs for controller", "slurmController", controllerKey)
 			continue
 		}
 
@@ -174,7 +174,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			logger.Error(err, "Failed to list JobSets for controller namespace", "controller", controllerKey)
+			logger.Error(err, "Failed to list JobSets for controller namespace", "slurmController", controllerKey)
 			continue
 		}
 
@@ -183,7 +183,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				logger.Error(err, "Failed to process pending jobs for WorkloadMixing", "controller", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
+				logger.Error(err, "Failed to process pending jobs for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
 				continue
 			}
 
@@ -191,7 +191,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				logger.Error(err, "Failed to reconcile workloads for WorkloadMixing", "controller", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
+				logger.Error(err, "Failed to reconcile workloads for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
 				continue
 			}
 		}
@@ -307,9 +307,17 @@ func (p *SlurmPoller) auditOrphanedJobSets(
 
 		// If job is present in Slurm, clear any missing tracking
 		if _, exists := slurmJobs[jobID]; exists {
+			var wasMissing bool
 			p.mu.Lock()
-			delete(p.firstSeenMissing, key)
+			if _, tracked := p.firstSeenMissing[key]; tracked {
+				delete(p.firstSeenMissing, key)
+				wasMissing = true
+			}
 			p.mu.Unlock()
+			if wasMissing {
+				logger.V(1).Info("Previously missing Slurm job reappeared within orphan grace period",
+					"jobID", jobID, "jobSet", key)
+			}
 			continue
 		}
 
@@ -336,8 +344,6 @@ func (p *SlurmPoller) auditOrphanedJobSets(
 		// JobSet must exceed disappearance grace period (protects transient API misses)
 		missingDuration := now.Sub(firstSeen)
 		if missingDuration < gracePeriod {
-			logger.V(1).Info("Slurm job missing from Slurm within disappearance grace period, skipped orphan teardown",
-				"jobSet", key, "jobID", jobID, "missingDuration", missingDuration, "gracePeriod", gracePeriod)
 			continue
 		}
 
@@ -478,20 +484,20 @@ func (p *SlurmPoller) processPendingJobsForWM(
 
 			if matched {
 				jobID := ptr.Deref(job.JobId, 0)
-				jobSetName := jobSetNameForJobID(strconv.Itoa(int(jobID)))
+				jobIDStr := strconv.Itoa(int(jobID))
+				jobSetName := jobSetNameForJobID(jobIDStr)
 				existingJS := jobSetsByName[jobSetName]
 				if !shouldEmitAdmissionEvent(job, existingJS) {
-					logger.V(1).Info("Skipping redundant SlurmJobAdmissionEvent", "jobID", jobID, "workloadMixing", client.ObjectKeyFromObject(wm))
 					continue
 				}
 
 				rawJSON, err := json.Marshal(*job)
 				if err != nil {
-					logger.Error(err, "Failed to marshal job info", "jobID", jobID)
+					logger.Error(err, "Failed to marshal job info", "jobID", jobIDStr, "workloadMixing", client.ObjectKeyFromObject(wm))
 					continue
 				}
 				event := slurmtypes.SlurmJobAdmissionEvent{
-					JobID:          fmt.Sprintf("%d", jobID),
+					JobID:          jobIDStr,
 					RawJobSpecJSON: string(rawJSON),
 					WorkloadMixing: types.NamespacedName{
 						Namespace: wm.Namespace,
@@ -507,7 +513,7 @@ func (p *SlurmPoller) processPendingJobsForWM(
 					return ctx.Err()
 				default:
 					metrics.RecordDroppedEvent(wm.Name)
-					logger.Info("Event channel is full, dropping event", "jobID", event.JobID, "workloadMixing", event.WorkloadMixing)
+					logger.Info("Admission event channel is full, dropping event", "jobID", event.JobID, "workloadMixing", event.WorkloadMixing)
 				}
 			}
 		}
