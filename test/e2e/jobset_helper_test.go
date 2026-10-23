@@ -181,7 +181,22 @@ func verifyJobSetCreatedWithCustomTemplate(jobSetName, jobID, jobNameLabel strin
 		g.Expect(slurmdContainer.Args[3]).To(Equal("$(SLURM_NODE_NAME)"))
 		g.Expect(slurmdContainer.Args[4]).To(Equal("-Z"))
 		g.Expect(slurmdContainer.Args[5]).To(Equal("--conf"))
-		g.Expect(slurmdContainer.Args[6]).To(MatchRegexp(`^'RealMemory=4096 Features=k8s-id-[0-9a-f-]+,dynamic_kpartition'$`))
+		g.Expect(slurmdContainer.Args[6]).To(MatchRegexp(`^'Features=k8s-id-[0-9a-f-]+,dynamic_kpartition'$`))
+
+		// Verify POD_CPUS and POD_MEMORY carry the slurmd container requests (-c 2 --mem=4096)
+		var podCPUsEnv, podMemoryEnv *corev1.EnvVar
+		for i := range slurmdContainer.Env {
+			switch slurmdContainer.Env[i].Name {
+			case "POD_CPUS":
+				podCPUsEnv = &slurmdContainer.Env[i]
+			case "POD_MEMORY":
+				podMemoryEnv = &slurmdContainer.Env[i]
+			}
+		}
+		g.Expect(podCPUsEnv).NotTo(BeNil(), "Expected POD_CPUS env var on slurmd container")
+		g.Expect(podCPUsEnv.Value).To(Equal("2"))
+		g.Expect(podMemoryEnv).NotTo(BeNil(), "Expected POD_MEMORY env var on slurmd container")
+		g.Expect(podMemoryEnv.Value).To(Equal("4096"))
 
 		// Verify Slurmd container has Downward API env vars for deterministic node naming
 		var slurmNodeNameEnv, jobSetNameEnv, replicatedJobNameEnv, jobIndexEnv, podIndexEnv *corev1.EnvVar

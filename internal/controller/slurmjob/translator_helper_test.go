@@ -49,12 +49,11 @@ const (
 	testGpuTypeL4           = "nvidia-l4"
 	testGpuTypeA100         = "nvidia-tesla-a100"
 	testCustomSlurmdImage   = "custom-slurmd:v1"
-	testDefaultNodeRes      = "RealMemory=2048"
-	testPartitionHighPrio   = "'" + testDefaultNodeRes + " Features=k8s-id-123'"
-	testPartitionLowPrio    = "'" + testDefaultNodeRes + " Features=k8s-id-123'"
+	testPartitionHighPrio   = "'Features=k8s-id-123'"
+	testPartitionLowPrio    = "'Features=k8s-id-123'"
 	testFeatureWithPart     = "'Features=k8s-id-123'"
-	testExpectedGpuL4Args   = "'RealMemory=8192 Features=k8s-id-123 Gres=gpu:l4:1'"
-	testExpectedGpuL4_2Args = "'" + testDefaultNodeRes + " Features=k8s-id-123 Gres=gpu:l4:2'"
+	testExpectedGpuL4Args   = "'Features=k8s-id-123 Gres=gpu:l4:1'"
+	testExpectedGpuL4_2Args = "'Features=k8s-id-123 Gres=gpu:l4:2'"
 	testSidecarName         = "my-sidecar"
 	testSidecarImage        = "sidecar:latest"
 	testUserVolumeName      = "user-vol"
@@ -406,9 +405,17 @@ type jobSetVerifier struct {
 	wantSlurmdImage  string
 	wantPreStopHook  []string
 	wantContainers   *int
+	// wantEnv values must be present exactly once on the slurmd container.
+	wantEnv map[string]string
 }
 
 type verifyJobSetOpt func(*jobSetVerifier)
+
+func withEnv(wantEnv map[string]string) verifyJobSetOpt {
+	return func(v *jobSetVerifier) {
+		v.wantEnv = wantEnv
+	}
+}
 
 func wantK8sBridgeLabels(component string) map[string]string {
 	return map[string]string{
@@ -577,6 +584,17 @@ func verifyJobSetOptions(t *testing.T, js *jobsetv1alpha2.JobSet, podSpec *corev
 	}
 	verifyJobSetResources(t, slurmd, v)
 	verifyJobSetLifecycle(t, slurmd, v)
+	for name, wantValue := range v.wantEnv {
+		var gotValues []string
+		for _, env := range slurmd.Env {
+			if env.Name == name {
+				gotValues = append(gotValues, env.Value)
+			}
+		}
+		if diff := cmp.Diff([]string{wantValue}, gotValues); diff != "" {
+			t.Errorf("Translate() returned unexpected slurmd env %s (-want +got):\n%s", name, diff)
+		}
+	}
 	if v.verifyVolume {
 		verifySlurmVolumeAndMount(t, *podSpec, *slurmd)
 	}
