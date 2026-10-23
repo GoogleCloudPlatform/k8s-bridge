@@ -178,6 +178,30 @@ func VerifyJobSetCreatedWithGPU(name, ns, jobID, expectedGPUCount string) {
 	gomega.Eventually(verifyJobSetCreated, jobsetTimeout, time.Second).Should(gomega.Succeed())
 }
 
+// VerifySlurmdCPURequest asserts that the slurmd container of the JobSet requests expectedCPU CPUs.
+func VerifySlurmdCPURequest(name, ns, expectedCPU string) {
+	ginkgo.GinkgoHelper()
+
+	ginkgo.By("verifying the slurmd container requests " + expectedCPU + " CPUs")
+	gomega.Eventually(func(g gomega.Gomega) {
+		js, err := JobSet(name, ns)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get JobSet")
+		g.Expect(js.Spec.ReplicatedJobs).To(gomega.HaveLen(1))
+
+		containers := js.Spec.ReplicatedJobs[0].Template.Spec.Template.Spec.Containers
+		var slurmdContainer *corev1.Container
+		for i := range containers {
+			if containers[i].Name == "slurmd" {
+				slurmdContainer = &containers[i]
+				break
+			}
+		}
+		g.Expect(slurmdContainer).NotTo(gomega.BeNil(), "slurmd container not found")
+		cpu := slurmdContainer.Resources.Requests[corev1.ResourceCPU]
+		g.Expect(cpu.String()).To(gomega.Equal(expectedCPU), "slurmd container CPU request mismatch")
+	}, jobsetTimeout, time.Second).Should(gomega.Succeed())
+}
+
 // PatchJobSetCondition artificially merges a status condition into a JobSet's status subresource.
 func PatchJobSetCondition(jobSetName, ns, condType, status, reason, message string) {
 	ginkgo.GinkgoHelper()

@@ -705,6 +705,25 @@ func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int
 	return (tasks + int64(replicas) - 1) / int64(replicas)
 }
 
+// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs per node * --cpus-per-gpu),
+// because slurmrestd reports cpus_per_task=1 even for jobs that use --cpus-per-gpu.
+func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, gpu *resolvedGRES) int64 {
+	cpusPerTask := int64(1)
+	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
+		if n := int64(ptr.Deref(job.CpusPerTask.Number, 0)); n > 0 {
+			cpusPerTask = n
+		}
+	}
+	cpu := cpusPerTask * tasksPerNode
+	if gpu == nil {
+		return cpu
+	}
+	if cpusPerGPU, ok := lookupTres(ptr.Deref(job.CpusPerTres, ""), GRESGPU, gpu.resourceType); ok {
+		cpu = max(cpu, gpu.count*cpusPerGPU)
+	}
+	return cpu
+}
+
 func parseGRES(tresStr string) ([]gresRequest, error) {
 	var reqs []gresRequest
 	if tresStr == "" {
@@ -867,18 +886,7 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 	}
 
 	// Resolve CPUs per pod
-	var cpu int64
-	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
-		cpu = int64(ptr.Deref(job.CpusPerTask.Number, 0)) * tasksPerNode
-	} else if resolvedGPU != nil {
-		if gpuCpus, ok := lookupTres(ptr.Deref(job.CpusPerTres, ""), GRESGPU, resolvedGPU.resourceType); ok {
-			cpu = gpuRequest * gpuCpus
-		} else {
-			cpu = 1 * tasksPerNode
-		}
-	} else {
-		cpu = 1 * tasksPerNode
-	}
+	cpu := resolveCPUsPerPod(job, tasksPerNode, resolvedGPU)
 
 	// Resolve Memory per pod
 	var memCandidates []int64
