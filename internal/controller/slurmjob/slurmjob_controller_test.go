@@ -42,6 +42,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
@@ -2088,6 +2089,68 @@ func newObservedLoggerContext(ctx context.Context) (context.Context, *observer.O
 	return logf.IntoContext(ctx, logger), recorded
 }
 
+func TestRequestLogger(t *testing.T) {
+	tests := []struct {
+		name               string
+		req                *reconcile.Request
+		wantJobID          any
+		wantWorkloadMixing bool
+		wantRequestFields  bool
+	}{
+		{
+			name:              "nil request keeps base logger",
+			req:               nil,
+			wantRequestFields: false,
+		},
+		{
+			name: "valid request adds jobID and workloadMixing",
+			req: &reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: reconNamespace, Name: "slurm-job-" + reconWmName + "-" + reconJobIDStr,
+			}},
+			wantJobID:          reconJobIDStr,
+			wantWorkloadMixing: true,
+			wantRequestFields:  true,
+		},
+		{
+			name: "unparsable request keeps request fields only",
+			req: &reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: reconNamespace, Name: "unrelated-name",
+			}},
+			wantRequestFields: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, recorded := newObservedLoggerContext(t.Context())
+			requestLogger(logf.FromContext(ctx), tc.req).Info("test")
+
+			entries := recorded.All()
+			if len(entries) != 1 {
+				t.Fatalf("Expected 1 log entry, got %d", len(entries))
+			}
+			fields := entries[0].ContextMap()
+
+			if got := fields["jobID"]; got != tc.wantJobID {
+				t.Errorf("Expected jobID %v, got %v", tc.wantJobID, got)
+			}
+			got, hasWM := fields["workloadMixing"]
+			if hasWM != tc.wantWorkloadMixing {
+				t.Errorf("Expected workloadMixing present=%v, got fields %v", tc.wantWorkloadMixing, fields)
+			}
+			if hasWM && (!strings.Contains(fmt.Sprint(got), reconWmName) || !strings.Contains(fmt.Sprint(got), reconNamespace)) {
+				t.Errorf("Expected workloadMixing %s/%s, got %v", reconNamespace, reconWmName, got)
+			}
+			_, hasName := fields["name"]
+			_, hasNamespace := fields["namespace"]
+			_, hasObject := fields["object"]
+			if hasName != tc.wantRequestFields || hasNamespace != tc.wantRequestFields || hasObject != tc.wantRequestFields {
+				t.Errorf("Expected request fields present=%v, got fields %v", tc.wantRequestFields, fields)
+			}
+		})
+	}
+}
+
 func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 	job := newReconTestJob().
 		withNodes(2).
@@ -2115,6 +2178,17 @@ func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 
 	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 1 {
 		t.Errorf("Expected 1 'New Slurm job appeared' log entry on first reconcile, got %d", got)
+	}
+	if got := recorded.FilterMessage("Created Kubernetes JobSet for Slurm job").Len(); got != 1 {
+		t.Errorf("Expected 1 'Created Kubernetes JobSet for Slurm job' log entry on first reconcile, got %d", got)
+	}
+	if got := recorded.FilterMessage("Released hold on Slurm job").Len(); got != 1 {
+		t.Errorf("Expected 1 'Released hold on Slurm job' log entry on first reconcile, got %d", got)
+	}
+	for _, entry := range recorded.All() {
+		if entry.ContextMap()["jobID"] != reconJobIDStr {
+			t.Errorf("Expected log entry %q to carry jobID=%q, got %v", entry.Message, reconJobIDStr, entry.ContextMap())
+		}
 	}
 
 	recorded.TakeAll()

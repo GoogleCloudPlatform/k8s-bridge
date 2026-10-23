@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
@@ -387,6 +388,8 @@ func (e *reconcileTestEnv) reconcile(ctx ...context.Context) (ctrl.Result, error
 		c, cancel = context.WithTimeout(c, e.reconciler.getReconciliationTimeout())
 		defer cancel()
 	}
+	// Mirror controller-runtime, which injects the LogConstructor logger into the Reconcile context.
+	c = logf.IntoContext(c, requestLogger(logf.FromContext(c), &e.req))
 	return e.reconciler.Reconcile(c, e.req)
 }
 
