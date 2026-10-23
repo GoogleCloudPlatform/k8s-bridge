@@ -335,34 +335,6 @@ func setupJobSetTerminalStateTest() (string, string) {
 	return jobID, jobSetName
 }
 
-// verifyJobSetSizing asserts that the translated JobSet creates wantReplicas slurmd pods and
-// that each slurmd container requests wantCPU CPUs and wantMemory memory.
-func verifyJobSetSizing(jobSetName string, wantReplicas int32, wantCPU, wantMemory string) {
-	GinkgoHelper()
-
-	Eventually(func(g Gomega) {
-		js, err := utils.JobSet(jobSetName, slurmNamespace)
-		g.Expect(err).NotTo(HaveOccurred(), "Failed to get JobSet")
-		g.Expect(js.Spec.ReplicatedJobs).To(HaveLen(1))
-		repJob := js.Spec.ReplicatedJobs[0]
-		g.Expect(repJob.Replicas).To(Equal(wantReplicas), "JobSet replicas do not match the requested node count")
-
-		var slurmdContainer *corev1.Container
-		containers := repJob.Template.Spec.Template.Spec.Containers
-		for i := range containers {
-			if containers[i].Name == "slurmd" {
-				slurmdContainer = &containers[i]
-				break
-			}
-		}
-		g.Expect(slurmdContainer).NotTo(BeNil(), "slurmd container not found")
-		g.Expect(slurmdContainer.Resources.Requests.Cpu().String()).To(Equal(wantCPU), "slurmd CPU request mismatch")
-		gotMemory := slurmdContainer.Resources.Requests.Memory()
-		g.Expect(gotMemory.Cmp(resource.MustParse(wantMemory))).To(Equal(0),
-			fmt.Sprintf("slurmd memory request is %s, want %s", gotMemory.String(), wantMemory))
-	}, jobsetTimeout, time.Second).Should(Succeed())
-}
-
 // logSlurmJobNodeFields writes the NumNodes and ReqTRES fields of a Slurm job to the Ginkgo log.
 // For a pending job NumNodes is slurmctld's node_count estimate, while ReqTRES carries the
 // requested node count; logging both shows whether a run exercised a divergence between them.

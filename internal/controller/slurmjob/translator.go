@@ -885,7 +885,6 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 		nodeSelectors = maps.Clone(mapping.NodeSelectors)
 	}
 
-	// Resolve CPUs per pod
 	cpu := resolveCPUsPerPod(job, tasksPerNode, resolvedGPU)
 
 	// Resolve Memory per pod

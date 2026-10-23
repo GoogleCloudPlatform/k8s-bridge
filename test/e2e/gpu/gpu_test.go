@@ -119,7 +119,10 @@ var _ = Describe("GPU Manager", Ordered, func() {
 				jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
 
 				utils.VerifyJobSetCreatedWithGPU(jobSetName, slurmNamespace, jobID, "1")
-				utils.VerifySlurmdCPURequest(jobSetName, slurmNamespace, cpusPerGPU)
+
+				By("verifying the slurmd pod requests the CPUs for --cpus-per-gpu")
+				// Memory: --mem=4096 and the 2048 MiB per CPU fallback both give 4096Mi.
+				utils.VerifyJobSetSizing(jobSetName, slurmNamespace, 1, cpusPerGPU, "4096Mi")
 
 				By("verifying that Slurm allocated the same number of CPUs to the job")
 				utils.NewSlurmJobVerifier(slurmNamespace, jobID).
