@@ -18,7 +18,7 @@ description: >-
 
 ## 1. Preconditions & Inputs
 
-Before modifying API schemas, RBAC markers, or chart templates, or running a pre-PR parity audit, read [references/parity-checklist.md](references/parity-checklist.md) for the source-to-derived parity matrix and known `docs/examples/`, `helm/`, and `Makefile` discrepancies.
+Before modifying API schemas, RBAC markers, or chart templates, or running a pre-PR parity audit, read [references/parity-checklist.md](references/parity-checklist.md) for the source-to-derived parity matrix.
 
 ---
 
@@ -43,7 +43,7 @@ make manifests generate
 ```
 
 ### Step 3: Synchronize Paired Artifacts & Audit Pre-PR Repository Parity
-Walk through every modified row in [references/parity-checklist.md](references/parity-checklist.md) (`helm/templates/clusterrole.yaml`, `cmd/main.go` flags across `config/` and `helm/`, sample/example/testdata `WorkloadMixing` manifests, repository discrepancies, and `make version-sync`).
+Walk through every modified row in [references/parity-checklist.md](references/parity-checklist.md) and synchronize all derived/paired artifacts.
 
 ---
 
