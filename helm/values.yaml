@@ -47,8 +47,6 @@ rbac:
 
 metrics:
   enabled: true
-  serviceMonitor:
-    enabled: false
 
 podAnnotations: {}
 podLabels: {}
