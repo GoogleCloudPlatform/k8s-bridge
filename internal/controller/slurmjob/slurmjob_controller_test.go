@@ -159,6 +159,79 @@ func TestReconcile_JobNotFound_Skipped(t *testing.T) {
 	}
 }
 
+// TestReconcile_SlurmUnavailable_KeepsExistingJobSet checks that the reconciler does not change
+// the JobSet, and does not cancel the job, when it cannot read the job from Slurm. The failed
+// JobSet case matters most: with the job data, the reconciler would cancel the job, delete its
+// dynamic nodes, and delete the JobSet.
+func TestReconcile_SlurmUnavailable_KeepsExistingJobSet(t *testing.T) {
+	slurmStates := []struct {
+		name        string
+		opts        []reconcileEnvOpt
+		getError    error
+		wantErr     string
+		wantRequeue time.Duration
+	}{
+		{
+			name:     "Slurm API returns an error",
+			getError: errors.New("connection refused"),
+			wantErr:  "connection refused",
+		},
+		{
+			name:        "Slurm client not ready",
+			opts:        []reconcileEnvOpt{withWithoutSlurmClient()},
+			wantRequeue: 5 * time.Second,
+		},
+	}
+	jobSets := []struct {
+		name  string
+		build func() *jobsetv1alpha2.JobSet
+	}{
+		{
+			name: "running JobSet",
+			build: func() *jobsetv1alpha2.JobSet {
+				return newReconTestJobSet().withSuspend(false).withSlurmdReplicas(1).build()
+			},
+		},
+		{
+			name: "failed JobSet",
+			build: func() *jobsetv1alpha2.JobSet {
+				return newReconTestJobSet().
+					withSuspend(false).
+					withSlurmdReplicas(1).
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build()
+			},
+		},
+	}
+
+	for _, slurm := range slurmStates {
+		t.Run(slurm.name, func(t *testing.T) {
+			for _, js := range jobSets {
+				t.Run(js.name, func(t *testing.T) {
+					opts := append([]reconcileEnvOpt{withExtraObjects(js.build())}, slurm.opts...)
+					env := newReconcileTestEnv(t, opts...)
+					env.mockSlurm.GetError = slurm.getError
+					before := env.getJobSet()
+
+					res, err := env.reconcile()
+					switch {
+					case slurm.wantErr == "" && err != nil:
+						t.Errorf("Expected no error, got %v", err)
+					case slurm.wantErr != "" && (err == nil || !strings.Contains(err.Error(), slurm.wantErr)):
+						t.Errorf("Expected error containing %q, got %v", slurm.wantErr, err)
+					}
+					if res.RequeueAfter != slurm.wantRequeue {
+						t.Errorf("Expected requeue after %v, got %v", slurm.wantRequeue, res.RequeueAfter)
+					}
+
+					env.verifyJobSetUnchanged(before)
+					env.verifyNoSlurmUpdates()
+				})
+			}
+		})
+	}
+}
+
 func TestReconcile_Idempotency(t *testing.T) {
 	existingJobSet := newTestJobSet("slurm-job-" + reconJobIDStr).build()
 

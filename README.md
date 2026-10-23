@@ -130,6 +130,25 @@ make test
 make test-e2e
 ```
 
+#### Resilience E2E Tests (Dedicated Kind Cluster)
+
+The resilience suite (`test/e2e/resilience`) stops components while a job runs. It checks that the job continues, and that each component manages the job correctly after it starts again. The suite stops the k8s-bridge controller manager and slurmctld. Slurm runs with slurmctld persistence enabled.
+
+The suite runs on its own Kind cluster, `k8s-bridge-e2e-resilience`. Kind writes the credentials of this cluster to `bin/kubeconfig-k8s-bridge-e2e-resilience`, so the current context of `~/.kube/config` does not change.
+
+```sh
+# Create the cluster, run the suite, and delete the cluster
+make test-e2e-resilience
+
+# Run both Kind suites in parallel on separate clusters
+make -j2 test-e2e test-e2e-resilience
+
+# Run the suite again on an existing resilience cluster
+make run-test-e2e-resilience
+```
+
+Each Kind cluster uses inotify instances of the host. If kubelet fails with `too many open files`, raise the limit, for example with `sudo sysctl fs.inotify.max_user_instances=512`. See the [Kind known issues](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files).
+
 #### GPU E2E Tests on a Provided Cluster
 
 The GPU E2E tests run against a cluster provisioned with **1x NVIDIA L4 GPU** (e.g. `g2-standard-4` machine type with `nvidia-l4` accelerator).
