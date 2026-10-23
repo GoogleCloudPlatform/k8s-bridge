@@ -13,10 +13,8 @@
 
 ## 2. Known Discrepancies Across `docs/examples/`, `helm/`, and `Makefile`
 
-When auditing or updating repository manifests and documentation, check for these known discrepancies:
+When auditing or updating repository manifests and documentation, check for this known discrepancy:
 
-1. **`Makefile` vs `gke-gpu-cluster-setup.sh` `GPU_ACCELERATOR_TYPE` default:**
-   - `Makefile` sets `GPU_ACCELERATOR_TYPE ?= nvidia-tesla-t4`, whereas `test/e2e/infra/gke-gpu-cluster-setup.sh` and `README.md` default to `nvidia-l4`.
-2. **Metrics Service Name and Port (`config/` vs `helm/`):**
+1. **Metrics Service Name and Port (`config/` vs `helm/`):**
    - Kustomize (`config/default/`) creates `k8s-bridge-controller-manager-metrics-service` on HTTPS port `8443` (`port: https`).
    - Helm (`helm/templates/metrics-service.yaml`) creates `k8s-bridge-metrics-service` on HTTPS port `8080` (`port: metrics`, because `--metrics-secure` defaults to `true` in `cmd/main.go`).

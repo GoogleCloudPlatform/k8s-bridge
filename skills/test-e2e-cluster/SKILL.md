@@ -23,7 +23,6 @@ Before running or modifying E2E suites, verify:
 ## 2. Guardrails
 
 - **Confirmation gate for GKE GPU cluster creation:** `make test-e2e-gpu` and `make setup-infra-gpu` create billable GKE clusters and GPU node pools via `test/e2e/infra/gpu-cluster-setup.sh`. Obtain user confirmation before running them.
-- **Set `GPU_ACCELERATOR_TYPE=nvidia-l4` in `.env` for GKE GPU tests:** `Makefile` defaults `GPU_ACCELERATOR_TYPE ?= nvidia-tesla-t4` (`n1-standard-4`), whereas `test/e2e/infra/gke-gpu-cluster-setup.sh`, `test/e2e/testdata/workloadmixing_gpu.yaml`, and `test/e2e/gpu/gpu_test.go` require `nvidia-l4` (`g2-standard-4` with `nvidia.com/gpu.product: NVIDIA-L4`). Set `GPU_ACCELERATOR_TYPE=nvidia-l4` in `.env` before running `make test-e2e-gpu`.
 - **Use `ResetSlurmAndK8sState` in `test/utils/slurm.go` for E2E cleanup:** Never force-delete dynamic `slurmd` pods with `--grace-period=0` (see [skills/ops-cleanup-state/SKILL.md](../ops-cleanup-state/SKILL.md)).
 - **Reload Lua `ConfigMap` objects when iterating on `hack/*.lua` in an existing Kind cluster:** If testing `hack/*.lua` changes against an existing Kind E2E cluster without rerunning `BeforeSuite`, reload the Lua ConfigMaps via [skills/dev-slurm-lua/SKILL.md](../dev-slurm-lua/SKILL.md) (Step 2, Option B).
 
