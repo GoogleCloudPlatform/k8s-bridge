@@ -405,9 +405,17 @@ type jobSetVerifier struct {
 	wantSlurmdImage  string
 	wantPreStopHook  []string
 	wantContainers   *int
+	// wantEnv values must be present exactly once on the slurmd container.
+	wantEnv map[string]string
 }
 
 type verifyJobSetOpt func(*jobSetVerifier)
+
+func withEnv(wantEnv map[string]string) verifyJobSetOpt {
+	return func(v *jobSetVerifier) {
+		v.wantEnv = wantEnv
+	}
+}
 
 func wantK8sBridgeLabels(component string) map[string]string {
 	return map[string]string{
@@ -576,6 +584,17 @@ func verifyJobSetOptions(t *testing.T, js *jobsetv1alpha2.JobSet, podSpec *corev
 	}
 	verifyJobSetResources(t, slurmd, v)
 	verifyJobSetLifecycle(t, slurmd, v)
+	for name, wantValue := range v.wantEnv {
+		var gotValues []string
+		for _, env := range slurmd.Env {
+			if env.Name == name {
+				gotValues = append(gotValues, env.Value)
+			}
+		}
+		if diff := cmp.Diff([]string{wantValue}, gotValues); diff != "" {
+			t.Errorf("Translate() returned unexpected slurmd env %s (-want +got):\n%s", name, diff)
+		}
+	}
 	if v.verifyVolume {
 		verifySlurmVolumeAndMount(t, *podSpec, *slurmd)
 	}

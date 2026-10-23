@@ -671,6 +671,169 @@ func TestAppendSlurmdArgs(t *testing.T) {
 	})
 }
 
+func envValues(envs []corev1.EnvVar, name string) []string {
+	var values []string
+	for _, env := range envs {
+		if env.Name == name {
+			values = append(values, env.Value)
+		}
+	}
+	return values
+}
+
+func TestAppendSlurmdArgs_PodResourceEnvs(t *testing.T) {
+	slurmdPodSpec := func(requests corev1.ResourceList, env ...corev1.EnvVar) *corev1.PodSpec {
+		return &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:      ContainerSlurmd,
+					Env:       env,
+					Resources: corev1.ResourceRequirements{Requests: requests},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		requests   corev1.ResourceList
+		wantCPUs   string
+		wantMemory string
+	}{
+		{
+			name: "whole CPUs and MiB from requests",
+			requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			},
+			wantCPUs:   "4",
+			wantMemory: "8192",
+		},
+		{
+			name: "fractional CPUs round up and bytes round down to MiB",
+			requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("1500m"),
+				corev1.ResourceMemory: resource.MustParse("1G"),
+			},
+			wantCPUs:   "2",
+			wantMemory: "953",
+		},
+		{
+			name: "no CPU or memory request gives 0",
+			requests: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+			},
+			wantCPUs:   "0",
+			wantMemory: "0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			podSpec := slurmdPodSpec(tt.requests)
+			if err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, ""); err != nil {
+				t.Fatalf("appendSlurmdArgs() returned unexpected error: %v", err)
+			}
+			c := podSpec.Containers[0]
+			expectedArgs := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testFeatureWithPart}
+			if diff := cmp.Diff(expectedArgs, c.Args); diff != "" {
+				t.Errorf("appendSlurmdArgs() set unexpected args (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff([]string{tt.wantCPUs}, envValues(c.Env, envPodCPUs)); diff != "" {
+				t.Errorf("appendSlurmdArgs() set unexpected %s (-want +got):\n%s", envPodCPUs, diff)
+			}
+			if diff := cmp.Diff([]string{tt.wantMemory}, envValues(c.Env, envPodMemory)); diff != "" {
+				t.Errorf("appendSlurmdArgs() set unexpected %s (-want +got):\n%s", envPodMemory, diff)
+			}
+		})
+	}
+
+	t.Run("ReplacesTemplateValues", func(t *testing.T) {
+		const (
+			templateEnv      = "TEMPLATE_ENV"
+			templateEnvValue = "from-template"
+		)
+		podSpec := slurmdPodSpec(
+			corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			},
+			corev1.EnvVar{Name: templateEnv, Value: templateEnvValue},
+			corev1.EnvVar{Name: envPodCPUs, Value: "99"},
+			corev1.EnvVar{Name: envPodMemory, Value: "1"},
+		)
+		if err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, ""); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		c := podSpec.Containers[0]
+		if diff := cmp.Diff([]string{templateEnvValue}, envValues(c.Env, templateEnv)); diff != "" {
+			t.Errorf("Unexpected %s (-want +got):\n%s", templateEnv, diff)
+		}
+		if diff := cmp.Diff([]string{"4"}, envValues(c.Env, envPodCPUs)); diff != "" {
+			t.Errorf("Unexpected %s (-want +got):\n%s", envPodCPUs, diff)
+		}
+		if diff := cmp.Diff([]string{"8192"}, envValues(c.Env, envPodMemory)); diff != "" {
+			t.Errorf("Unexpected %s (-want +got):\n%s", envPodMemory, diff)
+		}
+	})
+}
+
+// TestAppendSlurmdArgs_ManagedEnvNames fails when appendSlurmdArgs and slurmdManagedEnvNames disagree.
+func TestAppendSlurmdArgs_ManagedEnvNames(t *testing.T) {
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: ContainerSlurmd}}}
+	if err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, ""); err != nil {
+		t.Fatalf("appendSlurmdArgs() returned unexpected error: %v", err)
+	}
+	injected := make(map[string]bool, len(podSpec.Containers[0].Env))
+	for _, env := range podSpec.Containers[0].Env {
+		injected[env.Name] = true
+	}
+	if diff := cmp.Diff(slurmdManagedEnvNames, injected); diff != "" {
+		t.Errorf("appendSlurmdArgs() injected env names differ from slurmdManagedEnvNames (-want +got):\n%s", diff)
+	}
+}
+
+func TestTranslateSlurmJobToJobSet_PodResourceEnvs(t *testing.T) {
+	wmSpec := getTestWMSpec()
+	translator := NewJobSetTranslator()
+	controller := getTestController()
+
+	t.Run("Fallback memory", func(t *testing.T) {
+		// 2 tasks per pod => 4 CPUs and 4 * defaultMemoryPerCPUMB per pod.
+		job := newTestJob().
+			withNodes(2).
+			withTasks(4).
+			withCpusPerTask(2).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 2,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testPartitionHighPrio}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			}),
+			withEnv(map[string]string{envPodCPUs: "4", envPodMemory: "8192"}),
+		)
+	})
+
+	t.Run("Explicit memory request", func(t *testing.T) {
+		job := newTestJob().
+			withCpusPerTask(2).
+			withMemoryPerNode(4096).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 1,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testPartitionHighPrio}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("4096Mi"),
+			}),
+			withEnv(map[string]string{envPodCPUs: "2", envPodMemory: "4096"}),
+		)
+	})
+}
+
 //nolint:goconst // Test deliberately duplicates constant literals for contract verification.
 func TestAppendSlurmdArgs_NodeNameAndEnv(t *testing.T) {
 	t.Run("InjectsDeterministicNodeEnvsAndNodeNameArg", func(t *testing.T) {
@@ -764,14 +927,14 @@ func TestAppendSlurmdArgs_NodeNameAndEnv(t *testing.T) {
 			t.Errorf("Expected last -N value to be %q, got %q", "$(SLURM_NODE_NAME)", lastNodeName)
 		}
 
-		if len(c.Env) != 6 {
-			t.Fatalf("Expected 6 env vars (1 custom + 5 deterministic), got %d: %v", len(c.Env), c.Env)
+		if len(c.Env) != 8 {
+			t.Fatalf("Expected 8 env vars (1 custom + 5 deterministic + 2 resource), got %d: %v", len(c.Env), c.Env)
 		}
 		if c.Env[0].Name != "TEST_INITIAL_ENV" {
 			t.Errorf("Expected TEST_INITIAL_ENV at index 0, got %s", c.Env[0].Name)
 		}
 		// Deterministic env vars must be in order so SLURM_NODE_NAME can reference previous ones
-		expectedOrder := []string{"JOBSET_NAME", "REPLICATED_JOB_NAME", "JOB_INDEX", "POD_INDEX", "SLURM_NODE_NAME"}
+		expectedOrder := []string{"JOBSET_NAME", "REPLICATED_JOB_NAME", "JOB_INDEX", "POD_INDEX", "SLURM_NODE_NAME", "POD_CPUS", "POD_MEMORY"}
 		for i, wantName := range expectedOrder {
 			if c.Env[i+1].Name != wantName {
 				t.Errorf("Expected env at index %d to be %s, got %s", i+1, wantName, c.Env[i+1].Name)

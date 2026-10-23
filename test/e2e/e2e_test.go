@@ -93,22 +93,41 @@ var _ = Describe("Manager", func() {
 		It("should translate Slurm job to JobSet with custom template", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_template.yaml"
 
+			const (
+				expectedCPUs  = 2
+				expectedMemMB = 4096
+			)
+
 			By("applying the WorkloadMixing template CR")
 			utils.ApplyManifestWithCleanup(configPath)
 
 			By("submitting a batch job to Slurm with an explicit --job-name")
 			jobID := utils.NewBatchJobBuilder(slurmNamespace).
 				WithPartition(defaultSlurmPartition).
-				WithCpusPerTask(2).
-				WithMem(4096).
+				WithCpusPerTask(expectedCPUs).
+				WithMem(expectedMemMB).
 				WithWrap("sleep 300").
 				WithArgs("--job-name=E2E_Custom-Template.Job!").
 				Submit()
 			jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+			nodeName := fmt.Sprintf("%s-slurmd-0-0", jobSetName)
 
 			// The job name is lower-cased, invalid label characters are replaced
 			// with "-" and leading/trailing separators are trimmed.
 			verifyJobSetCreatedWithCustomTemplate(jobSetName, jobID, "e2e_custom-template.job")
+
+			By("verifying worker pod is scheduled and running")
+			utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetName, 1, 3*time.Minute)
+
+			By("verifying the job is running on the dynamic node in Slurmctld")
+			utils.NewSlurmJobVerifier(slurmNamespace, jobID).
+				WithState("RUNNING").
+				WithNodeList(nodeName).
+				WithTimeout(3 * time.Minute).
+				Verify()
+
+			By("verifying slurmctld schedules the pod's CPUs and memory on the dynamic node, not the host's")
+			utils.VerifySlurmNodeSchedulableResources(slurmNamespace, nodeName, expectedCPUs, expectedMemMB, 2*time.Minute)
 		})
 
 		It("should size the JobSet from the requested node count when a smaller node is in a static partition", func() {
