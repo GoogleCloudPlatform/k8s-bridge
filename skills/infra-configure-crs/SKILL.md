@@ -67,7 +67,7 @@ Apply the `WorkloadMixing` manifest for your scenario from Section 1 (delete any
 *(Stop here and proceed to Section 4 Verification when configuring partitions or CRs. Run Step 4 only when asked to remove the CRs and Slurm release.)*
 
 ### Step 4: CR & Slurm Release Teardown (Run ONLY When Requested to Remove CRs)
-Get user confirmation before deleting CRs or uninstalling releases. Delete all `WorkloadMixing` CRs first and wait until `kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge` returns no resources (so `JobSet` finalizers complete; see `ops-cleanup-state` if stuck) before uninstalling the `slurm` Helm release, Kueue/`ComputeClass` CRs, or base operators (`infra-deploy-stack`; see cleanup sections in [docs/quickstart.md](../../docs/quickstart.md), [docs/existing-infra.md](../../docs/existing-infra.md), and [docs/gke/ccc.md](../../docs/gke/ccc.md)).
+Get user confirmation before deleting CRs or uninstalling releases. Delete all `WorkloadMixing` CRs first and wait until `kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge` returns no resources (so `JobSet` finalizers complete; see `ops-cleanup-state` if stuck) before uninstalling the `slurm` Helm release, Kueue/`ComputeClass` CRs, or base operators (`infra-deploy-stack`).
 
 ---
 

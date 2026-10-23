@@ -223,12 +223,12 @@ Delete the tutorial resources:
 
 ```bash
 kubectl delete -f docs/examples/quickstart/workloadmixing.yaml
-kubectl delete -f docs/examples/ccc/kueue-resources.yaml
-kubectl delete -f docs/examples/ccc/computeclass.yaml
 
-# Wait until this returns no resources before uninstalling k8s-bridge
+# Wait until this returns no resources before deleting Kueue/ComputeClass CRs or uninstalling k8s-bridge
 kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
 
+kubectl delete -f docs/examples/ccc/kueue-resources.yaml
+kubectl delete -f docs/examples/ccc/computeclass.yaml
 helm uninstall k8s-bridge -n k8s-bridge-system
 helm uninstall slurm -n slurm
 ```
