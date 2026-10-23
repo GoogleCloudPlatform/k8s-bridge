@@ -21,6 +21,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -36,9 +38,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
@@ -47,7 +51,11 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 	slurmapi "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
+	slurmclientinterceptor "github.com/SlinkyProject/slurm-client/pkg/client/interceptor"
+	"github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	uberzap "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -452,11 +460,204 @@ func TestReconcile_DeletingJobSet_CancelsSlurmJob(t *testing.T) {
 				env.verifySlurmCancellation(tc.wantCancelReason)
 			}
 
+			env.verifyJobSetNotFound()
+
 			if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+tc.wantFailedDelta {
 				t.Errorf("Expected JobsSync(jobset_failed) delta %f, got %f", tc.wantFailedDelta, got-initFailed)
 			}
 		})
 	}
+}
+
+func TestReconcile_DeletingJobSet_FinalizerAndDynamicNodes(t *testing.T) {
+	const (
+		dynamicNode0 = "slurm-job-12345-slurmd-0-0"
+		dynamicNode1 = "slurm-job-12345-slurmd-1-0"
+	)
+
+	t.Run("JobSet deleted during slurmrestd outage cleans up dynamic nodes and removes finalizer once job is COMPLETED", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		completedJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateCOMPLETED).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withPendingSlurmJobs(completedJob),
+		)
+
+		// 1. Simulate slurmrestd outage when the JobSet deletion watch event first arrives
+		env.mockSlurm.GetError = errors.New("connection refused")
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error during slurmrestd outage, got nil")
+		}
+
+		// Finalizer must keep the JobSet in Kubernetes so cleanup is not lost
+		env.verifyJobSetHasFinalizer()
+		env.verifyNoSlurmUpdates()
+
+		// 2. slurmrestd recovers and reports the Slurm job is now COMPLETED
+		env.mockSlurm.GetError = nil
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected second reconcile to succeed after slurmrestd recovery, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+	})
+
+	t.Run("Transient dynamic node deletion error on deleting JobSet retains finalizer for retry", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		runningJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withPendingSlurmJobs(runningJob),
+		)
+		env.mockSlurm.DeleteNodeError = errors.New("Nodes busy")
+
+		initFailed := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed)
+
+		// 1. First reconcile cancels the RUNNING Slurm job, fails node deletion, and retains the finalizer
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error when dynamic node deletion fails with Nodes busy, got nil")
+		}
+		env.verifySlurmCancellation(ReasonJobSetMissing)
+		env.verifyJobSetHasFinalizer()
+
+		// 2. On retry, the Slurm job is now CANCELLED and nodes are no longer busy
+		cancelledJob := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateCANCELLED).
+			withHold(false).
+			withTranslatedJobMarkers().
+			build()
+		env.mockSlurm.SetPendingJobs(reconPartitionName, []slurmclienttypes.V0044JobInfo{*cancelledJob})
+		env.mockSlurm.DeleteNodeError = nil
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected retry reconcile to succeed, got: %v", err)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1, dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+
+		if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonJobSetFailed); got != initFailed+1 {
+			t.Errorf("Expected JobsSync(jobset_failed) delta 1 across retries, got %f", got-initFailed)
+		}
+	})
+
+	t.Run("Deleting JobSet when Slurm job is purged (NotFound) cleans up dynamic nodes and removes finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(2).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(deletingJS))
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected no error when Slurm job is NotFound for deleting JobSet, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifySlurmNodesDeleted(dynamicNode0, dynamicNode1)
+		env.verifyJobSetNotFound()
+	})
+
+	t.Run("Deleting JobSet when parent WorkloadMixing is NotFound removes finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(deletingJS))
+		if err := env.baseClient.Delete(t.Context(), env.wm); err != nil {
+			t.Fatalf("Failed to delete WorkloadMixing: %v", err)
+		}
+
+		res, err := env.reconcile()
+		if err != nil {
+			t.Fatalf("Expected no error when WorkloadMixing is NotFound for deleting JobSet, got: %v", err)
+		}
+		if res != (ctrl.Result{}) {
+			t.Errorf("Expected empty result, got %v", res)
+		}
+
+		env.verifyJobSetNotFound()
+		env.verifyNoSlurmUpdates()
+	})
+
+	t.Run("Live JobSet keeps finalizer when Slurm job is purged (NotFound)", func(t *testing.T) {
+		liveJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			build()
+
+		env := newReconcileTestEnv(t, withExtraObjects(liveJS))
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected no error when Slurm job is NotFound for live JobSet, got: %v", err)
+		}
+
+		want := jobSetState{Exists: true, Deleting: false, Finalizers: []string{FinalizerJobSet}}
+		if diff := cmp.Diff(want, getJobSetState(t, env.baseClient, env.jobSetKey)); diff != "" {
+			t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+		}
+		env.verifySlurmNodesDeleted()
+	})
+
+	t.Run("Finalizer patch failure returns error and keeps the finalizer", func(t *testing.T) {
+		deletingJS := newReconTestJobSet().
+			withSuspend(false).
+			withSlurmdReplicas(1).
+			withDeletionTimestamp().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(deletingJS),
+			withInterceptors(interceptor.Funcs{
+				Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
+					return errors.New("apiserver unavailable")
+				},
+			}),
+		)
+		env.mockSlurm.GetError = errors.New("[Not Found, Invalid job id specified]")
+
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Expected error when the finalizer patch fails, got nil")
+		}
+
+		want := jobSetState{Exists: true, Deleting: true, Finalizers: []string{FinalizerJobSet}}
+		if diff := cmp.Diff(want, getJobSetState(t, env.baseClient, env.jobSetKey)); diff != "" {
+			t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+		}
+	})
 }
 
 func TestReconcile_InformerCacheLag_DoesNotCancelNewlyTranslatedJob(t *testing.T) {
@@ -699,6 +900,48 @@ func TestReconcile_Graceful_MissingClient(t *testing.T) {
 	logOutput := buf.String()
 	if !strings.Contains(logOutput, "Slurm client not found in ClientMap") {
 		t.Errorf("Expected log message about missing client not found: %s", logOutput)
+	}
+}
+
+func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
+	tests := []struct {
+		name             string
+		opts             []reconcileEnvOpt
+		wantRequeueAfter time.Duration
+		wantJobSet       jobSetState
+	}{
+		{
+			name:             "retains finalizer while Slurm Controller exists",
+			wantRequeueAfter: 5 * time.Second,
+			wantJobSet:       jobSetState{Exists: true, Deleting: true, Finalizers: []string{FinalizerJobSet}},
+		},
+		{
+			name:             "releases finalizer without requeue when Slurm Controller is gone",
+			opts:             []reconcileEnvOpt{withWithoutController()},
+			wantRequeueAfter: 0,
+			wantJobSet:       jobSetState{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append([]reconcileEnvOpt{
+				withWithoutSlurmClient(),
+				withExtraObjects(newReconTestJobSet().withDeletionTimestamp().build()),
+			}, tc.opts...)
+			env := newReconcileTestEnv(t, opts...)
+
+			res, err := env.reconcile()
+			if err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if res.RequeueAfter != tc.wantRequeueAfter {
+				t.Errorf("Expected requeue after %v, got %v", tc.wantRequeueAfter, res.RequeueAfter)
+			}
+			if diff := cmp.Diff(tc.wantJobSet, getJobSetState(t, env.baseClient, env.jobSetKey), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -1047,56 +1290,54 @@ func TestCancelJobWithComment_PartConfigUnavailable422_DoesNotLogError(t *testin
 	}
 }
 
-func TestReconcile_ExplicitHold_SuspendsExistingJobSet(t *testing.T) {
-	js := newReconTestJobSet().
-		withSuspend(false).
-		build()
-
-	job := newReconTestJob().
-		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-		withHold(true).
-		withStateReason("JobHeldUser").
-		build()
-
-	env := newReconcileTestEnv(t,
-		withExtraObjects(js),
-		withPendingSlurmJobs(job),
-	)
-
-	_, err := env.reconcile()
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+func TestReconcile_ExplicitHold_DoesNotMutateExistingJobSetOrUnhold(t *testing.T) {
+	tests := []struct {
+		name        string
+		stateReason string
+		comment     string
+	}{
+		{
+			name:        "user hold without auto-hold marker",
+			stateReason: ReasonJobHeldUser,
+		},
+		{
+			name:        "admin hold",
+			stateReason: ReasonJobHeldAdmin,
+		},
+		{
+			name:        "admin hold with auto-hold marker",
+			stateReason: ReasonJobHeldAdmin,
+			comment:     AutoHoldMarker,
+		},
 	}
 
-	env.verifyJobSetSuspended(true, true)
-	env.verifyNoSlurmUpdates()
-}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := newReconTestJobSet().
+				withSuspend(false).
+				build()
 
-func TestReconcile_ExplicitHold_Removed_ResumesJobSet(t *testing.T) {
-	js := newReconTestJobSet().
-		withAnnotations(map[string]string{
-			AnnotationSuspendedBySlurmHold: ValueTrue,
-		}).
-		withSuspend(true).
-		build()
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(true).
+				withStateReason(tc.stateReason).
+				withComment(tc.comment).
+				build()
 
-	job := newReconTestJob().
-		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-		withHold(false).
-		withStateReason("None").
-		build()
+			env := newReconcileTestEnv(t,
+				withExtraObjects(js),
+				withPendingSlurmJobs(job),
+			)
 
-	env := newReconcileTestEnv(t,
-		withExtraObjects(js),
-		withPendingSlurmJobs(job),
-	)
+			before := env.getJobSet()
+			if _, err := env.reconcile(); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
 
-	_, err := env.reconcile()
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
+			env.verifyJobSetUnchanged(before)
+			env.verifyNoSlurmUpdates()
+		})
 	}
-
-	env.verifyJobSetSuspended(false, false)
 }
 
 func TestReconcile_SuspendedJobSet_DoesNotReleaseHold(t *testing.T) {
@@ -1155,7 +1396,7 @@ func TestReconcile_Preempted_PreservesJobSet(t *testing.T) {
 	}
 }
 
-func TestReconcile_SuspendedJobSet_WithoutAnnotation_NotResumed(t *testing.T) {
+func TestReconcile_SuspendedJobSet_UnheldJob_NotResumedByBridge(t *testing.T) {
 	js := newReconTestJobSet().
 		withSuspend(true).
 		build()
@@ -1171,12 +1412,13 @@ func TestReconcile_SuspendedJobSet_WithoutAnnotation_NotResumed(t *testing.T) {
 		withPendingSlurmJobs(job),
 	)
 
-	_, err := env.reconcile()
-	if err != nil {
+	before := env.getJobSet()
+	if _, err := env.reconcile(); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifyJobSetSuspended(true, false)
+	env.verifyJobSetUnchanged(before)
+	env.verifyNoSlurmUpdates()
 }
 
 func TestReconcile_ReleaseHold_PreservesExistingComment(t *testing.T) {
@@ -1847,6 +2089,68 @@ func newObservedLoggerContext(ctx context.Context) (context.Context, *observer.O
 	return logf.IntoContext(ctx, logger), recorded
 }
 
+func TestRequestLogger(t *testing.T) {
+	tests := []struct {
+		name               string
+		req                *reconcile.Request
+		wantJobID          any
+		wantWorkloadMixing bool
+		wantRequestFields  bool
+	}{
+		{
+			name:              "nil request keeps base logger",
+			req:               nil,
+			wantRequestFields: false,
+		},
+		{
+			name: "valid request adds jobID and workloadMixing",
+			req: &reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: reconNamespace, Name: "slurm-job-" + reconWmName + "-" + reconJobIDStr,
+			}},
+			wantJobID:          reconJobIDStr,
+			wantWorkloadMixing: true,
+			wantRequestFields:  true,
+		},
+		{
+			name: "unparsable request keeps request fields only",
+			req: &reconcile.Request{NamespacedName: types.NamespacedName{
+				Namespace: reconNamespace, Name: "unrelated-name",
+			}},
+			wantRequestFields: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, recorded := newObservedLoggerContext(t.Context())
+			requestLogger(logf.FromContext(ctx), tc.req).Info("test")
+
+			entries := recorded.All()
+			if len(entries) != 1 {
+				t.Fatalf("Expected 1 log entry, got %d", len(entries))
+			}
+			fields := entries[0].ContextMap()
+
+			if got := fields["jobID"]; got != tc.wantJobID {
+				t.Errorf("Expected jobID %v, got %v", tc.wantJobID, got)
+			}
+			got, hasWM := fields["workloadMixing"]
+			if hasWM != tc.wantWorkloadMixing {
+				t.Errorf("Expected workloadMixing present=%v, got fields %v", tc.wantWorkloadMixing, fields)
+			}
+			if hasWM && (!strings.Contains(fmt.Sprint(got), reconWmName) || !strings.Contains(fmt.Sprint(got), reconNamespace)) {
+				t.Errorf("Expected workloadMixing %s/%s, got %v", reconNamespace, reconWmName, got)
+			}
+			_, hasName := fields["name"]
+			_, hasNamespace := fields["namespace"]
+			_, hasObject := fields["object"]
+			if hasName != tc.wantRequestFields || hasNamespace != tc.wantRequestFields || hasObject != tc.wantRequestFields {
+				t.Errorf("Expected request fields present=%v, got fields %v", tc.wantRequestFields, fields)
+			}
+		})
+	}
+}
+
 func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 	job := newReconTestJob().
 		withNodes(2).
@@ -1874,6 +2178,17 @@ func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 
 	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 1 {
 		t.Errorf("Expected 1 'New Slurm job appeared' log entry on first reconcile, got %d", got)
+	}
+	if got := recorded.FilterMessage("Created Kubernetes JobSet for Slurm job").Len(); got != 1 {
+		t.Errorf("Expected 1 'Created Kubernetes JobSet for Slurm job' log entry on first reconcile, got %d", got)
+	}
+	if got := recorded.FilterMessage("Released hold on Slurm job").Len(); got != 1 {
+		t.Errorf("Expected 1 'Released hold on Slurm job' log entry on first reconcile, got %d", got)
+	}
+	for _, entry := range recorded.All() {
+		if entry.ContextMap()["jobID"] != reconJobIDStr {
+			t.Errorf("Expected log entry %q to carry jobID=%q, got %v", entry.Message, reconJobIDStr, entry.ContextMap())
+		}
 	}
 
 	recorded.TakeAll()
@@ -1969,4 +2284,526 @@ func TestReconcile_EmptyWMName_SkipsWithoutNewJobLog(t *testing.T) {
 	if got := recorded.FilterMessage("New Slurm job appeared").Len(); got != 0 {
 		t.Errorf("Did not expect 'New Slurm job appeared' when WorkloadMixing name is empty, got %d", got)
 	}
+}
+
+func assertContextBoundedBySlurmTimeout(t *testing.T, ctx context.Context, op string) {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Errorf("Expected context passed to %s to have a deadline", op)
+		return
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > defaultSlurmCallTimeout {
+		t.Errorf("Expected %s context deadline within (0, %v], got %v", op, defaultSlurmCallTimeout, remaining)
+	}
+}
+
+func TestReconcile_SlurmCallContextDeadlines(t *testing.T) {
+	t.Run("fetchState Get and releaseHold Update set per-call timeout", func(t *testing.T) {
+		job := newReconTestJob().
+			withNodes(2).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+		var getCalled, updateCalled bool
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Get: func(ctx context.Context, key object.ObjectKey, obj object.Object, opts ...slurmclient.GetOption) error {
+				getCalled = true
+				assertContextBoundedBySlurmTimeout(t, ctx, "Get")
+				return env.mockSlurm.Get(ctx, key, obj, opts...)
+			},
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				updateCalled = true
+				assertContextBoundedBySlurmTimeout(t, ctx, "releaseHold Update")
+				return env.mockSlurm.Update(ctx, obj, req, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !getCalled {
+			t.Error("Expected Slurm Get to be called")
+		}
+		if !updateCalled {
+			t.Error("Expected Slurm Update to be called for releaseHold")
+		}
+	})
+
+	t.Run("cancelJobWithComment Update and Delete set independent per-call timeouts", func(t *testing.T) {
+		completedJobSet := newReconTestJobSet().
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+
+		var updateCalled, deleteCalled bool
+		var updateCtxCaptured context.Context
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				updateCalled = true
+				updateCtxCaptured = ctx
+				assertContextBoundedBySlurmTimeout(t, ctx, "cancelJobWithComment Update")
+				return env.mockSlurm.Update(ctx, obj, req, opts...)
+			},
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				deleteCalled = true
+				if updateCtxCaptured == nil || updateCtxCaptured.Err() == nil {
+					t.Error("Expected Update context to be cancelled before Delete is invoked")
+				}
+				assertContextBoundedBySlurmTimeout(t, ctx, "cancelJobWithComment Delete")
+				return env.mockSlurm.Delete(ctx, obj, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Reconcile failed: %v", err)
+		}
+		if !updateCalled {
+			t.Error("Expected Slurm Update to be called for comment")
+		}
+		if !deleteCalled {
+			t.Error("Expected Slurm Delete to be called for job cancellation")
+		}
+	})
+}
+
+func TestReconcile_SlurmCallTimeout_BlockedCallsAbort(t *testing.T) {
+	const testCallTimeout = 10 * time.Millisecond
+
+	t.Run("fetchState Get aborts with DeadlineExceeded when server hangs", func(t *testing.T) {
+		env := newReconcileTestEnv(t)
+		env.reconciler.slurmCallTimeout = testCallTimeout
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Get: func(ctx context.Context, key object.ObjectKey, obj object.Object, opts ...slurmclient.GetOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("releaseHold Update aborts with DeadlineExceeded when server hangs", func(t *testing.T) {
+		job := newReconTestJob().
+			withNodes(1).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+		env.reconciler.slurmCallTimeout = testCallTimeout
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("cancelJobWithComment Update timeout still allows Delete to succeed", func(t *testing.T) {
+		completedJobSet := newReconTestJobSet().
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+		env.reconciler.slurmCallTimeout = testCallTimeout
+
+		var deleteCalled bool
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				deleteCalled = true
+				deadline, ok := ctx.Deadline()
+				if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > testCallTimeout {
+					t.Errorf("Expected Delete context to have fresh deadline within (0, %v]", testCallTimeout)
+				}
+				return env.mockSlurm.Delete(ctx, obj, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		if _, err := env.reconcile(); err != nil {
+			t.Fatalf("Expected Reconcile to succeed when only comment Update times out, got: %v", err)
+		}
+		if !deleteCalled {
+			t.Fatal("Expected Delete to be called after Update timed out")
+		}
+	})
+
+	t.Run("cancelJobWithComment Delete aborts with DeadlineExceeded when server hangs", func(t *testing.T) {
+		completedJobSet := newReconTestJobSet().
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+		env.reconciler.slurmCallTimeout = testCallTimeout
+
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("real slurmclient aborts over HTTP when server hangs", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		}))
+		defer srv.Close()
+
+		realClient, err := slurmclient.NewClient(&slurmclient.Config{
+			Server:    srv.URL,
+			AuthToken: "test-token",
+		}, &slurmclient.ClientOptions{
+			DisableFor: []object.Object{
+				&slurmclienttypes.V0044JobInfo{},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Failed to create real slurmclient: %v", err)
+		}
+
+		env := newReconcileTestEnv(t)
+		env.reconciler.slurmCallTimeout = 50 * time.Millisecond
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, realClient)
+
+		_, err = env.reconcile()
+		if err == nil {
+			t.Fatal("Expected Reconcile to fail when HTTP server hangs, got nil")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("reconciliationTimeout short-circuits multi-node cleanupDynamicNodes when server hangs", func(t *testing.T) {
+		const totalNodes = 20
+		completedJobSet := newReconTestJobSet().
+			withSlurmdReplicas(totalNodes).
+			withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+			build()
+
+		job := newReconTestJob().
+			withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+			withHold(false).
+			build()
+
+		env := newReconcileTestEnv(t,
+			withExtraObjects(completedJobSet),
+			withPendingSlurmJobs(job),
+		)
+		env.reconciler.slurmCallTimeout = 15 * time.Millisecond
+		env.reconciler.reconciliationTimeout = 35 * time.Millisecond
+
+		var nodeDeleteAttempts int
+		wrappedClient := slurmclientinterceptor.NewClient(env.mockSlurm, slurmclientinterceptor.Funcs{
+			Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+				if _, ok := obj.(*slurmclienttypes.V0044Node); ok {
+					nodeDeleteAttempts++
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return env.mockSlurm.Delete(ctx, obj, opts...)
+			},
+		})
+		env.clientMap.Add(t.Context(), types.NamespacedName{Namespace: reconNamespace, Name: reconControllerName}, wrappedClient)
+
+		_, err := env.reconcile()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Expected error wrapping context.DeadlineExceeded, got: %v", err)
+		}
+		if nodeDeleteAttempts == 0 || nodeDeleteAttempts >= totalNodes {
+			t.Errorf("Expected reconciliationTimeout to short-circuit node cleanup before all %d nodes were attempted, got %d attempts", totalNodes, nodeDeleteAttempts)
+		}
+	})
+}
+
+func TestJobSetWatchPredicate(t *testing.T) {
+	pred := jobSetWatchPredicate()
+
+	t.Run("Create", func(t *testing.T) {
+		tests := []struct {
+			name string
+			obj  *jobsetv1alpha2.JobSet
+			want bool
+		}{
+			{
+				name: "Nil object is ignored",
+				obj:  nil,
+				want: false,
+			},
+			{
+				name: "Newly created suspended non-terminal JobSet is ignored",
+				obj:  newReconTestJobSet().withSuspend(true).build(),
+				want: false,
+			},
+			{
+				name: "Unsuspended JobSet is allowed",
+				obj:  newReconTestJobSet().withSuspend(false).build(),
+				want: true,
+			},
+			{
+				name: "Completed JobSet is allowed",
+				obj: newReconTestJobSet().
+					withSuspend(true).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name: "Failed JobSet is allowed",
+				obj: newReconTestJobSet().
+					withSuspend(true).
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name: "Deleting suspended JobSet is allowed",
+				obj: newReconTestJobSet().
+					withSuspend(true).
+					withDeletionTimestamp().
+					build(),
+				want: true,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got := pred.Create(event.TypedCreateEvent[*jobsetv1alpha2.JobSet]{Object: tc.obj})
+				if got != tc.want {
+					t.Errorf("Create() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			oldObj *jobsetv1alpha2.JobSet
+			newObj *jobsetv1alpha2.JobSet
+			want   bool
+		}{
+			{
+				name:   "Nil ObjectOld is ignored",
+				oldObj: nil,
+				newObj: newReconTestJobSet().build(),
+				want:   false,
+			},
+			{
+				name:   "Nil ObjectNew is ignored",
+				oldObj: newReconTestJobSet().build(),
+				newObj: nil,
+				want:   false,
+			},
+			{
+				name:   "Non-terminal status replica update is ignored",
+				oldObj: newReconTestJobSet().withSuspend(false).build(),
+				newObj: func() *jobsetv1alpha2.JobSet {
+					js := newReconTestJobSet().withSuspend(false).build()
+					js.Status.ReplicatedJobsStatus = []jobsetv1alpha2.ReplicatedJobStatus{
+						{Name: ContainerSlurmd, Ready: 2, Active: 2},
+					}
+					return js
+				}(),
+				want: false,
+			},
+			{
+				name: "Transition to JobSetCompleted condition is allowed",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					build(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name: "Transition to JobSetFailed condition is allowed",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					build(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build(),
+				want: true,
+			},
+			{
+				name:   "Transition in spec.suspend is allowed",
+				oldObj: newReconTestJobSet().withSuspend(true).build(),
+				newObj: newReconTestJobSet().withSuspend(false).build(),
+				want:   true,
+			},
+			{
+				name:   "Transition in deletionTimestamp on non-terminal JobSet is allowed",
+				oldObj: newReconTestJobSet().withSuspend(false).build(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withDeletionTimestamp().
+					build(),
+				want: true,
+			},
+			{
+				name: "Transition in deletionTimestamp on terminal JobSet carrying FinalizerJobSet is allowed",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				newObj: newReconTestJobSet().
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					withDeletionTimestamp().
+					build(),
+				want: true,
+			},
+			{
+				name: "Transition in deletionTimestamp on terminal JobSet without FinalizerJobSet is ignored",
+				oldObj: newReconTestJobSet().
+					withFinalizers(testFinalizer).
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				newObj: newReconTestJobSet().
+					withFinalizers(testFinalizer).
+					withSuspend(false).
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					withDeletionTimestamp().
+					build(),
+				want: false,
+			},
+			{
+				name: "Subsequent status update on already-deleting JobSet is ignored",
+				oldObj: newReconTestJobSet().
+					withSuspend(false).
+					withDeletionTimestamp().
+					build(),
+				newObj: func() *jobsetv1alpha2.JobSet {
+					js := newReconTestJobSet().
+						withSuspend(false).
+						withDeletionTimestamp().
+						build()
+					js.Status.ReplicatedJobsStatus = []jobsetv1alpha2.ReplicatedJobStatus{
+						{Name: ContainerSlurmd, Ready: 0, Active: 1},
+					}
+					return js
+				}(),
+				want: false,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got := pred.Update(event.TypedUpdateEvent[*jobsetv1alpha2.JobSet]{
+					ObjectOld: tc.oldObj,
+					ObjectNew: tc.newObj,
+				})
+				if got != tc.want {
+					t.Errorf("Update() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		tests := []struct {
+			name string
+			obj  *jobsetv1alpha2.JobSet
+			want bool
+		}{
+			{
+				name: "Nil Object is ignored",
+				obj:  nil,
+				want: false,
+			},
+			{
+				name: "Non-terminal JobSet is allowed",
+				obj:  newReconTestJobSet().build(),
+				want: true,
+			},
+			{
+				name: "Completed JobSet is ignored",
+				obj: newReconTestJobSet().
+					withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+					build(),
+				want: false,
+			},
+			{
+				name: "Failed JobSet is ignored",
+				obj: newReconTestJobSet().
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build(),
+				want: false,
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				got := pred.Delete(event.TypedDeleteEvent[*jobsetv1alpha2.JobSet]{Object: tc.obj})
+				if got != tc.want {
+					t.Errorf("Delete() = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("Generic", func(t *testing.T) {
+		js := newReconTestJobSet().build()
+		if pred.Generic(event.TypedGenericEvent[*jobsetv1alpha2.JobSet]{Object: js}) {
+			t.Errorf("Generic() = true, want false")
+		}
+	})
 }

@@ -59,9 +59,21 @@ To remove the WorkloadMixing configurations:
 kubectl delete -f config/samples/k8s-bridge_v1alpha1_workloadmixing.yaml
 ```
 
+JobSets created by `k8s-bridge` carry the `k8s-bridge.x-k8s.io/slurm-node-cleanup` finalizer. A deleted JobSet stays `Terminating`, and its Pods keep running, until `k8s-bridge` deregisters its dynamic Slurm nodes. Before uninstalling, wait until this returns no resources:
+```sh
+kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
+```
+
 To uninstall the controller:
 ```sh
 helm uninstall k8s-bridge --namespace k8s-bridge-system
+```
+
+If no running `k8s-bridge` manages a JobSet anymore (uninstalled, rolled back to a version without the finalizer, or WorkloadMixing deleted with `--cascade=orphan`), remove only this finalizer:
+```sh
+kubectl get jobset <name> -n <namespace> -o json \
+  | jq '.metadata.finalizers -= ["k8s-bridge.x-k8s.io/slurm-node-cleanup"]' \
+  | kubectl replace -f -
 ```
 
 ## Metrics & Monitoring

@@ -66,6 +66,7 @@ spec:
           {{- else }}
           - --metrics-bind-address=0
           {{- end }}
+          - --zap-log-level={{ .Values.manager.logLevel }}
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         name: manager

@@ -25,6 +25,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -50,6 +52,7 @@ import (
 	slurmclientinterceptor "github.com/SlinkyProject/slurm-client/pkg/client/interceptor"
 	"github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
+	slinkyv1beta1 "github.com/SlinkyProject/slurm-operator/api/v1beta1"
 )
 
 const (
@@ -1073,7 +1076,7 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup_WhenAlreadyDele
 			Name:              testJobSet103Name,
 			Namespace:         testNamespace,
 			DeletionTimestamp: &now,
-			Finalizers:        []string{testFinalizer},
+			Finalizers:        []string{FinalizerJobSet},
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
 			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
@@ -1124,6 +1127,75 @@ func TestJobTeardownReconciler_HandleTeardown_DynamicNodeCleanup_WhenAlreadyDele
 	// Dynamic nodes must still be cleaned up in Slurm even if JobSet has DeletionTimestamp
 	if nodeDeleteCalls != 2 {
 		t.Errorf("Expected 2 node delete calls for already deleting JobSet, got %d", nodeDeleteCalls)
+	}
+
+	// Verify FinalizerJobSet was removed and the terminating JobSet is now fully deleted
+	checkJS := &jobsetv1alpha2.JobSet{}
+	getErr := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: testNamespace, Name: testJobSet103Name}, checkJS)
+	if !apierrors.IsNotFound(getErr) {
+		t.Errorf("Expected terminating JobSet to be deleted after finalizer removal, got: %v", getErr)
+	}
+}
+
+func TestJobTeardownReconciler_HandleTeardown_MissingSlurmClient(t *testing.T) {
+	const controllerName = "missing-client-controller"
+
+	tests := []struct {
+		name       string
+		extraObjs  []client.Object
+		wantErr    bool
+		wantJobSet jobSetState
+	}{
+		{
+			name: "retains finalizer and does not delete JobSet while Slurm Controller exists",
+			extraObjs: []client.Object{&slinkyv1beta1.Controller{
+				ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: testNamespace},
+			}},
+			wantErr:    true,
+			wantJobSet: jobSetState{Exists: true, Deleting: false, Finalizers: []string{FinalizerJobSet}},
+		},
+		{
+			name:       "releases finalizer and deletes JobSet when Slurm Controller is gone",
+			wantJobSet: jobSetState{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			_ = k8sbridgev1alpha1.AddToScheme(scheme)
+			_ = jobsetv1alpha2.AddToScheme(scheme)
+			_ = slinkyv1beta1.AddToScheme(scheme)
+
+			wm := newTestWorkloadMixing(reconWmName, controllerName, "", "")
+			js := newTestJobSet(testJobSet101Name).
+				withNamespace(testNamespace).
+				withFinalizers(FinalizerJobSet).
+				withSlurmdReplicas(1).
+				build()
+
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm, js}, tc.extraObjs...)...).Build()
+			reconciler := &JobTeardownReconciler{
+				Client:    fakeClient,
+				ClientMap: clientmap.NewClientMap(),
+			}
+
+			ev := slurmtypes.SlurmJobTeardownEvent{
+				JobID:          "101",
+				WorkloadMixing: client.ObjectKeyFromObject(wm),
+				Partition:      testBatchPartition,
+				Reason:         metrics.ReasonJobCompleted,
+			}
+
+			err := reconciler.handleTeardown(t.Context(), ev)
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("handleTeardown() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if diff := cmp.Diff(tc.wantJobSet, getJobSetState(t, fakeClient, client.ObjectKeyFromObject(js)), cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("JobSet state mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -1246,5 +1318,87 @@ func TestCleanupDynamicNodes_ContextCancelled(t *testing.T) {
 	}
 	if callCount > 0 {
 		t.Errorf("Expected 0 delete calls when context is pre-cancelled, got %d", callCount)
+	}
+}
+
+func TestJobTeardownReconciler_HandleTeardown_ReconciliationTimeoutShortCircuitsNodeCleanup(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	const (
+		testCtrlName = "slurmctld-controller-timeout"
+		totalNodes   = 20
+	)
+	wm := &k8sbridgev1alpha1.WorkloadMixing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      reconWmName,
+			Namespace: testNamespace,
+		},
+		Spec: k8sbridgev1alpha1.WorkloadMixingSpec{
+			ControllerRef: corev1.LocalObjectReference{
+				Name: testCtrlName,
+			},
+		},
+	}
+
+	js := &jobsetv1alpha2.JobSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobSet101Name,
+			Namespace: testNamespace,
+			Labels: map[string]string{
+				LabelSlurmJobID:     "101",
+				LabelSlurmPartition: testBatchPartition,
+			},
+		},
+		Spec: jobsetv1alpha2.JobSetSpec{
+			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
+				{
+					Name:     ContainerSlurmd,
+					Replicas: totalNodes,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
+
+	var nodeDeleteAttempts int
+	fakeSlurm := slurmclientfake.NewClientBuilder().WithInterceptorFuncs(slurmclientinterceptor.Funcs{
+		Delete: func(ctx context.Context, obj object.Object, opts ...slurmclient.DeleteOption) error {
+			nodeDeleteAttempts++
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}).Build()
+
+	cm := clientmap.NewClientMap()
+	ctrlKey := types.NamespacedName{Namespace: testNamespace, Name: testCtrlName}
+	cm.Add(t.Context(), ctrlKey, fakeSlurm)
+
+	reconciler := &JobTeardownReconciler{
+		Client:                fakeClient,
+		ClientMap:             cm,
+		slurmCallTimeout:      15 * time.Millisecond,
+		reconciliationTimeout: 35 * time.Millisecond,
+	}
+
+	ev := slurmtypes.SlurmJobTeardownEvent{
+		JobID: "101",
+		WorkloadMixing: types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      reconWmName,
+		},
+		Partition: testBatchPartition,
+		Reason:    metrics.ReasonJobCompleted,
+	}
+
+	err := reconciler.handleTeardown(context.Background(), ev)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Expected handleTeardown error wrapping context.DeadlineExceeded, got: %v", err)
+	}
+	if nodeDeleteAttempts == 0 || nodeDeleteAttempts >= totalNodes {
+		t.Errorf("Expected reconciliationTimeout to short-circuit node cleanup before all %d nodes were attempted, got %d attempts", totalNodes, nodeDeleteAttempts)
 	}
 }

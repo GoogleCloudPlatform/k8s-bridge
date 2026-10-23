@@ -45,6 +45,12 @@ rules:
   - update
   - watch
 - apiGroups:
+  - jobset.x-k8s.io
+  resources:
+  - jobsets/finalizers
+  verbs:
+  - update
+- apiGroups:
   - k8s-bridge.x-k8s.io
   resources:
   - workloadmixings

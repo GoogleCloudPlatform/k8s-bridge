@@ -46,11 +46,27 @@ import (
 // It implements manager.Runnable and manager.LeaderElectionRunnable.
 type JobTeardownReconciler struct {
 	client.Client
-	ClientMap      *clientmap.ClientMap
-	Recorder       record.EventRecorder
-	TeardownEvents <-chan slurmtypes.SlurmJobTeardownEvent
+	ClientMap             *clientmap.ClientMap
+	Recorder              record.EventRecorder
+	TeardownEvents        <-chan slurmtypes.SlurmJobTeardownEvent
+	slurmCallTimeout      time.Duration
+	reconciliationTimeout time.Duration
 	// onEventHandled is an optional callback invoked after processing an event (used for test synchronization).
 	onEventHandled func(ev slurmtypes.SlurmJobTeardownEvent)
+}
+
+func (r *JobTeardownReconciler) getSlurmCallTimeout() time.Duration {
+	if r.slurmCallTimeout > 0 {
+		return r.slurmCallTimeout
+	}
+	return defaultSlurmCallTimeout
+}
+
+func (r *JobTeardownReconciler) getReconciliationTimeout() time.Duration {
+	if r.reconciliationTimeout > 0 {
+		return r.reconciliationTimeout
+	}
+	return defaultReconciliationTimeout
 }
 
 // NeedLeaderElection implements manager.LeaderElectionRunnable ensuring
@@ -62,6 +78,7 @@ func (r *JobTeardownReconciler) NeedLeaderElection() bool {
 // Start runs the teardown event consumption loop. It implements manager.Runnable.
 func (r *JobTeardownReconciler) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("slurmjob-teardown-reconciler")
+	ctx = log.IntoContext(ctx, logger)
 	logger.Info("Starting JobTeardownReconciler")
 
 	for {
@@ -86,14 +103,23 @@ func (r *JobTeardownReconciler) Start(ctx context.Context) error {
 
 // handleTeardown reconciles a single teardown event.
 func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtypes.SlurmJobTeardownEvent) error {
-	logger := log.FromContext(ctx).WithName("slurmjob-teardown-reconciler")
+	ctx, cancel := context.WithTimeout(ctx, r.getReconciliationTimeout())
+	defer cancel()
 
-	jobSetName := fmt.Sprintf("slurm-job-%s", ev.JobID)
+	logger := log.FromContext(ctx).WithValues(
+		"jobID", ev.JobID,
+		"workloadMixing", ev.WorkloadMixing,
+	)
+	ctx = log.IntoContext(ctx, logger)
+
+	jobSetName := jobSetNameForJobID(ev.JobID)
+	logger.V(1).Info("Reconciling Slurm job teardown", "jobSet", jobSetName, "reason", ev.Reason, "partition", ev.Partition)
+
 	js := &jobsetv1alpha2.JobSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: jobSetName, Namespace: ev.WorkloadMixing.Namespace}, js)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.V(1).Info("JobSet not found, skipping teardown", "jobSet", jobSetName, "jobID", ev.JobID)
+			logger.V(1).Info("JobSet not found, skipping teardown", "jobSet", jobSetName)
 			return nil
 		}
 		return fmt.Errorf("failed to get JobSet %s/%s: %w", ev.WorkloadMixing.Namespace, jobSetName, err)
@@ -105,30 +131,22 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 		if !apierrors.IsNotFound(err) {
 			return fmt.Errorf("failed to get parent WorkloadMixing %s: %w", ev.WorkloadMixing, err)
 		}
-		logger.V(1).Info("Parent WorkloadMixing not found, skipping event and gauge update", "workloadMixing", ev.WorkloadMixing)
+		logger.V(1).Info("Parent WorkloadMixing not found, skipping event and gauge update")
 		wm = nil
 	}
 
-	// Delete dynamic slurmd nodes in Slurm
-	if wm != nil && r.ClientMap != nil && wm.Spec.ControllerRef.Name != "" {
-		controllerKey := types.NamespacedName{
-			Namespace: wm.Namespace,
-			Name:      wm.Spec.ControllerRef.Name,
-		}
-		slurmClient := r.ClientMap.Get(controllerKey)
-		if slurmClient != nil {
-			if err := r.cleanupDynamicNodes(ctx, slurmClient, js); err != nil {
-				return fmt.Errorf("failed to cleanup dynamic nodes for JobSet %s: %w", js.Name, err)
-			}
-		} else {
-			logger.V(1).Info("Slurm client not found in ClientMap, skipping dynamic node deletion", "controller", controllerKey)
-		}
+	slurmClient, err := r.slurmClientForCleanup(ctx, wm)
+	if err != nil {
+		return err
+	}
+	isDeleting := isJobSetDeleting(js)
+	if err := finalizeJobSet(ctx, r.Client, slurmClient, js, r.getSlurmCallTimeout()); err != nil {
+		return err
 	}
 
 	// Skip duplicate deletion if JobSet is already terminating
-	isDeleting := !js.DeletionTimestamp.IsZero()
 	if isDeleting {
-		logger.V(1).Info("JobSet already has deletion timestamp, skipping redundant delete", "jobSet", jobSetName, "jobID", ev.JobID)
+		logger.V(1).Info("JobSet already has deletion timestamp, skipping redundant delete", "jobSet", jobSetName)
 	} else {
 		// Delete JobSet
 		if err := r.Delete(ctx, js); err != nil {
@@ -136,7 +154,7 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 				return fmt.Errorf("failed to delete JobSet %s/%s: %w", js.Namespace, js.Name, err)
 			}
 		}
-		logger.Info("Deleted JobSet for terminated Slurm job", "jobSet", jobSetName, "jobID", ev.JobID, "reason", ev.Reason)
+		logger.Info("Deleted JobSet for terminated Slurm job", "jobSet", jobSetName, "reason", ev.Reason)
 	}
 
 	if !isDeleting && r.Recorder != nil && wm != nil {
@@ -169,13 +187,35 @@ func (r *JobTeardownReconciler) handleTeardown(ctx context.Context, ev slurmtype
 	if wm != nil && partition != "" {
 		count, err := CountActiveJobSets(ctx, r.Client, wm, partition, js.Name)
 		if err != nil {
-			logger.Error(err, "Failed to count active JobSets for gauge metric update", "workloadMixing", wm.Name, "partition", partition)
+			logger.Error(err, "Failed to count active JobSets for metric", "partition", partition)
 		} else {
 			metrics.SetActiveJobs(wm.Name, partition, count)
 		}
 	}
 
 	return nil
+}
+
+// slurmClientForCleanup returns the Slurm client used to delete the JobSet's dynamic nodes. It returns nil
+// if node cleanup is impossible (no WorkloadMixing or Slurm Controller), and an error if the Slurm client
+// is not ready yet so the finalizer is retained.
+func (r *JobTeardownReconciler) slurmClientForCleanup(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) (slurmclient.Client, error) {
+	if wm == nil || r.ClientMap == nil || wm.Spec.ControllerRef.Name == "" {
+		return nil, nil
+	}
+	controllerKey := types.NamespacedName{Namespace: wm.Namespace, Name: wm.Spec.ControllerRef.Name}
+	if slurmClient := r.ClientMap.Get(controllerKey); slurmClient != nil {
+		return slurmClient, nil
+	}
+	gone, err := isSlurmControllerGone(ctx, r.Client, controllerKey)
+	if err != nil {
+		return nil, err
+	}
+	if !gone {
+		return nil, fmt.Errorf("no Slurm client in ClientMap for controller %s", controllerKey)
+	}
+	log.FromContext(ctx).Info("Slurm Controller not found, skipping dynamic node cleanup", "slurmController", controllerKey)
+	return nil, nil
 }
 
 // deriveNodeNames derives dynamic slurmd node names directly from the Kubernetes JobSet
@@ -212,14 +252,13 @@ func deriveNodeNames(js *jobsetv1alpha2.JobSet) []string {
 	return nodeNames
 }
 
-const defaultSlurmCallTimeout = 5 * time.Second
-
+// cleanupDynamicNodes deletes dynamic slurmd nodes from Slurm.
 func (r *JobTeardownReconciler) cleanupDynamicNodes(
 	ctx context.Context,
 	slurmClient slurmclient.Client,
 	js *jobsetv1alpha2.JobSet,
 ) error {
-	return cleanupDynamicNodes(ctx, slurmClient, js)
+	return cleanupDynamicNodes(ctx, slurmClient, js, r.getSlurmCallTimeout())
 }
 
 // cleanupDynamicNodes deletes dynamic slurmd nodes from Slurm.
@@ -227,9 +266,13 @@ func cleanupDynamicNodes(
 	ctx context.Context,
 	slurmClient slurmclient.Client,
 	js *jobsetv1alpha2.JobSet,
+	callTimeout time.Duration,
 ) error {
 	if js == nil || slurmClient == nil {
 		return nil
+	}
+	if callTimeout <= 0 {
+		callTimeout = defaultSlurmCallTimeout
 	}
 	logger := log.FromContext(ctx)
 	nodeNames := deriveNodeNames(js)
@@ -246,7 +289,7 @@ func cleanupDynamicNodes(
 				Name: ptr.To(nodeName),
 			},
 		}
-		callCtx, cancel := context.WithTimeout(ctx, defaultSlurmCallTimeout)
+		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
 		err := slurmClient.Delete(callCtx, node)
 		cancel()
 		if err == nil {

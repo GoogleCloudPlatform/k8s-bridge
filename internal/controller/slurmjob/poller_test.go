@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
@@ -416,6 +417,7 @@ func TestSlurmPoller_Poll(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	t.Run("Success - Single WorkloadMixing with jobs", func(t *testing.T) {
 		testPollSingleWorkloadMixing(t, scheme)
@@ -450,6 +452,7 @@ func TestSlurmPoller_Poll_MultiPartition(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm).Build()
@@ -499,6 +502,7 @@ func TestSlurmPoller_Metrics(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	wm := newTestWorkloadMixing(testMetricsWMName, testMetricsCtrlName, testPartitionName, testQueueName)
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm).Build()
@@ -554,6 +558,21 @@ func TestSlurmPoller_Metrics(t *testing.T) {
 	}
 }
 
+func newPollerTestJobSet(jobID string) *testJobSetBuilder {
+	return newTestJobSet("slurm-job-" + jobID).
+		withNamespace(testNamespace).
+		withLabels(map[string]string{
+			LabelSlurmJobID:     jobID,
+			LabelSlurmPartition: testPartitionName,
+		}).
+		withOwnerReference(metav1.OwnerReference{
+			APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+			Kind:       KindWorkloadMixing,
+			Name:       testWMName,
+			UID:        testWMUID,
+		})
+}
+
 func TestPoll_TerminalStateDetection(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -561,24 +580,7 @@ func TestPoll_TerminalStateDetection(t *testing.T) {
 	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testJobSet101Name,
-			Namespace: testNamespace,
-			Labels: map[string]string{
-				LabelSlurmJobID:     "101",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	js := newPollerTestJobSet("101").build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -631,24 +633,7 @@ func TestPoll_NonTerminalPreservation(t *testing.T) {
 	_ = jobsetv1alpha2.AddToScheme(scheme)
 
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testJobSet102Name,
-			Namespace: testNamespace,
-			Labels: map[string]string{
-				LabelSlurmJobID:     "102",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	js := newPollerTestJobSet("102").build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -694,24 +679,19 @@ func TestPoll_OwnerUIDMismatch_Ignored(t *testing.T) {
 
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = "current-wm-uid"
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testJobSet101Name,
-			Namespace: testNamespace,
-			Labels: map[string]string{
-				LabelSlurmJobID:     "101",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        "stale-wm-uid",
-				},
-			},
-		},
-	}
+	js := newTestJobSet(testJobSet101Name).
+		withNamespace(testNamespace).
+		withLabels(map[string]string{
+			LabelSlurmJobID:     "101",
+			LabelSlurmPartition: testPartitionName,
+		}).
+		withOwnerReference(metav1.OwnerReference{
+			APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+			Kind:       KindWorkloadMixing,
+			Name:       testWMName,
+			UID:        "stale-wm-uid",
+		}).
+		build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -769,25 +749,7 @@ func TestPoll_OrphanedJobSet_DisappearanceGracePeriod(t *testing.T) {
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-202",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			Labels: map[string]string{
-				LabelSlurmJobID:     "202",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	js := newPollerTestJobSet("202").build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -872,24 +834,18 @@ func TestPoll_OrphanedJobSet_PartitionFallback(t *testing.T) {
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-209",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			Labels: map[string]string{
-				LabelSlurmJobID: "209",
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	js := newTestJobSet("slurm-job-209").
+		withNamespace(testNamespace).
+		withLabels(map[string]string{
+			LabelSlurmJobID: "209",
+		}).
+		withOwnerReference(metav1.OwnerReference{
+			APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+			Kind:       KindWorkloadMixing,
+			Name:       testWMName,
+			UID:        testWMUID,
+		}).
+		build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -939,25 +895,7 @@ func TestPoll_OrphanedJobSet_ReappearanceClearsTracking(t *testing.T) {
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-204",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			Labels: map[string]string{
-				LabelSlurmJobID:     "204",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	js := newPollerTestJobSet("204").build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -1026,71 +964,126 @@ func TestPoll_OrphanedJobSet_ReappearanceClearsTracking(t *testing.T) {
 	}
 }
 
-func TestPoll_OrphanedJobSet_AlreadyDeletingIgnored(t *testing.T) {
+type pollerTestEnv struct {
+	poller       *SlurmPoller
+	teardownChan chan slurmtypes.SlurmJobTeardownEvent
+	now          time.Time
+}
+
+func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, objs ...client.Object) *pollerTestEnv {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = jobsetv1alpha2.AddToScheme(scheme)
 
-	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	deletionTime := metav1.NewTime(now.Add(-10 * time.Second))
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-205",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			DeletionTimestamp: &deletionTime,
-			Finalizers:        []string{testFinalizer},
-			Labels: map[string]string{
-				LabelSlurmJobID:     "205",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
+	mockSlurm := &utils.SlurmClient{}
+	mockSlurm.SetPendingJobs(testPartitionName, slurmJobs)
+	cMap := clientmap.NewClientMap()
+	cMap.Add(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+
+	env := &pollerTestEnv{
+		teardownChan: make(chan slurmtypes.SlurmJobTeardownEvent, 10),
+		now:          time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
+	}
+	env.poller = &SlurmPoller{
+		Client:            fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm}, objs...)...).Build(),
+		ClientMap:         cMap,
+		TeardownEvents:    env.teardownChan,
+		PollInterval:      10 * time.Second,
+		OrphanGracePeriod: time.Minute,
+		nowFn:             func() time.Time { return env.now },
+	}
+	return env
+}
+
+func (e *pollerTestEnv) poll(t *testing.T) {
+	t.Helper()
+	if err := e.poller.Poll(t.Context()); err != nil {
+		t.Fatalf("Poll failed: %v", err)
+	}
+}
+
+func (e *pollerTestEnv) drainTeardownEvents() []slurmtypes.SlurmJobTeardownEvent {
+	var events []slurmtypes.SlurmJobTeardownEvent
+	for {
+		select {
+		case ev := <-e.teardownChan:
+			events = append(events, ev)
+		default:
+			return events
+		}
+	}
+}
+
+func TestPoll_DeletingJobSet_TeardownEvents(t *testing.T) {
+	completedJob := func(id int32) []slurmclienttypes.V0044JobInfo {
+		return []slurmclienttypes.V0044JobInfo{
+			*newEmptyTestJob().
+				withJobID(id).
+				withPartition(testPartitionName).
+				withJobState(slurmapi.V0044JobInfoJobStateCOMPLETED).
+				build(),
+		}
+	}
+
+	tests := []struct {
+		name      string
+		jobSet    *jobsetv1alpha2.JobSet
+		slurmJobs []slurmclienttypes.V0044JobInfo
+		// afterGracePeriod polls a second time after the orphan grace period has elapsed.
+		afterGracePeriod bool
+		// wantReason is the expected teardown reason; empty means no teardown event.
+		wantReason string
+	}{
+		{
+			name:       "Terminal Slurm job with deleting JobSet carrying FinalizerJobSet emits teardown event",
+			jobSet:     newPollerTestJobSet("210").withFinalizers(FinalizerJobSet).withDeletionTimestamp().build(),
+			slurmJobs:  completedJob(210),
+			wantReason: metrics.ReasonJobCompleted,
+		},
+		{
+			name:      "Terminal Slurm job with deleting JobSet without FinalizerJobSet is ignored",
+			jobSet:    newPollerTestJobSet("211").withFinalizers(testFinalizer).withDeletionTimestamp().build(),
+			slurmJobs: completedJob(211),
+		},
+		{
+			name:             "Orphaned deleting JobSet carrying FinalizerJobSet emits teardown event after grace period",
+			jobSet:           newPollerTestJobSet("212").withFinalizers(FinalizerJobSet).withDeletionTimestamp().build(),
+			afterGracePeriod: true,
+			wantReason:       metrics.ReasonJobOrphaned,
+		},
+		{
+			name:             "Orphaned deleting JobSet without FinalizerJobSet is ignored",
+			jobSet:           newPollerTestJobSet("205").withFinalizers(testFinalizer).withDeletionTimestamp().build(),
+			afterGracePeriod: true,
 		},
 	}
 
-	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
-	cMap := clientmap.NewClientMap()
-	mockSlurm := &utils.SlurmClient{}
-	controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
-	cMap.Add(context.Background(), controllerKey, mockSlurm)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newPollerTestEnv(t, tc.slurmJobs, tc.jobSet)
+			env.poll(t)
+			if tc.afterGracePeriod {
+				env.now = env.now.Add(70 * time.Second)
+				env.poll(t)
+			}
 
-	teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-	currentTime := now
-	poller := &SlurmPoller{
-		Client:            fakeK8sClient,
-		ClientMap:         cMap,
-		TeardownEvents:    teardownChan,
-		PollInterval:      10 * time.Second,
-		OrphanGracePeriod: 1 * time.Minute,
-		nowFn:             func() time.Time { return currentTime },
-	}
-
-	// Poll cycle 1 at now
-	if err := poller.Poll(context.Background()); err != nil {
-		t.Fatalf("Poll failed: %v", err)
-	}
-
-	// Poll cycle 2 past grace period
-	currentTime = now.Add(70 * time.Second)
-	if err := poller.Poll(context.Background()); err != nil {
-		t.Fatalf("Poll failed: %v", err)
-	}
-
-	select {
-	case ev := <-teardownChan:
-		t.Fatalf("Expected no teardown event for JobSet with DeletionTimestamp, got: %v", ev)
-	default:
+			events := env.drainTeardownEvents()
+			if tc.wantReason == "" {
+				if len(events) != 0 {
+					t.Fatalf("Expected no teardown events, got %+v", events)
+				}
+				return
+			}
+			wantJobID := tc.jobSet.Labels[LabelSlurmJobID]
+			if len(events) != 1 || events[0].JobID != wantJobID || events[0].Reason != tc.wantReason {
+				t.Fatalf("Expected one teardown event for JobID %s with reason %s, got %+v", wantJobID, tc.wantReason, events)
+			}
+		})
 	}
 }
 
@@ -1104,25 +1097,7 @@ func TestPoll_OrphanedJobSet_ChannelFull_RetriesOnNextPoll(t *testing.T) {
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-206",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			Labels: map[string]string{
-				LabelSlurmJobID:     "206",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	js := newPollerTestJobSet("206").build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -1185,25 +1160,7 @@ func TestPoll_OrphanedJobSet_NilTeardownChannel_PreservesTracking(t *testing.T) 
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	js := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-207",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			Labels: map[string]string{
-				LabelSlurmJobID:     "207",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	js := newPollerTestJobSet("207").build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, js).Build()
 	cMap := clientmap.NewClientMap()
@@ -1260,45 +1217,8 @@ func TestPoll_OrphanedJobSet_PrunesDeletedJobSetsFromTracking(t *testing.T) {
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
 
-	jsA := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-208a",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			Labels: map[string]string{
-				LabelSlurmJobID:     "208a",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
-
-	jsB := &jobsetv1alpha2.JobSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "slurm-job-208b",
-			Namespace:         testNamespace,
-			CreationTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
-			Labels: map[string]string{
-				LabelSlurmJobID:     "208b",
-				LabelSlurmPartition: testPartitionName,
-			},
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       testWMName,
-					UID:        testWMUID,
-				},
-			},
-		},
-	}
+	jsA := newPollerTestJobSet("208a").build()
+	jsB := newPollerTestJobSet("208b").build()
 
 	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, jsA, jsB).Build()
 	cMap := clientmap.NewClientMap()
@@ -1360,5 +1280,211 @@ func TestPoll_OrphanedJobSet_PrunesDeletedJobSetsFromTracking(t *testing.T) {
 	case ev := <-teardownChan:
 		t.Fatalf("Expected no teardown event for recreated jsB yet, got: %v", ev)
 	default:
+	}
+}
+
+func TestShouldEmitAdmissionEvent(t *testing.T) {
+	const jobID int32 = 301
+	const jobSetName = "slurm-job-301"
+
+	newPendingJobBuilder := func() *testJobBuilder {
+		return newEmptyTestJob().
+			withJobID(jobID).
+			withPartition(testPartitionName).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
+	}
+
+	tests := []struct {
+		name       string
+		job        *slurmclienttypes.V0044JobInfo
+		existingJS *jobsetv1alpha2.JobSet
+		want       bool
+	}{
+		{
+			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has no JobSet and is explicitly held by user",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment("user hold comment").
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name: "Skips when PENDING job has no JobSet and is explicitly held by admin",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldAdmin).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name: "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
+			job: newPendingJobBuilder().
+				withPartition(testPartitionName + ",other-partition").
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
+		{
+			name: "Emits when PENDING job has no JobSet and is auto-held",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
+		{
+			name: "Skips when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusNoAction)",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
+			want:       false,
+		},
+		{
+			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
+			want:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldEmitAdmissionEvent(tc.job, tc.existingJS); got != tc.want {
+				t.Errorf("shouldEmitAdmissionEvent() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	const jobID int32 = 301
+	const jobSetName = "slurm-job-301"
+
+	newPendingJobBuilder := func() *testJobBuilder {
+		return newEmptyTestJob().
+			withJobID(jobID).
+			withPartition(testPartitionName).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING)
+	}
+
+	newOwnedJobSetBuilder := func(ownerUID types.UID) *testJobSetBuilder {
+		return newTestJobSet(jobSetName).
+			withNamespace(testNamespace).
+			withLabels(map[string]string{
+				LabelSlurmJobID:     "301",
+				LabelSlurmPartition: testPartitionName,
+			}).
+			withOwnerReference(metav1.OwnerReference{
+				APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+				Kind:       KindWorkloadMixing,
+				Name:       testWMName,
+				UID:        ownerUID,
+			})
+	}
+
+	tests := []struct {
+		name       string
+		job        slurmclienttypes.V0044JobInfo
+		existingJS *jobsetv1alpha2.JobSet
+		wantEmit   bool
+	}{
+		{
+			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			job: *newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: newOwnedJobSetBuilder(testWMUID).withSuspend(false).build(),
+			wantEmit:   false,
+		},
+		{
+			name: "Emits when PENDING job has existing JobSet with mismatched owner UID (not owned by WM)",
+			job: *newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newOwnedJobSetBuilder("stale-wm-uid").withSuspend(true).build(),
+			wantEmit:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+			wm.UID = testWMUID
+
+			objs := []client.Object{wm}
+			if tc.existingJS != nil {
+				objs = append(objs, tc.existingJS)
+			}
+			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+
+			cMap := clientmap.NewClientMap()
+			mockSlurm := &utils.SlurmClient{}
+			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{tc.job})
+			controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+			cMap.Add(ctx, controllerKey, mockSlurm)
+
+			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
+			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+			poller := &SlurmPoller{
+				Client:          fakeK8sClient,
+				ClientMap:       cMap,
+				AdmissionEvents: admissionChan,
+				TeardownEvents:  teardownChan,
+				PollInterval:    10 * time.Second,
+			}
+
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll failed: %v", err)
+			}
+
+			want := 0
+			if tc.wantEmit {
+				want = 1
+			}
+			if got := len(admissionChan); got != want {
+				t.Fatalf("Poll() emitted %d admission events, want %d", got, want)
+			}
+		})
 	}
 }

@@ -30,7 +30,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
@@ -41,39 +40,44 @@ import (
 )
 
 const (
-	LabelSlurmJobID                = "k8s-bridge.x-k8s.io/slurm-job-id"
-	LabelSlurmJobName              = "k8s-bridge.x-k8s.io/slurm-job-name"
-	LabelSlurmPartition            = "k8s-bridge.x-k8s.io/slurm-partition"
-	AnnotationSuspendedBySlurmHold = "k8s-bridge.x-k8s.io/suspended-by-slurm-hold"
-	LabelKueueQueue                = "kueue.x-k8s.io/queue-name"
-	LabelKueuePriorityClass        = "kueue.x-k8s.io/priority-class"
-	GRESGPU                        = "gpu"
-	tresNode                       = "node"
-	ContainerSlurmd                = "slurmd"
-	DefaultSlurmdImage             = "placeholder-image"
-	defaultMemoryPerCPUMB          = 2048
-	SlurmConfigVolume              = "slurm-etc"
-	SlurmConfigDir                 = "/etc/slurm"
-	SlurmKeyFile                   = "slurm.key"
-	SlurmKeyMode                   = 0o600
-	SlurmctldDefaultPort           = 6817
-	argConfServer                  = "--conf-server"
-	argNodeName                    = "-N"
-	valNodeName                    = "$(SLURM_NODE_NAME)"
-	envJobSetName                  = "JOBSET_NAME"
-	envReplicatedJobName           = "REPLICATED_JOB_NAME"
-	envJobIndex                    = "JOB_INDEX"
-	envPodIndex                    = "POD_INDEX"
-	envSlurmNodeName               = "SLURM_NODE_NAME"
-	fieldPathJobSetName            = "metadata.labels['jobset.sigs.k8s.io/jobset-name']"
-	fieldPathReplicatedJobName     = "metadata.labels['jobset.sigs.k8s.io/replicatedjob-name']"
-	fieldPathJobIndex              = "metadata.labels['jobset.sigs.k8s.io/job-index']"
-	fieldPathJobCompletionIndex    = "metadata.labels['batch.kubernetes.io/job-completion-index']"
-	ReasonJobHeldUser              = "JobHeldUser"
-	ReasonJobHeldAdmin             = "JobHeldAdmin"
-	ReasonPriority                 = "Priority"
-	ValueTrue                      = "true"
-	AutoHoldMarker                 = "k8s-bridge-auto-hold"
+	LabelSlurmJobID             = "k8s-bridge.x-k8s.io/slurm-job-id"
+	LabelSlurmJobName           = "k8s-bridge.x-k8s.io/slurm-job-name"
+	LabelSlurmPartition         = "k8s-bridge.x-k8s.io/slurm-partition"
+	LabelKueueQueue             = "kueue.x-k8s.io/queue-name"
+	LabelKueuePriorityClass     = "kueue.x-k8s.io/priority-class"
+	GRESGPU                     = "gpu"
+	tresNode                    = "node"
+	ContainerSlurmd             = "slurmd"
+	DefaultSlurmdImage          = "placeholder-image"
+	defaultMemoryPerCPUMB       = 2048
+	SlurmConfigVolume           = "slurm-etc"
+	SlurmConfigDir              = "/etc/slurm"
+	SlurmKeyFile                = "slurm.key"
+	SlurmKeyMode                = 0o600
+	SlurmctldDefaultPort        = 6817
+	argConfServer               = "--conf-server"
+	argNodeName                 = "-N"
+	valNodeName                 = "$(SLURM_NODE_NAME)"
+	envJobSetName               = "JOBSET_NAME"
+	envReplicatedJobName        = "REPLICATED_JOB_NAME"
+	envJobIndex                 = "JOB_INDEX"
+	envPodIndex                 = "POD_INDEX"
+	envSlurmNodeName            = "SLURM_NODE_NAME"
+	fieldPathJobSetName         = "metadata.labels['jobset.sigs.k8s.io/jobset-name']"
+	fieldPathReplicatedJobName  = "metadata.labels['jobset.sigs.k8s.io/replicatedjob-name']"
+	fieldPathJobIndex           = "metadata.labels['jobset.sigs.k8s.io/job-index']"
+	fieldPathJobCompletionIndex = "metadata.labels['batch.kubernetes.io/job-completion-index']"
+	ReasonJobHeldUser           = "JobHeldUser"
+	ReasonJobHeldAdmin          = "JobHeldAdmin"
+	ReasonPriority              = "Priority"
+	AutoHoldMarker              = "k8s-bridge-auto-hold"
+
+	// LINT.IfChange(max_restarts)
+	// DefaultJobSetMaxRestarts and NoRequeueJobSetMaxRestarts set failurePolicy.maxRestarts
+	// on a translated JobSet. A job that was submitted with sbatch --no-requeue must not restart.
+	DefaultJobSetMaxRestarts   int32 = 3
+	NoRequeueJobSetMaxRestarts int32 = 0
+	// LINT.ThenChange(test/e2e/jobset_restart_policy_test.go:max_restarts)
 
 	SlurmdProbePeriodSeconds            = 10
 	SlurmdProbeTimeoutSeconds           = 5
@@ -89,10 +93,23 @@ const (
 	ComponentWorker   = "worker"
 )
 
+const (
+	// FinalizerJobSet is added to every JobSet created by k8s-bridge. It keeps the JobSet, and its
+	// slurmd replica count, until k8s-bridge has deregistered the JobSet's dynamic Slurm nodes.
+	FinalizerJobSet = "k8s-bridge.x-k8s.io/slurm-node-cleanup"
+
+	jobSetNamePrefix = "slurm-job-"
+)
+
 var (
 	invalidLabelCharsRegex = regexp.MustCompile(`[^a-z0-9_.-]+`)
 	repeatedDashRegex      = regexp.MustCompile(`-{2,}`)
 )
+
+// jobSetNameForJobID returns the name of the JobSet created for the given Slurm job ID.
+func jobSetNameForJobID(jobID string) string {
+	return jobSetNamePrefix + jobID
+}
 
 // JobTranslator defines the interface for translating Slurm jobs into Kubernetes resources.
 type JobTranslator interface {
@@ -199,7 +216,31 @@ func (t *JobSetTranslator) Translate(
 	injectPreStopHook(&podTemplate.Spec)
 	injectSlurmdProbes(&podTemplate.Spec, jobIDStr)
 
-	return buildJobSet(jobIDStr, replicas, labels, podTemplate), nil
+	maxRestarts := resolveMaxRestarts(job)
+	log.Log.WithName("translator").V(1).Info("Translated Slurm job to JobSet",
+		"jobID", jobIDStr,
+		"partition", mapping.Partition,
+		"localQueue", mapping.LocalQueue,
+		"priorityClass", mapping.WorkloadPriorityClass,
+		"dynamicNodeFeature", mapping.DynamicNodeFeature,
+		"replicas", replicas,
+		"maxRestarts", maxRestarts,
+		"requests", resources.Requests,
+		"limits", resources.Limits,
+		"nodeSelectors", podTemplate.Spec.NodeSelector,
+		"confServer", confServer)
+
+	return buildJobSet(jobIDStr, replicas, maxRestarts, labels, podTemplate), nil
+}
+
+// resolveMaxRestarts returns the JobSet restart budget for a Slurm job.
+// Requeue is false for a job that Slurm must not requeue, for example a job
+// that was submitted with sbatch --no-requeue. A nil Requeue keeps the default budget.
+func resolveMaxRestarts(job *slurmclienttypes.V0044JobInfo) int32 {
+	if !ptr.Deref(job.Requeue, true) {
+		return NoRequeueJobSetMaxRestarts
+	}
+	return DefaultJobSetMaxRestarts
 }
 
 func applyPodTemplateOverrides(
@@ -222,7 +263,7 @@ func applyPodTemplateOverrides(
 	foundSlurmd := false
 	for i := range template.Spec.Containers {
 		if template.Spec.Containers[i].Name == ContainerSlurmd {
-			mergeContainerResources(&template.Spec.Containers[i], resources)
+			mergeContainerResources(&template.Spec.Containers[i], resources, jobIDStr)
 			foundSlurmd = true
 			break
 		}
@@ -254,7 +295,7 @@ func applyPodTemplateOverrides(
 // mergeContainerResources applies Slurm-calculated resources onto the slurmd container
 // from podTemplate while preserving unrelated custom resources (e.g. ephemeral-storage)
 // and any limits explicitly configured in podTemplate.
-func mergeContainerResources(container *corev1.Container, calculated corev1.ResourceRequirements) {
+func mergeContainerResources(container *corev1.Container, calculated corev1.ResourceRequirements, jobIDStr string) {
 	logger := log.Log.WithName("translator")
 
 	if container.Resources.Requests == nil {
@@ -262,8 +303,8 @@ func mergeContainerResources(container *corev1.Container, calculated corev1.Reso
 	}
 	for resName, calcQty := range calculated.Requests {
 		if prevQty, ok := container.Resources.Requests[resName]; ok {
-			logger.Info("Warning: overwriting user-provided slurmd resource request from podTemplate",
-				"resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
+			logger.V(1).Info("Overwriting user-provided slurmd resource request from podTemplate",
+				"jobID", jobIDStr, "resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
 		}
 		container.Resources.Requests[resName] = calcQty
 	}
@@ -273,8 +314,8 @@ func mergeContainerResources(container *corev1.Container, calculated corev1.Reso
 			container.Resources.Limits = make(corev1.ResourceList)
 		}
 		if prevQty, ok := container.Resources.Limits[resName]; ok {
-			logger.Info("Warning: overwriting user-provided slurmd resource limit from podTemplate",
-				"resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
+			logger.V(1).Info("Overwriting user-provided slurmd resource limit from podTemplate",
+				"jobID", jobIDStr, "resource", resName, "templateValue", prevQty.String(), "calculatedValue", calcQty.String())
 		}
 		container.Resources.Limits[resName] = calcQty
 	}
@@ -414,10 +455,11 @@ func buildPodTemplate(jobIDStr, sanitizedJobName string, resources corev1.Resour
 func buildJobSet(
 	jobIDStr string,
 	replicas int32,
+	maxRestarts int32,
 	labels map[string]string,
 	podTemplate corev1.PodTemplateSpec,
 ) *jobsetv1alpha2.JobSet {
-	jobSetName := fmt.Sprintf("slurm-job-%s", jobIDStr)
+	jobSetName := jobSetNameForJobID(jobIDStr)
 	var podFailurePolicy *batchv1.PodFailurePolicy
 	if findContainer(&podTemplate.Spec, ContainerSlurmd) != nil &&
 		(podTemplate.Spec.RestartPolicy == "" || podTemplate.Spec.RestartPolicy == corev1.RestartPolicyNever) {
@@ -437,13 +479,14 @@ func buildJobSet(
 
 	return &jobsetv1alpha2.JobSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   jobSetName,
-			Labels: labels,
+			Name:       jobSetName,
+			Labels:     labels,
+			Finalizers: []string{FinalizerJobSet},
 		},
 		Spec: jobsetv1alpha2.JobSetSpec{
 			Suspend: ptr.To(true),
 			FailurePolicy: &jobsetv1alpha2.FailurePolicy{
-				MaxRestarts: 1,
+				MaxRestarts: maxRestarts,
 			},
 			ReplicatedJobs: []jobsetv1alpha2.ReplicatedJob{
 				{
@@ -487,18 +530,18 @@ func injectPreStopHook(spec *corev1.PodSpec) {
 }
 
 func injectSlurmdProbes(spec *corev1.PodSpec, jobIDStr string) {
-	logger := ctrl.Log.WithName("translator")
+	logger := log.Log.WithName("translator")
 	for i := range spec.Containers {
 		if spec.Containers[i].Name == ContainerSlurmd {
 			if spec.Containers[i].StartupProbe == nil {
 				spec.Containers[i].StartupProbe = defaultSlurmdStartupProbe()
 			} else {
-				logger.Info("Custom startupProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
+				logger.V(1).Info("Custom startupProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
 			}
 			if spec.Containers[i].LivenessProbe == nil {
 				spec.Containers[i].LivenessProbe = defaultSlurmdLivenessProbe()
 			} else {
-				logger.Info("Custom livenessProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
+				logger.V(1).Info("Custom livenessProbe already configured on slurmd container, skipping default probe injection", "jobID", jobIDStr)
 			}
 			break
 		}
@@ -615,8 +658,8 @@ func resolveReplicas(job *slurmclienttypes.V0044JobInfo) (int32, error) {
 		return nodes, nil
 	}
 
-	log.Log.WithName("translator").Info("Could not determine requested node count from TresReqStr, falling back to NodeCount",
-		"jobID", ptr.Deref(job.JobId, 0), "tresReqStr", ptr.Deref(job.TresReqStr, ""))
+	log.Log.WithName("translator").V(1).Info("Could not determine requested node count from TresReqStr, falling back to NodeCount",
+		"jobID", strconv.Itoa(int(ptr.Deref(job.JobId, 0))), "tresReqStr", ptr.Deref(job.TresReqStr, ""))
 	// Check Infinite before Set. slurmrestd sends an infinite value with set=false and number=0.
 	// Reference: DUMP_FUNC(UINT32_NO_VAL) in src/plugins/data_parser/v0.0.44/parsers.c
 	// https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/src/plugins/data_parser/v0.0.44/parsers.c#L3106-L3132
@@ -819,7 +862,8 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 			return corev1.ResourceRequirements{}, nil, fmt.Errorf("missing GRES mapping for gpu:%s", resolvedGPU.resourceType)
 		}
 		k8sGpuResourceName = mapping.K8sResourceName
-		nodeSelectors = mapping.NodeSelectors
+		// Copy the map so that the JobSet does not share it with the WorkloadMixing spec.
+		nodeSelectors = maps.Clone(mapping.NodeSelectors)
 	}
 
 	// Resolve CPUs per pod

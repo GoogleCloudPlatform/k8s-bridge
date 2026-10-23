@@ -28,10 +28,24 @@ helm install k8s-bridge . --namespace k8s-bridge-system --create-namespace
 
 ## Uninstalling the Chart
 
+JobSets created by `k8s-bridge` carry the `k8s-bridge.x-k8s.io/slurm-node-cleanup` finalizer. Delete your WorkloadMixing resources first and wait until this returns no resources:
+
+```console
+kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
+```
+
 To uninstall/delete the `k8s-bridge` deployment:
 
 ```console
 helm uninstall k8s-bridge --namespace k8s-bridge-system
+```
+
+If a JobSet is stuck in `Terminating` after uninstalling, remove only this finalizer:
+
+```console
+kubectl get jobset <name> -n <namespace> -o json \
+  | jq '.metadata.finalizers -= ["k8s-bridge.x-k8s.io/slurm-node-cleanup"]' \
+  | kubectl replace -f -
 ```
 
 ## Configuration
