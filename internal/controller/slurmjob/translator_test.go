@@ -1816,3 +1816,239 @@ func TestTranslateSlurmJobToJobSet_JobNameLabel(t *testing.T) {
 		}
 	})
 }
+
+// TestTranslateSlurmJobToJobSet_MaxNodeSize verifies that the translator rejects a job whose
+// slurmd container needs more CPUs or memory than the slurmd limits in the podTemplate.
+// The memory need follows the current memory rule: the larger of the memory option and
+// 2048 MiB for each CPU.
+func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
+	translator := NewJobSetTranslator()
+	controller := getTestController()
+
+	limits := func(cpu, memory string) corev1.ResourceList {
+		return slurmdWithLimits(cpu, memory).Resources.Limits
+	}
+	requests := func(cpu, memory string) corev1.ResourceList {
+		return corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpu),
+			corev1.ResourceMemory: resource.MustParse(memory),
+		}
+	}
+
+	tests := []struct {
+		name          string
+		noPodTemplate bool
+		cpuLimit      string // An empty value means no CPU limit.
+		memLimit      string // An empty value means no memory limit.
+		job           *slurmclienttypes.V0044JobInfo
+		wantErr       string // An empty value means that the job fits.
+		wantReplicas  int32
+		wantRequests  corev1.ResourceList
+		wantLimits    corev1.ResourceList
+	}{
+		{
+			name:     "Failure - -N1 -n8 needs more CPUs and memory than the limits",
+			cpuLimit: "4",
+			memLimit: testSlurmdMemoryLimit,
+			job:      newTestJob().withTasks(8).build(),
+			wantErr:  "job needs 8 CPUs and 16384 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 8192 MiB",
+		},
+		{
+			name:     "Failure - -N1 -n2 --mem=16G needs more memory than the limit",
+			cpuLimit: "4",
+			memLimit: testSlurmdMemoryLimit,
+			job:      newTestJob().withTasks(2).withMemoryPerNode(16384).build(),
+			wantErr:  "job needs 2 CPUs and 16384 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 8192 MiB",
+		},
+		{
+			name:         "Success - -N1 -n4 fits the limits exactly",
+			cpuLimit:     "4",
+			memLimit:     testSlurmdMemoryLimit,
+			job:          newTestJob().withTasks(4).build(),
+			wantReplicas: 1,
+			wantRequests: requests("4", "8192Mi"),
+			wantLimits:   limits("4", testSlurmdMemoryLimit),
+		},
+		{
+			name:     "Failure - -N1 -n4 default memory is above a 6Gi limit",
+			cpuLimit: "4",
+			memLimit: "6Gi",
+			job:      newTestJob().withTasks(4).build(),
+			wantErr:  "job needs 4 CPUs and 8192 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 6144 MiB",
+		},
+		{
+			// The current memory rule takes the larger of --mem and 2048 MiB for each CPU.
+			name:     "Failure - -N1 -n4 --mem=1024 still needs 2048 MiB for each CPU",
+			cpuLimit: "4",
+			memLimit: "6Gi",
+			job:      newTestJob().withTasks(4).withMemoryPerNode(1024).build(),
+			wantErr:  "job needs 4 CPUs and 8192 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 6144 MiB",
+		},
+		{
+			name:          "Success - -N1 -n48 without podTemplate has no maximum node size",
+			noPodTemplate: true,
+			job:           newTestJob().withTasks(48).build(),
+			wantReplicas:  1,
+			wantRequests:  requests("48", "98304Mi"),
+		},
+		{
+			name:         "Success - -N1 -n48 without slurmd limits has no maximum node size",
+			job:          newTestJob().withTasks(48).build(),
+			wantReplicas: 1,
+			wantRequests: requests("48", "98304Mi"),
+		},
+		{
+			name:     "Failure - Only a memory limit names only the memory limit",
+			memLimit: testSlurmdMemoryLimit,
+			job:      newTestJob().withTasks(8).build(),
+			wantErr:  "job needs 8 CPUs and 16384 MiB per node, but the maximum node size of partition high-prio is 8192 MiB",
+		},
+		{
+			name:     "Failure - Only a CPU limit names only the CPU limit",
+			cpuLimit: "4",
+			job:      newTestJob().withTasks(8).build(),
+			wantErr:  "job needs 8 CPUs and 16384 MiB per node, but the maximum node size of partition high-prio is 4 CPUs",
+		},
+		{
+			name:         "Success - Only a CPU limit does not check memory",
+			cpuLimit:     "4",
+			job:          newTestJob().withTasks(2).withMemoryPerNode(16384).build(),
+			wantReplicas: 1,
+			wantRequests: requests("2", "16384Mi"),
+			wantLimits:   limits("4", ""),
+		},
+		{
+			name:     "Failure - A fractional CPU limit rejects a 4-CPU container",
+			cpuLimit: "3500m",
+			memLimit: testSlurmdMemoryLimit,
+			job:      newTestJob().withTasks(4).build(),
+			wantErr:  "job needs 4 CPUs and 8192 MiB per node, but the maximum node size of partition high-prio is 3.5 CPUs and 8192 MiB",
+		},
+		{
+			// The current memory rule gives --mem=0 the default of 2048 MiB for each CPU.
+			name:         "Success - --mem=0 gets the default memory and fits",
+			cpuLimit:     "4",
+			memLimit:     testSlurmdMemoryLimit,
+			job:          newTestJob().withTasks(1).withMemoryPerNode(0).build(),
+			wantReplicas: 1,
+			wantRequests: requests("1", "2048Mi"),
+			wantLimits:   limits("4", testSlurmdMemoryLimit),
+		},
+		{
+			name:     "Failure - -N2 -n16 needs 8 CPUs in each container",
+			cpuLimit: "4",
+			memLimit: testSlurmdMemoryLimit,
+			job:      newTestJob().withNodes(2).withTasks(16).build(),
+			wantErr:  "job needs 8 CPUs and 16384 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 8192 MiB",
+		},
+		{
+			name:         "Success - A GPU job fits, because the check does not compare GPUs",
+			cpuLimit:     "4",
+			memLimit:     testSlurmdMemoryLimit,
+			job:          newTestJob().withTresPerNode("gres/gpu:l4=1").build(),
+			wantReplicas: 1,
+			wantRequests: corev1.ResourceList{
+				corev1.ResourceCPU:                       resource.MustParse("1"),
+				corev1.ResourceMemory:                    resource.MustParse("2048Mi"),
+				corev1.ResourceName(testGpuResourceName): resource.MustParse("1"),
+			},
+			wantLimits: corev1.ResourceList{
+				corev1.ResourceCPU:                       resource.MustParse("4"),
+				corev1.ResourceMemory:                    resource.MustParse(testSlurmdMemoryLimit),
+				corev1.ResourceName(testGpuResourceName): resource.MustParse("1"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wmSpec := getTestWMSpec()
+			if !tt.noPodTemplate {
+				wmSpec = newTestWMSpec().withContainers(slurmdWithLimits(tt.cpuLimit, tt.memLimit)).build()
+			}
+
+			obj, err := translator.Translate(tt.job, wmSpec, controller)
+			if tt.wantErr != "" {
+				verifyTranslationError(t, obj, err, tt.wantErr)
+				return
+			}
+			verifyJobSet(t, obj, err, "123", tt.wantReplicas,
+				withRequests(tt.wantRequests),
+				withLimits(tt.wantLimits),
+			)
+		})
+	}
+}
+
+func TestMissingSlurmdLimits(t *testing.T) {
+	podTemplate := func(containers ...corev1.Container) *corev1.PodTemplateSpec {
+		return &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: containers}}
+	}
+	sidecar := corev1.Container{
+		Name: testSidecarName,
+		Resources: corev1.ResourceRequirements{
+			Limits: slurmdWithLimits("1", "1Gi").Resources.Limits,
+		},
+	}
+	bothMissing := []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
+
+	tests := []struct {
+		name     string
+		template *corev1.PodTemplateSpec
+		want     []corev1.ResourceName
+	}{
+		{name: "No podTemplate", template: nil, want: bothMissing},
+		{name: "No slurmd container", template: podTemplate(), want: bothMissing},
+		{name: "Only another container has limits", template: podTemplate(sidecar, slurmdWithLimits("", "")), want: bothMissing},
+		{name: "Only a CPU limit", template: podTemplate(slurmdWithLimits("4", "")), want: []corev1.ResourceName{corev1.ResourceMemory}},
+		{name: "Only a memory limit", template: podTemplate(slurmdWithLimits("", testSlurmdMemoryLimit)), want: []corev1.ResourceName{corev1.ResourceCPU}},
+		{name: "Both limits", template: podTemplate(slurmdWithLimits("4", testSlurmdMemoryLimit)), want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if diff := cmp.Diff(tt.want, missingSlurmdLimits(tt.template)); diff != "" {
+				t.Errorf("missingSlurmdLimits() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFormatCPUs(t *testing.T) {
+	tests := []struct {
+		quantity string
+		want     string
+	}{
+		{quantity: "1", want: "1 CPU"},
+		{quantity: "4", want: "4 CPUs"},
+		{quantity: "3500m", want: "3.5 CPUs"},
+		{quantity: "500m", want: "0.5 CPUs"},
+		{quantity: "0", want: "0 CPUs"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.quantity, func(t *testing.T) {
+			if got := formatCPUs(resource.MustParse(tt.quantity)); got != tt.want {
+				t.Errorf("formatCPUs(%q) = %q, want %q", tt.quantity, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatMiB(t *testing.T) {
+	tests := []struct {
+		quantity string
+		want     string
+	}{
+		{quantity: "4Gi", want: "4096 MiB"},
+		{quantity: "16384Mi", want: "16384 MiB"},
+		{quantity: "0", want: "0 MiB"},
+		{quantity: "1G", want: "1G"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.quantity, func(t *testing.T) {
+			if got := formatMiB(resource.MustParse(tt.quantity)); got != tt.want {
+				t.Errorf("formatMiB(%q) = %q, want %q", tt.quantity, got, tt.want)
+			}
+		})
+	}
+}

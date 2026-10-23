@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -79,6 +80,9 @@ type SlurmJobReconciler struct {
 	Translator            JobTranslator
 	slurmCallTimeout      time.Duration
 	reconciliationTimeout time.Duration
+	// maxNodeSizeWarned holds the WorkloadMixings that got the warning about
+	// missing slurmd limits. The keys are types.NamespacedName values.
+	maxNodeSizeWarned sync.Map
 }
 
 func (r *SlurmJobReconciler) getSlurmCallTimeout() time.Duration {
@@ -823,6 +827,8 @@ func (r *SlurmJobReconciler) translateSlurmJobToJobset(ctx context.Context, wm *
 		return nil, ReconciliationDone, fmt.Errorf("failed to fetch Controller %s: %w", controllerKey, err)
 	}
 
+	r.warnIfMaxNodeSizeUnset(ctx, wm)
+
 	start := time.Now()
 	obj, err := translator.Translate(jobInfo, &wm.Spec, controllerCR)
 	duration := time.Since(start)
@@ -854,6 +860,25 @@ func (r *SlurmJobReconciler) translateSlurmJobToJobset(ctx context.Context, wm *
 	}
 
 	return obj, ReconciliationContinue, nil
+}
+
+// warnIfMaxNodeSizeUnset logs a warning when the slurmd container in the podTemplate
+// of the WorkloadMixing has no CPU or memory limit. Without a limit, the translator
+// does not check that resource against the maximum node size. The warning appears once
+// for each WorkloadMixing. It appears again after a restart, or after a person adds
+// the limits and then removes them.
+func (r *SlurmJobReconciler) warnIfMaxNodeSizeUnset(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) {
+	key := types.NamespacedName{Namespace: wm.Namespace, Name: wm.Name}
+	missing := missingSlurmdLimits(wm.Spec.PodTemplate)
+	if len(missing) == 0 {
+		r.maxNodeSizeWarned.Delete(key)
+		return
+	}
+	if _, warned := r.maxNodeSizeWarned.LoadOrStore(key, struct{}{}); warned {
+		return
+	}
+	log.FromContext(ctx).Info("Maximum node size not configured: the slurmd container in spec.podTemplate has no cpu or memory limit",
+		"workloadMixing", key, "missingLimits", missing)
 }
 
 func (r *SlurmJobReconciler) createK8sResource(ctx context.Context, obj client.Object) (bool, error) {

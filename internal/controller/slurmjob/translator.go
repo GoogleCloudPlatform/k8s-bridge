@@ -205,6 +205,11 @@ func (t *JobSetTranslator) Translate(
 		podTemplate = buildPodTemplate(jobIDStr, sanitizedJobName, resources, gresInfo.NodeSelectors)
 	}
 
+	// 6. Reject a job that needs more than the maximum node size of the partition
+	if err := enforcePodLimitsForPartition(&podTemplate.Spec, mapping.Partition); err != nil {
+		return nil, err
+	}
+
 	if err := injectSlurmVolumes(&podTemplate.Spec, controller); err != nil {
 		return nil, fmt.Errorf("failed to inject slurm volumes: %w", err)
 	}
@@ -319,6 +324,77 @@ func mergeContainerResources(container *corev1.Container, calculated corev1.Reso
 		}
 		container.Resources.Limits[resName] = calcQty
 	}
+}
+
+// enforcePodLimitsForPartition returns an error when the CPU or memory request of
+// the slurmd container is above its limit. The limits come from the slurmd container
+// in the WorkloadMixing podTemplate, and they are the maximum node size of the
+// partition. The check skips a resource that has no limit. It does not check GPUs,
+// because the translator sets the GPU limit equal to the GPU request.
+func enforcePodLimitsForPartition(podSpec *corev1.PodSpec, partition string) error {
+	slurmd := findContainer(podSpec, ContainerSlurmd)
+	if slurmd == nil {
+		return nil
+	}
+	cpuNeed := slurmd.Resources.Requests[corev1.ResourceCPU]
+	memNeed := slurmd.Resources.Requests[corev1.ResourceMemory]
+	cpuLimit, hasCPULimit := slurmd.Resources.Limits[corev1.ResourceCPU]
+	memLimit, hasMemLimit := slurmd.Resources.Limits[corev1.ResourceMemory]
+
+	cpuFits := !hasCPULimit || cpuNeed.Cmp(cpuLimit) <= 0
+	memFits := !hasMemLimit || memNeed.Cmp(memLimit) <= 0
+	if cpuFits && memFits {
+		return nil
+	}
+
+	var maxNodeSize []string
+	if hasCPULimit {
+		maxNodeSize = append(maxNodeSize, formatCPUs(cpuLimit))
+	}
+	if hasMemLimit {
+		maxNodeSize = append(maxNodeSize, formatMiB(memLimit))
+	}
+	return fmt.Errorf("job needs %s and %s per node, but the maximum node size of partition %s is %s",
+		formatCPUs(cpuNeed), formatMiB(memNeed), partition, strings.Join(maxNodeSize, " and "))
+}
+
+// missingSlurmdLimits returns the CPU and memory limits that the slurmd container in
+// the pod template does not set. enforcePodLimitsForPartition does not check these
+// resources.
+func missingSlurmdLimits(template *corev1.PodTemplateSpec) []corev1.ResourceName {
+	var limits corev1.ResourceList
+	if template != nil {
+		if slurmd := findContainer(&template.Spec, ContainerSlurmd); slurmd != nil {
+			limits = slurmd.Resources.Limits
+		}
+	}
+	var missing []corev1.ResourceName
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if _, ok := limits[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+// formatCPUs formats a CPU quantity for a message, for example "1 CPU", "4 CPUs", or "3.5 CPUs".
+func formatCPUs(q resource.Quantity) string {
+	milliCPUs := q.MilliValue()
+	unit := "CPUs"
+	if milliCPUs == 1000 {
+		unit = "CPU"
+	}
+	return strconv.FormatFloat(float64(milliCPUs)/1000, 'f', -1, 64) + " " + unit
+}
+
+// formatMiB formats a memory quantity in MiB for a message, for example "8192 MiB".
+// A quantity that is not a whole number of MiB keeps its own notation, for example "1G".
+func formatMiB(q resource.Quantity) string {
+	const bytesPerMiB = 1 << 20
+	if bytes := q.Value(); bytes%bytesPerMiB == 0 {
+		return fmt.Sprintf("%d MiB", bytes/bytesPerMiB)
+	}
+	return q.String()
 }
 
 // resolvePartitionMapping resolves the partition for the job and returns the corresponding mapping.
