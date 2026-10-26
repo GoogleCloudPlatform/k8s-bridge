@@ -66,7 +66,6 @@ type WorkloadMixingReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
 func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.V(1).Info("Started syncing WorkloadMixing")
 
 	workloadMixing := &k8sbridgev1alpha1.WorkloadMixing{}
 	if err := r.Get(ctx, req.NamespacedName, workloadMixing); err != nil {
@@ -75,12 +74,11 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			r.cleanupWorkloadMixingMetrics(ctx, req.Name)
 			return ctrl.Result{}, nil
 		}
-		logger.Error(err, "Failed to get WorkloadMixing")
 		return ctrl.Result{}, err
 	}
 
 	if !workloadMixing.DeletionTimestamp.IsZero() {
-		logger.Info("WorkloadMixing is being deleted, cleaning up metrics", "name", workloadMixing.Name)
+		logger.Info("WorkloadMixing is being deleted, cleaning up metrics")
 		r.cleanupWorkloadMixingMetrics(ctx, workloadMixing.Name)
 		return ctrl.Result{}, nil
 	}
@@ -89,7 +87,7 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	original := workloadMixing.DeepCopy()
 
-	logger.V(1).Info("Reconciling WorkloadMixing")
+	logger.V(1).Info("Reconciling WorkloadMixing", "controllerRef", workloadMixing.Spec.ControllerRef.Name)
 
 	if err := r.updateAvailabilityStatus(ctx, workloadMixing, original); err != nil {
 		return ctrl.Result{}, err
@@ -113,7 +111,7 @@ func (r *WorkloadMixingReconciler) updateActiveJobsMetrics(ctx context.Context, 
 	for _, pm := range wm.Spec.PartitionsMapping {
 		count, err := slurmjob.CountActiveJobSets(ctx, r.Client, wm, pm.Partition)
 		if err != nil {
-			log.FromContext(ctx).V(1).Info("Failed to count active JobSets for metric", "workloadMixing", wm.Name, "partition", pm.Partition, "error", err)
+			log.FromContext(ctx).Error(err, "Failed to count active JobSets for metric", "partition", pm.Partition)
 			continue
 		}
 		metrics.SetActiveJobs(wm.Name, pm.Partition, count)
@@ -180,13 +178,16 @@ func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context,
 	changed := meta.SetStatusCondition(&workloadMixing.Status.Conditions, condition)
 	if changed {
 		if err := r.Status().Patch(ctx, workloadMixing, client.MergeFrom(original)); err != nil {
-			logger.Error(err, "Failed to patch WorkloadMixing status")
 			if r.Recorder != nil {
 				r.Recorder.Event(workloadMixing, corev1.EventTypeWarning, "StatusUpdateFailed", "Failed to update WorkloadMixing status")
 			}
 			return err
 		}
-		logger.Info("Updated WorkloadMixing status condition", "status", condition.Status, "reason", condition.Reason)
+		logger.Info("Updated WorkloadMixing status condition",
+			"status", condition.Status,
+			"reason", condition.Reason,
+			"message", condition.Message,
+			"partitionsMapping", workloadMixing.Spec.PartitionsMapping)
 		if r.Recorder != nil {
 			eventType := corev1.EventTypeNormal
 			if condition.Status == metav1.ConditionFalse {
@@ -194,6 +195,10 @@ func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context,
 			}
 			r.Recorder.Event(workloadMixing, eventType, condition.Reason, condition.Message)
 		}
+	} else {
+		logger.V(1).Info("WorkloadMixing status condition unchanged",
+			"status", condition.Status,
+			"reason", condition.Reason)
 	}
 
 	return nil
@@ -225,10 +230,9 @@ func (r *WorkloadMixingReconciler) getController(ctx context.Context, workloadMi
 
 	if err := r.Get(ctx, controllerKey, controllerCR); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("Referenced Controller not found", "controller", controllerKey)
+			logger.V(1).Info("Referenced Controller not found", "slurmController", controllerKey)
 			return nil, nil
 		}
-		logger.Error(err, "Failed to get Controller", "controller", controllerKey)
 		return nil, err
 	}
 	return controllerCR, nil
@@ -241,12 +245,11 @@ func (r *WorkloadMixingReconciler) getRestAPI(ctx context.Context, controllerCR 
 
 	restAPIList, err := resolver.GetRestapisForController(ctx, controllerCR)
 	if err != nil {
-		logger.Error(err, "Failed to get RestApis for Controller", "controller", controllerKey)
 		return nil, err
 	}
 
 	if len(restAPIList.Items) == 0 {
-		logger.Info("No RestApi found for Controller", "controller", controllerKey)
+		logger.V(1).Info("No RestApi found for Controller", "slurmController", controllerKey)
 		return nil, nil
 	}
 

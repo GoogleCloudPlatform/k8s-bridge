@@ -25,6 +25,9 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"time"
+
+	"go.uber.org/zap/zapcore"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -34,8 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
-
-	"time"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/clientmap"
@@ -59,6 +60,13 @@ var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
+
+func defaultZapOptions() zap.Options {
+	return zap.Options{
+		Development: false,
+		TimeEncoder: zapcore.ISO8601TimeEncoder,
+	}
+}
 
 func bindFlags(fs *flag.FlagSet, pollInterval, orphanGracePeriod *time.Duration) {
 	fs.DurationVar(pollInterval, "poll-interval", defaultPollInterval,
@@ -108,9 +116,7 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	opts := zap.Options{
-		Development: true,
-	}
+	opts := defaultZapOptions()
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
@@ -210,7 +216,12 @@ func main() {
 
 	setupLog.Info("Configured reconciliation parameters",
 		"poll-interval", pollInterval,
-		"orphan-grace-period", orphanGracePeriod)
+		"orphan-grace-period", orphanGracePeriod,
+		"leader-elect", enableLeaderElection,
+		"metrics-bind-address", metricsAddr,
+		"metrics-secure", secureMetrics,
+		"health-probe-bind-address", probeAddr,
+		"debug", debug)
 
 	admissionEventsChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 1024)
 	teardownEventsChan := make(chan slurmtypes.SlurmJobTeardownEvent, 1024)
