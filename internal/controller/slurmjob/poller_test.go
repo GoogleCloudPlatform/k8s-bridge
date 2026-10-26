@@ -965,9 +965,12 @@ func TestPoll_OrphanedJobSet_ReappearanceClearsTracking(t *testing.T) {
 }
 
 type pollerTestEnv struct {
-	poller       *SlurmPoller
-	teardownChan chan slurmtypes.SlurmJobTeardownEvent
-	now          time.Time
+	poller        *SlurmPoller
+	teardownChan  chan slurmtypes.SlurmJobTeardownEvent
+	clientMap     *clientmap.ClientMap
+	mockSlurm     *utils.SlurmClient
+	controllerKey types.NamespacedName
+	now           time.Time
 }
 
 func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, objs ...client.Object) *pollerTestEnv {
@@ -983,11 +986,15 @@ func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, o
 	mockSlurm := &utils.SlurmClient{}
 	mockSlurm.SetPendingJobs(testPartitionName, slurmJobs)
 	cMap := clientmap.NewClientMap()
-	cMap.Add(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+	controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+	cMap.Add(t.Context(), controllerKey, mockSlurm)
 
 	env := &pollerTestEnv{
-		teardownChan: make(chan slurmtypes.SlurmJobTeardownEvent, 10),
-		now:          time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
+		teardownChan:  make(chan slurmtypes.SlurmJobTeardownEvent, 10),
+		clientMap:     cMap,
+		mockSlurm:     mockSlurm,
+		controllerKey: controllerKey,
+		now:           time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
 	}
 	env.poller = &SlurmPoller{
 		Client:            fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm}, objs...)...).Build(),
@@ -1016,6 +1023,35 @@ func (e *pollerTestEnv) drainTeardownEvents() []slurmtypes.SlurmJobTeardownEvent
 		default:
 			return events
 		}
+	}
+}
+
+// expectNoTeardownEvent fails the test if the poller sent a teardown event. step names the poll
+// cycle in the failure message.
+func (e *pollerTestEnv) expectNoTeardownEvent(t *testing.T, step string) {
+	t.Helper()
+	if events := e.drainTeardownEvents(); len(events) != 0 {
+		t.Fatalf("%s: expected no teardown event, got %v", step, events)
+	}
+}
+
+// expectTeardownEvent fails the test if the poller did not send exactly one teardown event, or if
+// a non-empty field of want differs from that event.
+func (e *pollerTestEnv) expectTeardownEvent(t *testing.T, want slurmtypes.SlurmJobTeardownEvent) {
+	t.Helper()
+	events := e.drainTeardownEvents()
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 teardown event, got %d: %v", len(events), events)
+	}
+	got := events[0]
+	if got.JobID != want.JobID {
+		t.Errorf("Teardown event JobID = %q, want %q", got.JobID, want.JobID)
+	}
+	if want.Reason != "" && got.Reason != want.Reason {
+		t.Errorf("Teardown event Reason = %q, want %q", got.Reason, want.Reason)
+	}
+	if want.Partition != "" && got.Partition != want.Partition {
+		t.Errorf("Teardown event Partition = %q, want %q", got.Partition, want.Partition)
 	}
 }
 
@@ -1283,33 +1319,6 @@ func TestPoll_OrphanedJobSet_PrunesDeletedJobSetsFromTracking(t *testing.T) {
 	}
 }
 
-// newOwnedJobSet returns a JobSet for Slurm job jobID that the test WorkloadMixing owns.
-func newOwnedJobSet(jobID string) *jobsetv1alpha2.JobSet {
-	return newTestJobSet("slurm-job-" + jobID).
-		withNamespace(testNamespace).
-		withLabels(map[string]string{
-			LabelSlurmJobID:     jobID,
-			LabelSlurmPartition: testPartitionName,
-		}).
-		withOwnerReference(metav1.OwnerReference{
-			APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-			Kind:       KindWorkloadMixing,
-			Name:       testWMName,
-			UID:        testWMUID,
-		}).
-		build()
-}
-
-// expectNoTeardownEvent fails the test if the poller sent a teardown event.
-func expectNoTeardownEvent(t *testing.T, teardownChan <-chan slurmtypes.SlurmJobTeardownEvent, step string) {
-	t.Helper()
-	select {
-	case ev := <-teardownChan:
-		t.Fatalf("%s: expected no teardown event, got: %v", step, ev)
-	default:
-	}
-}
-
 // TestPoll_OrphanedJobSet_SlurmUnavailable_NoTeardown checks that the poller does not tear down
 // a JobSet when it cannot read the Slurm job list. If the poller used an empty job list instead,
 // a Slurm outage would tear down all running workloads. When Slurm answers again and the job is
@@ -1318,80 +1327,44 @@ func expectNoTeardownEvent(t *testing.T, teardownChan <-chan slurmtypes.SlurmJob
 func TestPoll_OrphanedJobSet_SlurmUnavailable_NoTeardown(t *testing.T) {
 	tests := []struct {
 		name            string
-		makeUnavailable func(ctx context.Context, cMap *clientmap.ClientMap, key types.NamespacedName)
+		makeUnavailable func(t *testing.T, env *pollerTestEnv)
 	}{
 		{
 			name: "Slurm job list fails",
-			makeUnavailable: func(ctx context.Context, cMap *clientmap.ClientMap, key types.NamespacedName) {
-				cMap.Add(ctx, key, &errorClient{})
+			makeUnavailable: func(t *testing.T, env *pollerTestEnv) {
+				env.clientMap.Add(t.Context(), env.controllerKey, &errorClient{})
 			},
 		},
 		{
 			name: "Slurm client not ready",
-			makeUnavailable: func(_ context.Context, cMap *clientmap.ClientMap, key types.NamespacedName) {
-				cMap.Remove(key)
+			makeUnavailable: func(_ *testing.T, env *pollerTestEnv) {
+				env.clientMap.Remove(env.controllerKey)
 			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := t.Context()
-			scheme := runtime.NewScheme()
-			_ = corev1.AddToScheme(scheme)
-			_ = k8sbridgev1alpha1.AddToScheme(scheme)
-			_ = jobsetv1alpha2.AddToScheme(scheme)
-
-			now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
-			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-			wm.UID = testWMUID
-
-			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, newOwnedJobSet("210")).Build()
-			cMap := clientmap.NewClientMap()
-			controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
-			cMap.Add(ctx, controllerKey, &utils.SlurmClient{})
-
-			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-			currentTime := now
-			poller := &SlurmPoller{
-				Client:            fakeK8sClient,
-				ClientMap:         cMap,
-				TeardownEvents:    teardownChan,
-				PollInterval:      10 * time.Second,
-				OrphanGracePeriod: 1 * time.Minute,
-				nowFn:             func() time.Time { return currentTime },
-			}
+			env := newPollerTestEnv(t, nil, newPollerTestJobSet("210").build())
+			start := env.now
 
 			// Poll cycle 1: Slurm answers without job 210, so the grace period starts.
-			if err := poller.Poll(ctx); err != nil {
-				t.Fatalf("Poll cycle 1 failed: %v", err)
-			}
-			expectNoTeardownEvent(t, teardownChan, "Poll cycle 1")
+			env.poll(t)
+			env.expectNoTeardownEvent(t, "Poll cycle 1")
 
 			// Poll cycle 2: the grace period is over, but Slurm is unavailable. The poller
 			// cannot confirm that job 210 is still missing, so it must keep the JobSet.
-			tc.makeUnavailable(ctx, cMap, controllerKey)
-			currentTime = now.Add(70 * time.Second)
-			if err := poller.Poll(ctx); err != nil {
-				t.Fatalf("Poll cycle 2 failed: %v", err)
-			}
-			expectNoTeardownEvent(t, teardownChan, "Poll cycle 2")
+			tc.makeUnavailable(t, env)
+			env.now = start.Add(70 * time.Second)
+			env.poll(t)
+			env.expectNoTeardownEvent(t, "Poll cycle 2")
 
 			// Poll cycle 3: Slurm answers again, and job 210 is still missing. This also proves
 			// that poll cycle 1 started the grace period, so poll cycle 2 checked a real case.
-			cMap.Add(ctx, controllerKey, &utils.SlurmClient{})
-			currentTime = now.Add(80 * time.Second)
-			if err := poller.Poll(ctx); err != nil {
-				t.Fatalf("Poll cycle 3 failed: %v", err)
-			}
-			select {
-			case ev := <-teardownChan:
-				if ev.JobID != "210" {
-					t.Errorf("Expected JobID 210, got %s", ev.JobID)
-				}
-			default:
-				t.Fatal("Expected teardown event when Slurm answers again without job 210, got none")
-			}
+			env.clientMap.Add(t.Context(), env.controllerKey, env.mockSlurm)
+			env.now = start.Add(80 * time.Second)
+			env.poll(t)
+			env.expectTeardownEvent(t, slurmtypes.SlurmJobTeardownEvent{JobID: "210", Reason: metrics.ReasonJobOrphaned})
 		})
 	}
 }
@@ -1401,78 +1374,38 @@ func TestPoll_OrphanedJobSet_SlurmUnavailable_NoTeardown(t *testing.T) {
 // The job is in Slurm before the outage, so the grace period starts at the first successful poll
 // after the outage that does not find the job.
 func TestPoll_OrphanedJobSet_SlurmOutage_GracePeriodStartsAfterRecovery(t *testing.T) {
-	ctx := t.Context()
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = k8sbridgev1alpha1.AddToScheme(scheme)
-	_ = jobsetv1alpha2.AddToScheme(scheme)
-
-	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
-	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-	wm.UID = testWMUID
-
-	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, newOwnedJobSet("211")).Build()
-	cMap := clientmap.NewClientMap()
-	mockSlurm := &utils.SlurmClient{}
-	mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{newRunningJob(211, testPartitionName)})
-	controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
-	cMap.Add(ctx, controllerKey, mockSlurm)
-
-	teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-	currentTime := now
-	poller := &SlurmPoller{
-		Client:            fakeK8sClient,
-		ClientMap:         cMap,
-		TeardownEvents:    teardownChan,
-		PollInterval:      10 * time.Second,
-		OrphanGracePeriod: 1 * time.Minute,
-		nowFn:             func() time.Time { return currentTime },
-	}
+	env := newPollerTestEnv(t,
+		[]slurmclienttypes.V0044JobInfo{newRunningJob(211, testPartitionName)},
+		newPollerTestJobSet("211").build(),
+	)
+	start := env.now
 
 	// Poll cycle 1: job 211 runs in Slurm.
-	if err := poller.Poll(ctx); err != nil {
-		t.Fatalf("Poll cycle 1 failed: %v", err)
-	}
-	expectNoTeardownEvent(t, teardownChan, "Poll cycle 1")
+	env.poll(t)
+	env.expectNoTeardownEvent(t, "Poll cycle 1")
 
 	// Poll cycles 2 to 4: Slurm is unavailable for 3 minutes, which is 3 times the grace period.
-	cMap.Add(ctx, controllerKey, &errorClient{})
+	env.clientMap.Add(t.Context(), env.controllerKey, &errorClient{})
 	for _, elapsed := range []time.Duration{10 * time.Second, 70 * time.Second, 3 * time.Minute} {
-		currentTime = now.Add(elapsed)
-		if err := poller.Poll(ctx); err != nil {
-			t.Fatalf("Poll at %s failed: %v", elapsed, err)
-		}
-		expectNoTeardownEvent(t, teardownChan, fmt.Sprintf("Poll at %s with Slurm unavailable", elapsed))
+		env.now = start.Add(elapsed)
+		env.poll(t)
+		env.expectNoTeardownEvent(t, fmt.Sprintf("Poll at %s with Slurm unavailable", elapsed))
 	}
 
 	// Poll cycle 5: Slurm is available again, but job 211 is gone, for example because slurmctld
 	// lost its state. This poll is the first one that does not find the job, so the grace period
 	// starts now.
-	mockSlurm.SetPendingJobs(testPartitionName, nil)
-	cMap.Add(ctx, controllerKey, mockSlurm)
-	recovery := now.Add(3*time.Minute + 10*time.Second)
-	currentTime = recovery
-	if err := poller.Poll(ctx); err != nil {
-		t.Fatalf("Poll cycle 5 failed: %v", err)
-	}
-	expectNoTeardownEvent(t, teardownChan, "Poll cycle 5")
+	env.mockSlurm.SetPendingJobs(testPartitionName, nil)
+	env.clientMap.Add(t.Context(), env.controllerKey, env.mockSlurm)
+	recovery := start.Add(3*time.Minute + 10*time.Second)
+	env.now = recovery
+	env.poll(t)
+	env.expectNoTeardownEvent(t, "Poll cycle 5")
 
 	// Poll cycle 6: the grace period that started at recovery is over.
-	currentTime = recovery.Add(70 * time.Second)
-	if err := poller.Poll(ctx); err != nil {
-		t.Fatalf("Poll cycle 6 failed: %v", err)
-	}
-	select {
-	case ev := <-teardownChan:
-		if ev.JobID != "211" {
-			t.Errorf("Expected JobID 211, got %s", ev.JobID)
-		}
-		if ev.Reason != metrics.ReasonJobOrphaned {
-			t.Errorf("Expected reason %s, got %s", metrics.ReasonJobOrphaned, ev.Reason)
-		}
-	default:
-		t.Fatal("Expected teardown event after the grace period that started at recovery, got none")
-	}
+	env.now = recovery.Add(70 * time.Second)
+	env.poll(t)
+	env.expectTeardownEvent(t, slurmtypes.SlurmJobTeardownEvent{JobID: "211", Reason: metrics.ReasonJobOrphaned})
 }
 
 func TestShouldEmitAdmissionEvent(t *testing.T) {

@@ -110,17 +110,6 @@ func TestReconcile_PermanentFailure_TranslationError(t *testing.T) {
 	env.verifySlurmCancellation("missing GRES mapping for gpu:a100")
 }
 
-func TestReconcile_TemporaryFailure_GetJobError(t *testing.T) {
-	env := newReconcileTestEnv(t)
-	env.mockSlurm.GetError = errors.New("connection refused")
-
-	_, err := env.reconcile()
-	verifyError(t, err, "connection refused")
-
-	env.verifyJobSetNotFound()
-	env.verifyNoSlurmUpdates()
-}
-
 func TestReconcile_JobNotFound_Skipped(t *testing.T) {
 	tests := []struct {
 		name string
@@ -159,10 +148,10 @@ func TestReconcile_JobNotFound_Skipped(t *testing.T) {
 	}
 }
 
-// TestReconcile_SlurmUnavailable_KeepsExistingJobSet checks that the reconciler does not change
-// the JobSet, and does not cancel the job, when it cannot read the job from Slurm. The failed
-// JobSet case matters most: with the job data, the reconciler would cancel the job, delete its
-// dynamic nodes, and delete the JobSet.
+// TestReconcile_SlurmUnavailable_KeepsExistingJobSet checks that the reconciler does not create,
+// change, or delete a JobSet, and does not cancel the job, when it cannot read the job from Slurm.
+// The failed JobSet case matters most: with the job data, the reconciler would cancel the job,
+// delete its dynamic nodes, and delete the JobSet.
 func TestReconcile_SlurmUnavailable_KeepsExistingJobSet(t *testing.T) {
 	slurmStates := []struct {
 		name        string
@@ -170,6 +159,7 @@ func TestReconcile_SlurmUnavailable_KeepsExistingJobSet(t *testing.T) {
 		getError    error
 		wantErr     string
 		wantRequeue time.Duration
+		wantLog     string
 	}{
 		{
 			name:     "Slurm API returns an error",
@@ -180,12 +170,17 @@ func TestReconcile_SlurmUnavailable_KeepsExistingJobSet(t *testing.T) {
 			name:        "Slurm client not ready",
 			opts:        []reconcileEnvOpt{withWithoutSlurmClient()},
 			wantRequeue: 5 * time.Second,
+			wantLog:     "Slurm client not found in ClientMap, requeuing Slurm job",
 		},
 	}
 	jobSets := []struct {
 		name  string
 		build func() *jobsetv1alpha2.JobSet
 	}{
+		{
+			name:  "no JobSet",
+			build: func() *jobsetv1alpha2.JobSet { return nil },
+		},
 		{
 			name: "running JobSet",
 			build: func() *jobsetv1alpha2.JobSet {
@@ -206,25 +201,42 @@ func TestReconcile_SlurmUnavailable_KeepsExistingJobSet(t *testing.T) {
 
 	for _, slurm := range slurmStates {
 		t.Run(slurm.name, func(t *testing.T) {
-			for _, js := range jobSets {
-				t.Run(js.name, func(t *testing.T) {
-					opts := append([]reconcileEnvOpt{withExtraObjects(js.build())}, slurm.opts...)
+			for _, tc := range jobSets {
+				t.Run(tc.name, func(t *testing.T) {
+					js := tc.build()
+					var opts []reconcileEnvOpt
+					if js != nil {
+						opts = append(opts, withExtraObjects(js))
+					}
+					opts = append(opts, slurm.opts...)
 					env := newReconcileTestEnv(t, opts...)
 					env.mockSlurm.GetError = slurm.getError
-					before := env.getJobSet()
+					var before *jobsetv1alpha2.JobSet
+					if js != nil {
+						before = env.getJobSet()
+					}
+					ctx, recorded := newObservedLoggerContext(t.Context())
 
-					res, err := env.reconcile()
-					switch {
-					case slurm.wantErr == "" && err != nil:
-						t.Errorf("Expected no error, got %v", err)
-					case slurm.wantErr != "" && (err == nil || !strings.Contains(err.Error(), slurm.wantErr)):
-						t.Errorf("Expected error containing %q, got %v", slurm.wantErr, err)
+					res, err := env.reconcile(ctx)
+					if slurm.wantErr != "" {
+						verifyError(t, err, slurm.wantErr)
+					} else if err != nil {
+						t.Fatalf("Reconcile failed: %v", err)
 					}
 					if res.RequeueAfter != slurm.wantRequeue {
 						t.Errorf("Expected requeue after %v, got %v", slurm.wantRequeue, res.RequeueAfter)
 					}
+					if slurm.wantLog != "" {
+						if got := recorded.FilterMessage(slurm.wantLog).Len(); got != 1 {
+							t.Errorf("Expected 1 log entry %q, got %d", slurm.wantLog, got)
+						}
+					}
 
-					env.verifyJobSetUnchanged(before)
+					if before == nil {
+						env.verifyJobSetNotFound()
+					} else {
+						env.verifyJobSetUnchanged(before)
+					}
 					env.verifyNoSlurmUpdates()
 				})
 			}
@@ -952,28 +964,6 @@ func TestReconcile_Cancelled_MultiPartition(t *testing.T) {
 
 	env.verifySlurmCancellation("Multi-partition jobs with multiple mapped partitions are not supported")
 	env.verifyJobSetNotFound()
-}
-
-func TestReconcile_Graceful_MissingClient(t *testing.T) {
-	env := newReconcileTestEnv(t, withWithoutSlurmClient())
-
-	var buf bytes.Buffer
-	testLogger := zap.New(zap.WriteTo(&buf), zap.UseDevMode(true))
-	ctx := logf.IntoContext(context.Background(), testLogger)
-
-	res, err := env.reconcile(ctx)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
-	}
-
-	if res.RequeueAfter != 5*time.Second {
-		t.Errorf("Expected requeue after 5s, got %v", res.RequeueAfter)
-	}
-
-	logOutput := buf.String()
-	if !strings.Contains(logOutput, "Slurm client not found in ClientMap") {
-		t.Errorf("Expected log message about missing client not found: %s", logOutput)
-	}
 }
 
 func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
