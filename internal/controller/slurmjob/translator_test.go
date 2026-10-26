@@ -184,8 +184,7 @@ func TestTranslateSlurmJobToJobSet_Replicas(t *testing.T) {
 	translator := NewJobSetTranslator()
 	controller := getTestController()
 
-	// Jobs without task information ask for 1 CPU per pod. The translator rounds it up to
-	// 1 whole core (2 CPUs) and applies the 2048MB-per-CPU memory fallback.
+	// A job without task information gets 1 CPU, rounded up to 1 core (2 CPUs), and 2048MB per CPU.
 	const singleTaskCPU, singleTaskMem = "2", "4096Mi"
 
 	tests := []struct {
@@ -337,8 +336,7 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 		)
 	})
 
-	// slurmrestd reports cpus_per_task as set to 1 for every job without -c.
-	// TresPerNode and CpusPerTres use the format of a real job record.
+	// slurmrestd reports cpus_per_task=1 for a job without -c. The TRES strings use the real record format.
 	t.Run("Success - Resource Calculation - CpusPerTres (GPU) with reported CpusPerTask", func(t *testing.T) {
 		const oneL4PerNode = "gres/gpu:l4:1"
 		tests := []struct {

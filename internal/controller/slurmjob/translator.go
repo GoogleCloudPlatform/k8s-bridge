@@ -705,14 +705,13 @@ func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int
 	return (tasks + int64(replicas) - 1) / int64(replicas)
 }
 
-// assumedThreadsPerCore is the number of hardware threads per CPU core that the translator
-// assumes for the nodes that run slurmd pods. The translator does not know the node of a pod
-// when it builds the JobSet.
+// assumedThreadsPerCore is the threads per core that the translator assumes for the
+// node of a pod, which it does not know when it builds the JobSet.
+// TODO: consider exposing this value as a WorkloadMixing API field.
 const assumedThreadsPerCore = 2
 
-// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs per node * --cpus-per-gpu),
-// because slurmrestd reports cpus_per_task=1 even for jobs that use --cpus-per-gpu.
-// The result is rounded up to whole cores, see roundUpToWholeCores.
+// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs * --cpus-per-gpu)
+// rounded up to whole cores. slurmrestd reports cpus_per_task=1 for --cpus-per-gpu jobs.
 func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, gpu *resolvedGRES) int64 {
 	cpusPerTask := int64(1)
 	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
@@ -729,12 +728,8 @@ func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, g
 	return roundUpToWholeCores(cpu)
 }
 
-// roundUpToWholeCores rounds cpus up to a multiple of assumedThreadsPerCore. By default
-// (SelectTypeParameters=CR_Core_Memory), Slurm allocates every CPU of an allocated core,
-// so a job that asks for 3 CPUs on a node with 2 threads per core gets 4 CPUs.
-//
-// Reference: CR_Core in slurm.conf(5)
-// https://github.com/SchedMD/slurm/blob/slurm-26-05-5-1/doc/man/man5/slurm.conf.5#L5098-L5105
+// roundUpToWholeCores rounds cpus up to a multiple of assumedThreadsPerCore, because Slurm
+// allocates whole cores by default (CR_Core in slurm.conf(5)).
 func roundUpToWholeCores(cpus int64) int64 {
 	return (cpus + assumedThreadsPerCore - 1) / assumedThreadsPerCore * assumedThreadsPerCore
 }
