@@ -705,14 +705,22 @@ func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int
 	return (tasks + int64(replicas) - 1) / int64(replicas)
 }
 
-// assumedThreadsPerCore is the threads per core that the translator assumes for the
-// node of a pod, which it does not know when it builds the JobSet.
-// TODO: consider exposing this value as a WorkloadMixing API field.
-const assumedThreadsPerCore = 2
+// defaultThreadsPerCore is the threads per core that the translator assumes when
+// WorkloadMixing.spec.threadsPerCore is not set.
+const defaultThreadsPerCore = 2
 
-// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs * --cpus-per-gpu)
-// rounded up to whole cores. slurmrestd reports cpus_per_task=1 for --cpus-per-gpu jobs.
-func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, gpu *resolvedGRES) int64 {
+// resolveThreadsPerCore returns spec.threadsPerCore, or defaultThreadsPerCore when it is not set.
+func resolveThreadsPerCore(wmSpec *k8sbridgev1alpha1.WorkloadMixingSpec) int64 {
+	if wmSpec != nil && wmSpec.ThreadsPerCore != nil && *wmSpec.ThreadsPerCore > 0 {
+		return int64(*wmSpec.ThreadsPerCore)
+	}
+	return defaultThreadsPerCore
+}
+
+// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs per pod * --cpus-per-gpu)
+// rounded up to whole cores. The Slurm CLI rejects --cpus-per-task together with --cpus-per-gpu,
+// so slurmrestd reports the default cpus_per_task=1 for a --cpus-per-gpu job.
+func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, gpu *resolvedGRES, threadsPerCore int64) int64 {
 	cpusPerTask := int64(1)
 	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
 		if n := int64(ptr.Deref(job.CpusPerTask.Number, 0)); n > 0 {
@@ -725,13 +733,16 @@ func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, g
 			cpu = max(cpu, gpu.count*cpusPerGPU)
 		}
 	}
-	return roundUpToWholeCores(cpu)
+	return roundUpToWholeCores(cpu, threadsPerCore)
 }
 
-// roundUpToWholeCores rounds cpus up to a multiple of assumedThreadsPerCore, because Slurm
+// roundUpToWholeCores rounds cpus up to a multiple of threadsPerCore, because Slurm
 // allocates whole cores by default (CR_Core in slurm.conf(5)).
-func roundUpToWholeCores(cpus int64) int64 {
-	return (cpus + assumedThreadsPerCore - 1) / assumedThreadsPerCore * assumedThreadsPerCore
+func roundUpToWholeCores(cpus, threadsPerCore int64) int64 {
+	if threadsPerCore <= 1 {
+		return cpus
+	}
+	return (cpus + threadsPerCore - 1) / threadsPerCore * threadsPerCore
 }
 
 func parseGRES(tresStr string) ([]gresRequest, error) {
@@ -895,7 +906,7 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 		nodeSelectors = maps.Clone(mapping.NodeSelectors)
 	}
 
-	cpu := resolveCPUsPerPod(job, tasksPerNode, resolvedGPU)
+	cpu := resolveCPUsPerPod(job, tasksPerNode, resolvedGPU, resolveThreadsPerCore(wmSpec))
 
 	// Resolve Memory per pod
 	var memCandidates []int64

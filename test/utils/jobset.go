@@ -187,7 +187,9 @@ func VerifyJobSetSizing(name, ns string, wantReplicas int32, wantCPU, wantMemory
 
 		slurmdContainer := findSlurmdContainer(&repJob.Template.Spec.Template.Spec)
 		g.Expect(slurmdContainer).NotTo(gomega.BeNil(), "slurmd container not found")
-		g.Expect(slurmdContainer.Resources.Requests.Cpu().String()).To(gomega.Equal(wantCPU), "slurmd CPU request mismatch")
+		gotCPU := slurmdContainer.Resources.Requests.Cpu()
+		g.Expect(gotCPU.Cmp(resource.MustParse(wantCPU))).To(gomega.Equal(0),
+			fmt.Sprintf("slurmd CPU request is %s, want %s", gotCPU.String(), wantCPU))
 		gotMemory := slurmdContainer.Resources.Requests.Memory()
 		g.Expect(gotMemory.Cmp(resource.MustParse(wantMemory))).To(gomega.Equal(0),
 			fmt.Sprintf("slurmd memory request is %s, want %s", gotMemory.String(), wantMemory))

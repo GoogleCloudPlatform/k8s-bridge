@@ -384,6 +384,15 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
 				wantGPU:     resource.MustParse("1"),
 			},
+			{
+				name:        "no cpus per GPU falls back to task CPUs",
+				tasks:       3,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "",
+				wantCPU:     resource.MustParse("4"),      // 3 tasks * 1 = 3, rounded up to 4
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -469,23 +478,49 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 			}),
 		)
 	})
+
+	t.Run("Success - Resource Calculation - ThreadsPerCore 1 does not round up", func(t *testing.T) {
+		job := newTestJob().
+			withCpusPerTask(3).
+			withMemoryPerCpu(1024).
+			build()
+		wmSpec := newTestWMSpec().withThreadsPerCore(1).build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+
+		// CPUs = CpusPerTask (3) * TasksPerNode (1) = 3, no rounding with 1 thread per core
+		wantCPU := resource.MustParse("3")
+		// Memory = Max(MemoryPerCpu (1024MB) * CPUs (3) = 3072MB, fallback (3 * 2048 = 6144MB)) = 6144Mi
+		wantMem := resource.MustParse("6144Mi")
+
+		verifyJobSet(t, obj, err, "123", 1,
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    wantCPU,
+				corev1.ResourceMemory: wantMem,
+			}),
+		)
+	})
 }
 
 func TestRoundUpToWholeCores(t *testing.T) {
 	tests := []struct {
-		cpus int64
-		want int64
+		cpus           int64
+		threadsPerCore int64
+		want           int64
 	}{
-		{cpus: 1, want: 2},
-		{cpus: 2, want: 2},
-		{cpus: 3, want: 4},
-		{cpus: 4, want: 4},
-		{cpus: 7, want: 8},
+		{cpus: 1, threadsPerCore: 2, want: 2},
+		{cpus: 2, threadsPerCore: 2, want: 2},
+		{cpus: 3, threadsPerCore: 2, want: 4},
+		{cpus: 4, threadsPerCore: 2, want: 4},
+		{cpus: 7, threadsPerCore: 2, want: 8},
+		{cpus: 1, threadsPerCore: 1, want: 1},
+		{cpus: 3, threadsPerCore: 1, want: 3},
+		{cpus: 5, threadsPerCore: 4, want: 8},
 	}
 
 	for _, tt := range tests {
-		if got := roundUpToWholeCores(tt.cpus); got != tt.want {
-			t.Errorf("roundUpToWholeCores(%d) = %d, want %d", tt.cpus, got, tt.want)
+		if got := roundUpToWholeCores(tt.cpus, tt.threadsPerCore); got != tt.want {
+			t.Errorf("roundUpToWholeCores(%d, %d) = %d, want %d", tt.cpus, tt.threadsPerCore, got, tt.want)
 		}
 	}
 }

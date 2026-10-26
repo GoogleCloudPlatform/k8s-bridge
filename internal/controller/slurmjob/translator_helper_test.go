@@ -162,6 +162,11 @@ func (b *testWMSpecBuilder) withPodTemplateLabels(labels map[string]string) *tes
 	return b
 }
 
+func (b *testWMSpecBuilder) withThreadsPerCore(threads int32) *testWMSpecBuilder {
+	b.spec.ThreadsPerCore = ptr.To(threads)
+	return b
+}
+
 func (b *testWMSpecBuilder) ensurePodTemplate() {
 	if b.spec.PodTemplate == nil {
 		b.spec.PodTemplate = &corev1.PodTemplateSpec{}

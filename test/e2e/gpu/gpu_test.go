@@ -95,13 +95,11 @@ var _ = Describe("GPU Manager", Ordered, func() {
 		)
 
 		// slurmrestd reports cpus_per_task=1 for a job without -c, so the pod must take its
-		// CPUs from --cpus-per-gpu. Each entry asks for 1 GPU, and Slurm allocates whole cores.
+		// CPUs from --cpus-per-gpu. Each entry asks for 1 GPU on a node with 2 threads per
+		// core, so Slurm allocates whole cores: --cpus-per-gpu=1 still allocates 2 CPUs.
 		DescribeTable("should request the CPUs that Slurm allocates for --cpus-per-gpu",
-			func(args ...string) {
-				const (
-					configPath = "test/e2e/testdata/workloadmixing_gpu.yaml"
-					cpusPerGPU = "2"
-				)
+			func(cpusPerGPU, wantCPUs string, args ...string) {
+				const configPath = "test/e2e/testdata/workloadmixing_gpu.yaml"
 
 				By("applying the WorkloadMixing GPU CR")
 				utils.ApplyManifestWithCleanup(configPath)
@@ -119,21 +117,22 @@ var _ = Describe("GPU Manager", Ordered, func() {
 				utils.VerifyJobSetCreatedWithGPU(jobSetName, slurmNamespace, jobID, "1")
 
 				By("verifying the slurmd pod requests the CPUs for --cpus-per-gpu")
-				// Memory: --mem=4096 and the 2048 MiB per CPU fallback both give 4096Mi.
-				utils.VerifyJobSetSizing(jobSetName, slurmNamespace, 1, cpusPerGPU, "4096Mi")
+				// Memory: --mem=4096 is at least the 2048 MiB per CPU fallback in every entry.
+				utils.VerifyJobSetSizing(jobSetName, slurmNamespace, 1, wantCPUs, "4096Mi")
 
 				By("verifying that Slurm allocated the same number of CPUs to the job")
 				utils.NewSlurmJobVerifier(slurmNamespace, jobID).
 					WithState("COMPLETED").
-					WithNumCPUs(cpusPerGPU).
+					WithNumCPUs(wantCPUs).
 					Verify()
 
 				By("verifying the JobSet is deleted")
 				utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
 			},
-			Entry("--gpus-per-node=nvidia_l4:1", "--gpus-per-node=nvidia_l4:1"),
-			Entry("--gpus-per-task=nvidia_l4:1", "--ntasks=1", "--gpus-per-task=nvidia_l4:1"),
-			Entry("--gpus=nvidia_l4:1", "--gpus=nvidia_l4:1"),
+			Entry("--gpus-per-node=nvidia_l4:1 --cpus-per-gpu=2", "2", "2", "--gpus-per-node=nvidia_l4:1"),
+			Entry("--gpus-per-task=nvidia_l4:1 --cpus-per-gpu=2", "2", "2", "--ntasks=1", "--gpus-per-task=nvidia_l4:1"),
+			Entry("--gpus=nvidia_l4:1 --cpus-per-gpu=2", "2", "2", "--gpus=nvidia_l4:1"),
+			Entry("--gpus=nvidia_l4:1 --cpus-per-gpu=1 rounds up to a whole core", "1", "2", "--gpus=nvidia_l4:1"),
 		)
 
 		It("should cancel Slurm job if translation fails due to unmapped GRES", func() {

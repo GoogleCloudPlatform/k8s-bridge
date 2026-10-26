@@ -79,6 +79,14 @@ type WorkloadMixingSpec struct {
 	// PodTemplate is an optional template for the Pods that will be created.
 	// +optional
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
+
+	// ThreadsPerCore is the number of hardware threads per core on the nodes that run the
+	// slurmd pods. Slurm allocates whole cores, so k8s-bridge rounds the CPU request of each
+	// pod up to a multiple of this value. Set 1 for node pools without SMT.
+	// +kubebuilder:default=2
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ThreadsPerCore *int32 `json:"threadsPerCore,omitempty"`
 }
 
 // WorkloadMixingStatus defines the observed state of WorkloadMixing.
