@@ -96,8 +96,8 @@ var _ = Describe("GPU Manager", Ordered, func() {
 
 		// slurmrestd reports cpus_per_task=1 for a job without -c, so the slurmd pod
 		// must take its CPU request from --cpus-per-gpu. Each entry asks for 1 GPU.
-		// The CPU count is even because Slurm allocates whole cores and rounds an odd
-		// count up on nodes with 2 threads per core.
+		// Slurm allocates whole cores, and the translator rounds the CPU request up to
+		// whole cores of 2 CPUs, so on nodes with 2 threads per core both counts are equal.
 		DescribeTable("should request the CPUs that Slurm allocates for --cpus-per-gpu",
 			func(args ...string) {
 				const (
