@@ -1,0 +1,97 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The resilience e2e suite (test/e2e/resilience) deploys this Slurm cluster.
+# It is a copy of slurm_cluster.yaml with slurmctld persistence enabled.
+# Keep all other fields equal to slurm_cluster.yaml.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slurm-auth-jwt
+  namespace: slurm
+type: Opaque
+data:
+  # Base64 encoded string: "thisisjwtkeyatleast32byteslong12345"
+  jwt.key: dGhpc2lzand0a2V5YXRsZWFzdDMyYnl0ZXNsb25nMTIzNDU=
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slurm-auth-slurm
+  namespace: slurm
+type: Opaque
+data:
+  # Base64 encoded string: "thisismungekeyatleast32byteslong123"
+  slurm.key: dGhpc2lzbXVuZ2VrZXlhdGxlYXN0MzJieXRlc2xvbmcxMjM=
+---
+apiVersion: slinky.slurm.net/v1beta1
+kind: Controller
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  extraConf: |
+    GresTypes=gpu
+    EnforcePartLimits=NO
+    SchedulerParameters=ignore_constraint_validation
+    NodeSet=kdyn_nodes Feature=dynamic_kpartition
+    PartitionName=workloadmixing-partition Nodes=kdyn_nodes
+    PartitionName=workloadmixing-debug-partition Nodes=kdyn_nodes
+    PartitionName=workloadmixing-other-partition Nodes=kdyn_nodes
+    PartitionName=workloadmixing-other-partition-2 Nodes=kdyn_nodes
+    JobSubmitPlugins=job_submit/lua
+    CliFilterPlugins=cli_filter/lua
+    CliFilterParameters=workload_mixing_partitions=workloadmixing-partition,workloadmixing-debug-partition
+  configFileRefs:
+    - name: slurm-job-submit-lua
+    - name: slurm-cli-filter-lua
+  clusterName: slurm
+  # slurmctld keeps its StateSaveLocation on the PVC statesave-slurm-controller-0.
+  # Slinky copies these fields into the volume claim template of the StatefulSet.
+  # A claim without accessModes and a storage request fails validation.
+  # storageClassName is not set, so Kind uses its default class "standard" (local-path).
+  persistence:
+    enabled: true
+    accessModes: ["ReadWriteOnce"]
+    resources:
+      requests:
+        storage: 1Gi
+  jwtKeyRef:
+    name: slurm-auth-jwt
+    key: jwt.key
+  slurmKeyRef:
+    name: slurm-auth-slurm
+    key: slurm.key
+  # LINT.IfChange(slurm_version_pair)
+  slurmctld:
+    image: ghcr.io/slinkyproject/slurmctld:26.05-ubuntu24.04
+    env:
+      - name: WORKLOAD_MIXING_PARTITIONS
+        value: "workloadmixing-partition,workloadmixing-debug-partition"
+  reconfigure:
+    image: ghcr.io/slinkyproject/slurmctld:26.05-ubuntu24.04
+  logfile:
+    image: ghcr.io/slinkyproject/slurmctld:26.05-ubuntu24.04
+---
+apiVersion: slinky.slurm.net/v1beta1
+kind: RestApi
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+  slurmrestd:
+    image: ghcr.io/slinkyproject/slurmrestd:26.05-ubuntu24.04
+  # LINT.ThenChange(test/utils/slurm.go:slurm_version_pair)
