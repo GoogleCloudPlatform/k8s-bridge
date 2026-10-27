@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
@@ -459,46 +460,103 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 		)
 	})
 
-	t.Run("Success - Resource Calculation - Odd CpusPerTask rounds up to whole cores", func(t *testing.T) {
-		job := newTestJob().
-			withCpusPerTask(3).
-			build()
+	t.Run("Success - Resource Calculation - ThreadsPerCore rounding", func(t *testing.T) {
+		tests := []struct {
+			name                    string
+			cpusPerTask             int32
+			threadsPerCore          *int32
+			partitionThreadsPerCore *int32
+			otherPartThreadsPerCore *int32
+			wantCPU                 resource.Quantity
+			wantMem                 resource.Quantity
+		}{
+			{
+				name:           "nil threadsPerCore uses default 2 and rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: nil,
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:           "threadsPerCore 1 keeps 3 as 3",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(1)),
+				wantCPU:        resource.MustParse("3"),
+				wantMem:        resource.MustParse("6144Mi"),
+			},
+			{
+				name:           "threadsPerCore 2 rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(2)),
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:           "threadsPerCore 4 rounds 5 up to 8",
+				cpusPerTask:    5,
+				threadsPerCore: ptr.To(int32(4)),
+				wantCPU:        resource.MustParse("8"),
+				wantMem:        resource.MustParse("16384Mi"),
+			},
+			{
+				name:           "threadsPerCore 0 uses default 2 and rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(0)),
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:                    "partition threadsPerCore 1 overrides spec threadsPerCore 2",
+				cpusPerTask:             3,
+				threadsPerCore:          ptr.To(int32(2)),
+				partitionThreadsPerCore: ptr.To(int32(1)),
+				wantCPU:                 resource.MustParse("3"),
+				wantMem:                 resource.MustParse("6144Mi"),
+			},
+			{
+				name:                    "partition threadsPerCore 4 overrides spec threadsPerCore 1",
+				cpusPerTask:             5,
+				threadsPerCore:          ptr.To(int32(1)),
+				partitionThreadsPerCore: ptr.To(int32(4)),
+				wantCPU:                 resource.MustParse("8"),
+				wantMem:                 resource.MustParse("16384Mi"),
+			},
+			{
+				name:                    "other partition threadsPerCore does not affect target partition",
+				cpusPerTask:             3,
+				threadsPerCore:          nil,
+				otherPartThreadsPerCore: ptr.To(int32(1)),
+				wantCPU:                 resource.MustParse("4"),
+				wantMem:                 resource.MustParse("8192Mi"),
+			},
+		}
 
-		obj, err := translator.Translate(job, wmSpec, controller)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				job := newTestJob().
+					withCpusPerTask(tt.cpusPerTask).
+					build()
+				wmBuilder := newTestWMSpec()
+				if tt.threadsPerCore != nil {
+					wmBuilder = wmBuilder.withThreadsPerCore(*tt.threadsPerCore)
+				}
+				if tt.partitionThreadsPerCore != nil {
+					wmBuilder = wmBuilder.withPartitionThreadsPerCore(testDefaultPartition, *tt.partitionThreadsPerCore)
+				}
+				if tt.otherPartThreadsPerCore != nil {
+					wmBuilder = wmBuilder.withPartitionThreadsPerCore("low-prio", *tt.otherPartThreadsPerCore)
+				}
 
-		// CPUs = CpusPerTask (3) * TasksPerNode (1) = 3, rounded up to 2 whole cores = 4
-		wantCPU := resource.MustParse("4")
-		// Memory = fallback (4 * 2048 = 8192MB) = 8192Mi
-		wantMem := resource.MustParse("8192Mi")
+				obj, err := translator.Translate(job, wmBuilder.build(), controller)
 
-		verifyJobSet(t, obj, err, "123", 1,
-			withRequests(corev1.ResourceList{
-				corev1.ResourceCPU:    wantCPU,
-				corev1.ResourceMemory: wantMem,
-			}),
-		)
-	})
-
-	t.Run("Success - Resource Calculation - ThreadsPerCore 1 does not round up", func(t *testing.T) {
-		job := newTestJob().
-			withCpusPerTask(3).
-			withMemoryPerCpu(1024).
-			build()
-		wmSpec := newTestWMSpec().withThreadsPerCore(1).build()
-
-		obj, err := translator.Translate(job, wmSpec, controller)
-
-		// CPUs = CpusPerTask (3) * TasksPerNode (1) = 3, no rounding with 1 thread per core
-		wantCPU := resource.MustParse("3")
-		// Memory = Max(MemoryPerCpu (1024MB) * CPUs (3) = 3072MB, fallback (3 * 2048 = 6144MB)) = 6144Mi
-		wantMem := resource.MustParse("6144Mi")
-
-		verifyJobSet(t, obj, err, "123", 1,
-			withRequests(corev1.ResourceList{
-				corev1.ResourceCPU:    wantCPU,
-				corev1.ResourceMemory: wantMem,
-			}),
-		)
+				verifyJobSet(t, obj, err, "123", 1,
+					withRequests(corev1.ResourceList{
+						corev1.ResourceCPU:    tt.wantCPU,
+						corev1.ResourceMemory: tt.wantMem,
+					}),
+				)
+			})
+		}
 	})
 }
 

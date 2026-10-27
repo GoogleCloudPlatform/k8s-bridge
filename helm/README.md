@@ -26,6 +26,14 @@ Or to install from the local chart directory:
 helm install k8s-bridge . --namespace k8s-bridge-system --create-namespace
 ```
 
+## Upgrading the Chart
+
+Helm does not update CRDs in `crds/` during `helm upgrade`. Apply the updated CRDs before you upgrade the chart so Kubernetes recognizes new `WorkloadMixing` fields (such as `threadsPerCore`):
+
+```console
+kubectl apply --server-side -f helm/crds/
+```
+
 ## Uninstalling the Chart
 
 JobSets created by `k8s-bridge` carry the `k8s-bridge.x-k8s.io/slurm-node-cleanup` finalizer. Delete your WorkloadMixing resources first and wait until this returns no resources:

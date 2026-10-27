@@ -116,6 +116,13 @@ spec:
                       description: Partition is the name of the Slurm partition to
                         observe/map.
                       type: string
+                    threadsPerCore:
+                      description: |-
+                        ThreadsPerCore overrides spec.threadsPerCore for this partition when its node pool uses a
+                        different SMT setting.
+                      format: int32
+                      minimum: 1
+                      type: integer
                     workloadPriorityClass:
                       description: WorkloadPriorityClass is the name of the Kueue
                         WorkloadPriorityClass to map this partition to.

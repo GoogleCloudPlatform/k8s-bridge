@@ -41,6 +41,12 @@ type PartitionMapping struct {
 	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9_-]+$"
 	// +optional
 	DynamicNodeFeature string `json:"dynamicNodeFeature,omitempty"`
+
+	// ThreadsPerCore overrides spec.threadsPerCore for this partition when its node pool uses a
+	// different SMT setting.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ThreadsPerCore *int32 `json:"threadsPerCore,omitempty"`
 }
 
 type GenericResourceMapping struct {
@@ -83,7 +89,10 @@ type WorkloadMixingSpec struct {
 	// ThreadsPerCore is the number of hardware threads per core on the nodes that run the
 	// slurmd pods. Slurm allocates whole cores, so k8s-bridge rounds the CPU request of each
 	// pod up to a multiple of this value. Set 1 for node pools without SMT.
+	// ---
+	// LINT.IfChange(default_threads_per_core)
 	// +kubebuilder:default=2
+	// LINT.ThenChange(internal/controller/slurmjob/translator.go:default_threads_per_core)
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	ThreadsPerCore *int32 `json:"threadsPerCore,omitempty"`
