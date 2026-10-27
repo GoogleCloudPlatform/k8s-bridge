@@ -28,7 +28,7 @@ Tools required:
 
 - `kubectl`
 - `helm` 3.8+
-- Worker nodes with at least `2000m` allocatable CPU and `4Gi` allocatable memory free per dynamic worker pod (with the default `threadsPerCore: 2`)
+- Worker nodes with at least `1000m` allocatable CPU and `2Gi` allocatable memory free per dynamic worker pod
 
 | Component | Chart | Verified version |
 |---|---|---|

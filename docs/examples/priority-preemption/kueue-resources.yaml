@@ -43,9 +43,9 @@ spec:
         - name: default-flavor
           resources:
             - name: "cpu"
-              nominalQuota: 4
+              nominalQuota: 2
             - name: "memory"
-              nominalQuota: 8Gi
+              nominalQuota: 4Gi
   preemption:
     withinClusterQueue: LowerPriority
 ---
