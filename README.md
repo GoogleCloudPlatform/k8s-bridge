@@ -32,7 +32,7 @@ Alternatively, you can install from the local `./helm` chart in the repository:
 make helm-install
 ```
 
-> **Upgrading:** Helm does not update CRDs in `helm/crds/` during `helm upgrade`. Run `kubectl apply --server-side -f helm/crds/` before you upgrade so Kubernetes recognizes new `WorkloadMixing` fields.
+> **Upgrading:** Helm does not update CRDs in `helm/crds/` during `helm upgrade`. Run `kubectl apply --server-side --force-conflicts -f helm/crds/` before you upgrade so Kubernetes recognizes new `WorkloadMixing` fields. The `--force-conflicts` flag is necessary because Helm owns the CRDs that it installed.
 
 **2. Configure Workload Mixing:**
 
