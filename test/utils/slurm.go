@@ -71,6 +71,8 @@ var (
 	derivedECRegex  = regexp.MustCompile(`\bDerivedEC=(\S+)`)
 	nodeListRegex   = regexp.MustCompile(`\bNodeList=(\S+)`)
 	allocNodesRegex = regexp.MustCompile(`\bAllocNodes=(\S+)`)
+	startTimeRegex  = regexp.MustCompile(`\bStartTime=(\S+)`)
+	restartsRegex   = regexp.MustCompile(`\bRestarts=(\S+)`)
 	// requeueRegex matches Slurm's "Requeue=0|1" field: 0 when the job was submitted
 	// with --no-requeue (or JobRequeue=0 is configured), 1 otherwise.
 	requeueRegex = regexp.MustCompile(`\bRequeue=(\S+)`)
@@ -645,6 +647,10 @@ type SlurmJobState struct {
 	DerivedEC  string
 	NodeList   string
 	AllocNodes string
+	// StartTime and Restarts change when Slurm starts the job again, for
+	// example after a requeue.
+	StartTime string
+	Restarts  string
 	// Requeue is Slurm's "Requeue=0|1" flag: "0" when the job may not be requeued
 	// (sbatch --no-requeue or JobRequeue=0), "1" otherwise.
 	Requeue string
@@ -710,6 +716,8 @@ func QuerySlurmJobState(slurmNamespace, jobID string) (SlurmJobState, error) {
 		DerivedEC:  extractRegexField(derivedECRegex, output),
 		NodeList:   extractRegexField(nodeListRegex, output),
 		AllocNodes: extractRegexField(allocNodesRegex, output),
+		StartTime:  extractRegexField(startTimeRegex, output),
+		Restarts:   extractRegexField(restartsRegex, output),
 		Requeue:    extractRegexField(requeueRegex, output),
 		NumCPUs:    extractRegexField(numCPUsRegex, output),
 		UserName:   userName,
