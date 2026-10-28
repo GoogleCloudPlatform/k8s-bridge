@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
@@ -184,8 +185,8 @@ func TestTranslateSlurmJobToJobSet_Replicas(t *testing.T) {
 	translator := NewJobSetTranslator()
 	controller := getTestController()
 
-	// Jobs without task information get 1 CPU per pod and the 2048MB-per-CPU memory fallback.
-	const singleTaskCPU, singleTaskMem = "1", "2048Mi"
+	// A job without task information gets 1 CPU, rounded up to 1 core (2 CPUs), and 2048MB per CPU.
+	const singleTaskCPU, singleTaskMem = "2", "4096Mi"
 
 	tests := []struct {
 		name         string
@@ -336,6 +337,86 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 		)
 	})
 
+	// slurmrestd reports cpus_per_task=1 for a job without -c. The TRES strings use the real record format.
+	t.Run("Success - Resource Calculation - CpusPerTres (GPU) with reported CpusPerTask", func(t *testing.T) {
+		const oneL4PerNode = "gres/gpu:l4:1"
+		tests := []struct {
+			name        string
+			tasks       int32
+			tresPerNode string
+			cpusPerTres string
+			wantCPU     resource.Quantity
+			wantMem     resource.Quantity
+			wantGPU     resource.Quantity
+		}{
+			{
+				name:        "cpus per GPU above task CPUs",
+				tasks:       1,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "gres/gpu:4",
+				wantCPU:     resource.MustParse("4"),      // max(1 task * 1, 1 GPU * 4)
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+			{
+				name:        "two GPUs per node",
+				tasks:       1,
+				tresPerNode: "gres/gpu:l4:2",
+				cpusPerTres: "gres/gpu:4",
+				wantCPU:     resource.MustParse("8"),       // max(1 task * 1, 2 GPUs * 4)
+				wantMem:     resource.MustParse("16384Mi"), // fallback 8 * 2048 MiB
+				wantGPU:     resource.MustParse("2"),
+			},
+			{
+				name:        "task CPUs above cpus per GPU",
+				tasks:       8,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "gres/gpu:2",
+				wantCPU:     resource.MustParse("8"),       // max(8 tasks * 1, 1 GPU * 2)
+				wantMem:     resource.MustParse("16384Mi"), // fallback 8 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+			{
+				name:        "odd cpus per GPU rounds up to whole cores",
+				tasks:       1,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "gres/gpu:3",
+				wantCPU:     resource.MustParse("4"),      // max(1 task * 1, 1 GPU * 3) = 3, rounded up to 4
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+			{
+				name:        "no cpus per GPU falls back to task CPUs",
+				tasks:       3,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "",
+				wantCPU:     resource.MustParse("4"),      // 3 tasks * 1 = 3, rounded up to 4
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				job := newTestJob().
+					withTasks(tt.tasks).
+					withCpusPerTask(1).
+					withTresPerNode(tt.tresPerNode).
+					withCpusPerTres(tt.cpusPerTres).
+					build()
+
+				obj, err := translator.Translate(job, wmSpec, controller)
+
+				verifyJobSet(t, obj, err, "123", 1,
+					withRequests(corev1.ResourceList{
+						corev1.ResourceCPU:                       tt.wantCPU,
+						corev1.ResourceMemory:                    tt.wantMem,
+						corev1.ResourceName(testGpuResourceName): tt.wantGPU,
+					}),
+				)
+			})
+		}
+	})
+
 	t.Run("Success - Resource Calculation - Fallback CPU and MemoryPerCpu", func(t *testing.T) {
 		job := newTestJob().
 			withNodes(2).
@@ -345,10 +426,10 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 
-		// CPUs = Fallback (1) * TasksPerNode (ceil(2/2) = 1) = 1
-		wantCPU := resource.MustParse("1")
-		// Memory = Max(MemoryPerCpu (4096MB) * CPUs (1) = 4096MB, fallback (1 * 2048 = 2048MB)) = 4096Mi
-		wantMem := resource.MustParse("4096Mi")
+		// CPUs = Fallback (1) * TasksPerNode (ceil(2/2) = 1) = 1, rounded up to 1 whole core = 2
+		wantCPU := resource.MustParse("2")
+		// Memory = Max(MemoryPerCpu (4096MB) * CPUs (2) = 8192MB, fallback (2 * 2048 = 4096MB)) = 8192Mi
+		wantMem := resource.MustParse("8192Mi")
 
 		verifyJobSet(t, obj, err, "123", 2,
 			withRequests(corev1.ResourceList{
@@ -366,9 +447,9 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 
-		// CPUs = Fallback (1) * TasksPerNode (1) = 1
-		wantCPU := resource.MustParse("1")
-		// Memory = Max(MemoryPerTres (8192MB) * GPU_placeholder (1) = 8192MB, fallback (1 * 2048 = 2048MB)) = 8192Mi
+		// CPUs = Fallback (1) * TasksPerNode (1) = 1, rounded up to 1 whole core = 2
+		wantCPU := resource.MustParse("2")
+		// Memory = Max(MemoryPerTres (8192MB) * GPU_placeholder (1) = 8192MB, fallback (2 * 2048 = 4096MB)) = 8192Mi
 		wantMem := resource.MustParse("8192Mi")
 
 		verifyJobSet(t, obj, err, "123", 1,
@@ -378,6 +459,128 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 			}),
 		)
 	})
+
+	t.Run("Success - Resource Calculation - ThreadsPerCore rounding", func(t *testing.T) {
+		tests := []struct {
+			name                    string
+			cpusPerTask             int32
+			threadsPerCore          *int32
+			partitionThreadsPerCore *int32
+			otherPartThreadsPerCore *int32
+			wantCPU                 resource.Quantity
+			wantMem                 resource.Quantity
+		}{
+			{
+				name:           "nil threadsPerCore uses default 2 and rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: nil,
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:           "threadsPerCore 1 keeps 3 as 3",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(1)),
+				wantCPU:        resource.MustParse("3"),
+				wantMem:        resource.MustParse("6144Mi"),
+			},
+			{
+				name:           "threadsPerCore 2 rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(2)),
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:           "threadsPerCore 4 rounds 5 up to 8",
+				cpusPerTask:    5,
+				threadsPerCore: ptr.To(int32(4)),
+				wantCPU:        resource.MustParse("8"),
+				wantMem:        resource.MustParse("16384Mi"),
+			},
+			{
+				name:           "threadsPerCore 0 uses default 2 and rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(0)),
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:                    "partition threadsPerCore 1 overrides spec threadsPerCore 2",
+				cpusPerTask:             3,
+				threadsPerCore:          ptr.To(int32(2)),
+				partitionThreadsPerCore: ptr.To(int32(1)),
+				wantCPU:                 resource.MustParse("3"),
+				wantMem:                 resource.MustParse("6144Mi"),
+			},
+			{
+				name:                    "partition threadsPerCore 4 overrides spec threadsPerCore 1",
+				cpusPerTask:             5,
+				threadsPerCore:          ptr.To(int32(1)),
+				partitionThreadsPerCore: ptr.To(int32(4)),
+				wantCPU:                 resource.MustParse("8"),
+				wantMem:                 resource.MustParse("16384Mi"),
+			},
+			{
+				name:                    "other partition threadsPerCore does not affect target partition",
+				cpusPerTask:             3,
+				threadsPerCore:          nil,
+				otherPartThreadsPerCore: ptr.To(int32(1)),
+				wantCPU:                 resource.MustParse("4"),
+				wantMem:                 resource.MustParse("8192Mi"),
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				job := newTestJob().
+					withCpusPerTask(tt.cpusPerTask).
+					build()
+				wmBuilder := newTestWMSpec()
+				if tt.threadsPerCore != nil {
+					wmBuilder = wmBuilder.withThreadsPerCore(*tt.threadsPerCore)
+				}
+				if tt.partitionThreadsPerCore != nil {
+					wmBuilder = wmBuilder.withPartitionThreadsPerCore(testDefaultPartition, *tt.partitionThreadsPerCore)
+				}
+				if tt.otherPartThreadsPerCore != nil {
+					wmBuilder = wmBuilder.withPartitionThreadsPerCore("low-prio", *tt.otherPartThreadsPerCore)
+				}
+
+				obj, err := translator.Translate(job, wmBuilder.build(), controller)
+
+				verifyJobSet(t, obj, err, "123", 1,
+					withRequests(corev1.ResourceList{
+						corev1.ResourceCPU:    tt.wantCPU,
+						corev1.ResourceMemory: tt.wantMem,
+					}),
+				)
+			})
+		}
+	})
+}
+
+func TestRoundUpToWholeCores(t *testing.T) {
+	tests := []struct {
+		cpus           int64
+		threadsPerCore int64
+		want           int64
+	}{
+		{cpus: 1, threadsPerCore: 2, want: 2},
+		{cpus: 2, threadsPerCore: 2, want: 2},
+		{cpus: 3, threadsPerCore: 2, want: 4},
+		{cpus: 4, threadsPerCore: 2, want: 4},
+		{cpus: 7, threadsPerCore: 2, want: 8},
+		{cpus: 1, threadsPerCore: 1, want: 1},
+		{cpus: 3, threadsPerCore: 1, want: 3},
+		{cpus: 5, threadsPerCore: 4, want: 8},
+	}
+
+	for _, tt := range tests {
+		if got := roundUpToWholeCores(tt.cpus, tt.threadsPerCore); got != tt.want {
+			t.Errorf("roundUpToWholeCores(%d, %d) = %d, want %d", tt.cpus, tt.threadsPerCore, got, tt.want)
+		}
+	}
 }
 
 func TestParseTresString(t *testing.T) {
