@@ -27,6 +27,7 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 )
 
@@ -151,13 +152,7 @@ func VerifyJobSetCreatedWithGPU(name, ns, jobID, expectedGPUCount string) {
 		g.Expect(hasGPUToleration).To(gomega.BeTrue(), "Missing nvidia.com/gpu toleration in JobSet pod template")
 
 		// Verify slurmd container has GPU limits/requests
-		var slurmdContainer *corev1.Container
-		for i := range podTemplate.Spec.Containers {
-			if podTemplate.Spec.Containers[i].Name == "slurmd" {
-				slurmdContainer = &podTemplate.Spec.Containers[i]
-				break
-			}
-		}
+		slurmdContainer := findSlurmdContainer(&podTemplate.Spec)
 		g.Expect(slurmdContainer).NotTo(gomega.BeNil(), "slurmd container not found")
 		gpuQuantity, hasLimit := slurmdContainer.Resources.Limits["nvidia.com/gpu"]
 		g.Expect(hasLimit).To(gomega.BeTrue(), "Missing nvidia.com/gpu limit in slurmd container")
@@ -176,6 +171,39 @@ func VerifyJobSetCreatedWithGPU(name, ns, jobID, expectedGPUCount string) {
 		)
 	}
 	gomega.Eventually(verifyJobSetCreated, jobsetTimeout, time.Second).Should(gomega.Succeed())
+}
+
+// VerifyJobSetSizing asserts that the JobSet creates wantReplicas slurmd pods and
+// that each slurmd container requests wantCPU CPUs and wantMemory memory.
+func VerifyJobSetSizing(name, ns string, wantReplicas int32, wantCPU, wantMemory string) {
+	ginkgo.GinkgoHelper()
+
+	gomega.Eventually(func(g gomega.Gomega) {
+		js, err := JobSet(name, ns)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to get JobSet")
+		g.Expect(js.Spec.ReplicatedJobs).To(gomega.HaveLen(1))
+		repJob := js.Spec.ReplicatedJobs[0]
+		g.Expect(repJob.Replicas).To(gomega.Equal(wantReplicas), "JobSet replicas do not match the requested node count")
+
+		slurmdContainer := findSlurmdContainer(&repJob.Template.Spec.Template.Spec)
+		g.Expect(slurmdContainer).NotTo(gomega.BeNil(), "slurmd container not found")
+		gotCPU := slurmdContainer.Resources.Requests.Cpu()
+		g.Expect(gotCPU.Cmp(resource.MustParse(wantCPU))).To(gomega.Equal(0),
+			fmt.Sprintf("slurmd CPU request is %s, want %s", gotCPU.String(), wantCPU))
+		gotMemory := slurmdContainer.Resources.Requests.Memory()
+		g.Expect(gotMemory.Cmp(resource.MustParse(wantMemory))).To(gomega.Equal(0),
+			fmt.Sprintf("slurmd memory request is %s, want %s", gotMemory.String(), wantMemory))
+	}, jobsetTimeout, time.Second).Should(gomega.Succeed())
+}
+
+// findSlurmdContainer returns the slurmd container of podSpec, or nil if there is none.
+func findSlurmdContainer(podSpec *corev1.PodSpec) *corev1.Container {
+	for i := range podSpec.Containers {
+		if podSpec.Containers[i].Name == "slurmd" {
+			return &podSpec.Containers[i]
+		}
+	}
+	return nil
 }
 
 // PatchJobSetCondition artificially merges a status condition into a JobSet's status subresource.

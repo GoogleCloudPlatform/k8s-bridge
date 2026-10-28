@@ -184,7 +184,7 @@ func (t *JobSetTranslator) Translate(
 	}
 
 	// 3. Resource Calculation
-	resources, gresInfo, err := resolvePodResources(job, replicas, wmSpec)
+	resources, gresInfo, err := resolvePodResources(job, replicas, mapping, wmSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -708,6 +708,54 @@ func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int
 	return (tasks + int64(replicas) - 1) / int64(replicas)
 }
 
+// defaultThreadsPerCore is the threads per core that the translator assumes when
+// neither PartitionMapping.threadsPerCore nor WorkloadMixing.spec.threadsPerCore is set.
+const (
+	// LINT.IfChange(default_threads_per_core)
+	defaultThreadsPerCore int32 = 2
+	// LINT.ThenChange(api/v1alpha1/workloadmixing_types.go:default_threads_per_core)
+)
+
+// resolveThreadsPerCore returns mapping.threadsPerCore when set, otherwise spec.threadsPerCore,
+// or defaultThreadsPerCore when neither field is set.
+func resolveThreadsPerCore(mapping *k8sbridgev1alpha1.PartitionMapping, wmSpec *k8sbridgev1alpha1.WorkloadMixingSpec) int64 {
+	if n := ptr.Deref(mapping.ThreadsPerCore, 0); n > 0 {
+		return int64(n)
+	}
+	if n := ptr.Deref(wmSpec.ThreadsPerCore, defaultThreadsPerCore); n > 0 {
+		return int64(n)
+	}
+	return int64(defaultThreadsPerCore)
+}
+
+// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs per pod * --cpus-per-gpu)
+// rounded up to whole cores. The Slurm CLI rejects --cpus-per-task together with --cpus-per-gpu,
+// so slurmrestd reports the default cpus_per_task=1 for a --cpus-per-gpu job.
+func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, gpu *resolvedGRES, threadsPerCore int64) int64 {
+	cpusPerTask := int64(1)
+	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
+		if n := int64(ptr.Deref(job.CpusPerTask.Number, 0)); n > 0 {
+			cpusPerTask = n
+		}
+	}
+	cpu := cpusPerTask * tasksPerNode
+	if gpu != nil {
+		if cpusPerGPU, ok := lookupTres(ptr.Deref(job.CpusPerTres, ""), GRESGPU, gpu.resourceType); ok {
+			cpu = max(cpu, gpu.count*cpusPerGPU)
+		}
+	}
+	return roundUpToWholeCores(cpu, threadsPerCore)
+}
+
+// roundUpToWholeCores rounds cpus up to a multiple of threadsPerCore, because Slurm
+// allocates whole cores by default (CR_Core in slurm.conf(5)).
+func roundUpToWholeCores(cpus, threadsPerCore int64) int64 {
+	if threadsPerCore <= 1 {
+		return cpus
+	}
+	return (cpus + threadsPerCore - 1) / threadsPerCore * threadsPerCore
+}
+
 func parseGRES(tresStr string) ([]gresRequest, error) {
 	var reqs []gresRequest
 	if tresStr == "" {
@@ -842,7 +890,12 @@ func findGRESMapping(resName string, resType string, wmSpec *k8sbridgev1alpha1.W
 	return nil
 }
 
-func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmSpec *k8sbridgev1alpha1.WorkloadMixingSpec) (corev1.ResourceRequirements, *GresResolutionInfo, error) {
+func resolvePodResources(
+	job *slurmclienttypes.V0044JobInfo,
+	replicas int32,
+	partMapping *k8sbridgev1alpha1.PartitionMapping,
+	wmSpec *k8sbridgev1alpha1.WorkloadMixingSpec,
+) (corev1.ResourceRequirements, *GresResolutionInfo, error) {
 	if replicas <= 0 {
 		return corev1.ResourceRequirements{}, nil, fmt.Errorf("invalid replicas count: %d", replicas)
 	}
@@ -860,28 +913,16 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 
 	if resolvedGPU != nil {
 		gpuRequest = resolvedGPU.count
-		mapping := findGRESMapping(GRESGPU, resolvedGPU.resourceType, wmSpec)
-		if mapping == nil {
+		gresMapping := findGRESMapping(GRESGPU, resolvedGPU.resourceType, wmSpec)
+		if gresMapping == nil {
 			return corev1.ResourceRequirements{}, nil, fmt.Errorf("missing GRES mapping for gpu:%s", resolvedGPU.resourceType)
 		}
-		k8sGpuResourceName = mapping.K8sResourceName
+		k8sGpuResourceName = gresMapping.K8sResourceName
 		// Copy the map so that the JobSet does not share it with the WorkloadMixing spec.
-		nodeSelectors = maps.Clone(mapping.NodeSelectors)
+		nodeSelectors = maps.Clone(gresMapping.NodeSelectors)
 	}
 
-	// Resolve CPUs per pod
-	var cpu int64
-	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
-		cpu = int64(ptr.Deref(job.CpusPerTask.Number, 0)) * tasksPerNode
-	} else if resolvedGPU != nil {
-		if gpuCpus, ok := lookupTres(ptr.Deref(job.CpusPerTres, ""), GRESGPU, resolvedGPU.resourceType); ok {
-			cpu = gpuRequest * gpuCpus
-		} else {
-			cpu = 1 * tasksPerNode
-		}
-	} else {
-		cpu = 1 * tasksPerNode
-	}
+	cpu := resolveCPUsPerPod(job, tasksPerNode, resolvedGPU, resolveThreadsPerCore(partMapping, wmSpec))
 
 	// Resolve Memory per pod
 	var memCandidates []int64

@@ -116,6 +116,13 @@ spec:
                       description: Partition is the name of the Slurm partition to
                         observe/map.
                       type: string
+                    threadsPerCore:
+                      description: |-
+                        ThreadsPerCore overrides spec.threadsPerCore for this partition when its node pool uses a
+                        different SMT setting.
+                      format: int32
+                      minimum: 1
+                      type: integer
                     workloadPriorityClass:
                       description: WorkloadPriorityClass is the name of the Kueue
                         WorkloadPriorityClass to map this partition to.
@@ -8631,6 +8638,15 @@ spec:
                     - containers
                     type: object
                 type: object
+              threadsPerCore:
+                default: 2
+                description: |-
+                  ThreadsPerCore is the number of hardware threads per core on the nodes that run the
+                  slurmd pods. Slurm allocates whole cores, so k8s-bridge rounds the CPU request of each
+                  pod up to a multiple of this value. Set 1 for node pools without SMT.
+                format: int32
+                minimum: 1
+                type: integer
             required:
             - controllerRef
             type: object

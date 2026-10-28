@@ -162,6 +162,21 @@ func (b *testWMSpecBuilder) withPodTemplateLabels(labels map[string]string) *tes
 	return b
 }
 
+func (b *testWMSpecBuilder) withThreadsPerCore(threads int32) *testWMSpecBuilder {
+	b.spec.ThreadsPerCore = ptr.To(threads)
+	return b
+}
+
+func (b *testWMSpecBuilder) withPartitionThreadsPerCore(partition string, threads int32) *testWMSpecBuilder {
+	for i := range b.spec.PartitionsMapping {
+		if b.spec.PartitionsMapping[i].Partition == partition {
+			b.spec.PartitionsMapping[i].ThreadsPerCore = ptr.To(threads)
+			return b
+		}
+	}
+	return b
+}
+
 func (b *testWMSpecBuilder) ensurePodTemplate() {
 	if b.spec.PodTemplate == nil {
 		b.spec.PodTemplate = &corev1.PodTemplateSpec{}

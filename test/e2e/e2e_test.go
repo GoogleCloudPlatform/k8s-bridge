@@ -148,7 +148,7 @@ var _ = Describe("Manager", func() {
 
 			By("verifying the JobSet has one replica per requested node, each sized for 2 tasks")
 			// CPU: 1 CPU per task * 2 tasks per node; memory: 2048MB fallback per CPU.
-			verifyJobSetSizing(jobSetName, 2, "2", "4096Mi")
+			utils.VerifyJobSetSizing(jobSetName, slurmNamespace, 2, "2", "4096Mi")
 
 			By("verifying Slurm ran the job on both slurmd pods")
 			utils.NewSlurmJobVerifier(slurmNamespace, jobID).
@@ -181,7 +181,7 @@ var _ = Describe("Manager", func() {
 
 			By("verifying the JobSet has one replica per requested node, each sized for 2 tasks")
 			// CPU: 2 CPUs per task * 2 tasks per node; memory: 2048MB fallback per CPU.
-			verifyJobSetSizing(jobSetName, 2, "4", "8192Mi")
+			utils.VerifyJobSetSizing(jobSetName, slurmNamespace, 2, "4", "8192Mi")
 		})
 
 		It("should cancel Slurm job if translation fails due to unmapped GRES", func() {
