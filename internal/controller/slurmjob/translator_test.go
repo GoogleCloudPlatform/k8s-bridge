@@ -2185,6 +2185,8 @@ func TestTranslateSlurmJobToJobSet_JobNameLabel(t *testing.T) {
 
 // TestTranslateSlurmJobToJobSet_MaxNodeSize verifies that the translator rejects a job whose
 // slurmd container needs more CPUs or memory than the slurmd limits in the podTemplate.
+// The translator rounds the CPU need up to whole cores. The test uses the default
+// threadsPerCore of 2, so a job that needs 1 CPU gets 2 CPUs.
 // The memory need follows the current memory rule: the larger of the memory option and
 // 2048 MiB for each CPU.
 func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
@@ -2292,12 +2294,13 @@ func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
 		},
 		{
 			// The current memory rule gives --mem=0 the default of 2048 MiB for each CPU.
+			// The job needs 1 CPU, which rounds up to 1 whole core (2 CPUs).
 			name:         "Success - --mem=0 gets the default memory and fits",
 			cpuLimit:     "4",
 			memLimit:     testSlurmdMemoryLimit,
 			job:          newTestJob().withTasks(1).withMemoryPerNode(0).build(),
 			wantReplicas: 1,
-			wantRequests: requests("1", "2048Mi"),
+			wantRequests: requests("2", "4096Mi"),
 			wantLimits:   limits("4", testSlurmdMemoryLimit),
 		},
 		{
@@ -2308,14 +2311,15 @@ func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
 			wantErr:  "job needs 8 CPUs and 16384 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 8192 MiB",
 		},
 		{
+			// The job needs 1 CPU, which rounds up to 1 whole core (2 CPUs).
 			name:         "Success - A GPU job fits, because the check does not compare GPUs",
 			cpuLimit:     "4",
 			memLimit:     testSlurmdMemoryLimit,
 			job:          newTestJob().withTresPerNode("gres/gpu:l4=1").build(),
 			wantReplicas: 1,
 			wantRequests: corev1.ResourceList{
-				corev1.ResourceCPU:                       resource.MustParse("1"),
-				corev1.ResourceMemory:                    resource.MustParse("2048Mi"),
+				corev1.ResourceCPU:                       resource.MustParse("2"),
+				corev1.ResourceMemory:                    resource.MustParse("4096Mi"),
 				corev1.ResourceName(testGpuResourceName): resource.MustParse("1"),
 			},
 			wantLimits: corev1.ResourceList{
