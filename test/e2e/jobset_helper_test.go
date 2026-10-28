@@ -183,6 +183,21 @@ func verifyJobSetCreatedWithCustomTemplate(jobSetName, jobID, jobNameLabel strin
 		g.Expect(slurmdContainer.Args[5]).To(Equal("--conf"))
 		g.Expect(slurmdContainer.Args[6]).To(MatchRegexp(`^'Features=k8s-id-[0-9a-f-]+,dynamic_kpartition'$`))
 
+		// Verify POD_CPUS and POD_MEMORY carry the slurmd container requests (-c 2 --mem=4096)
+		var podCPUsEnv, podMemoryEnv *corev1.EnvVar
+		for i := range slurmdContainer.Env {
+			switch slurmdContainer.Env[i].Name {
+			case "POD_CPUS":
+				podCPUsEnv = &slurmdContainer.Env[i]
+			case "POD_MEMORY":
+				podMemoryEnv = &slurmdContainer.Env[i]
+			}
+		}
+		g.Expect(podCPUsEnv).NotTo(BeNil(), "Expected POD_CPUS env var on slurmd container")
+		g.Expect(podCPUsEnv.Value).To(Equal("2"))
+		g.Expect(podMemoryEnv).NotTo(BeNil(), "Expected POD_MEMORY env var on slurmd container")
+		g.Expect(podMemoryEnv.Value).To(Equal("4096"))
+
 		// Verify Slurmd container has Downward API env vars for deterministic node naming
 		var slurmNodeNameEnv, jobSetNameEnv, replicatedJobNameEnv, jobIndexEnv, podIndexEnv *corev1.EnvVar
 		for i := range slurmdContainer.Env {
@@ -333,34 +348,6 @@ func setupJobSetTerminalStateTest() (string, string) {
 	_ = waitForJobSetUID(jobSetName)
 
 	return jobID, jobSetName
-}
-
-// verifyJobSetSizing asserts that the translated JobSet creates wantReplicas slurmd pods and
-// that each slurmd container requests wantCPU CPUs and wantMemory memory.
-func verifyJobSetSizing(jobSetName string, wantReplicas int32, wantCPU, wantMemory string) {
-	GinkgoHelper()
-
-	Eventually(func(g Gomega) {
-		js, err := utils.JobSet(jobSetName, slurmNamespace)
-		g.Expect(err).NotTo(HaveOccurred(), "Failed to get JobSet")
-		g.Expect(js.Spec.ReplicatedJobs).To(HaveLen(1))
-		repJob := js.Spec.ReplicatedJobs[0]
-		g.Expect(repJob.Replicas).To(Equal(wantReplicas), "JobSet replicas do not match the requested node count")
-
-		var slurmdContainer *corev1.Container
-		containers := repJob.Template.Spec.Template.Spec.Containers
-		for i := range containers {
-			if containers[i].Name == "slurmd" {
-				slurmdContainer = &containers[i]
-				break
-			}
-		}
-		g.Expect(slurmdContainer).NotTo(BeNil(), "slurmd container not found")
-		g.Expect(slurmdContainer.Resources.Requests.Cpu().String()).To(Equal(wantCPU), "slurmd CPU request mismatch")
-		gotMemory := slurmdContainer.Resources.Requests.Memory()
-		g.Expect(gotMemory.Cmp(resource.MustParse(wantMemory))).To(Equal(0),
-			fmt.Sprintf("slurmd memory request is %s, want %s", gotMemory.String(), wantMemory))
-	}, jobsetTimeout, time.Second).Should(Succeed())
 }
 
 // logSlurmJobNodeFields writes the NumNodes and ReqTRES fields of a Slurm job to the Ginkgo log.

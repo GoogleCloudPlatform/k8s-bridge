@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
@@ -184,8 +185,8 @@ func TestTranslateSlurmJobToJobSet_Replicas(t *testing.T) {
 	translator := NewJobSetTranslator()
 	controller := getTestController()
 
-	// Jobs without task information get 1 CPU per pod and the 2048MB-per-CPU memory fallback.
-	const singleTaskCPU, singleTaskMem = "1", "2048Mi"
+	// A job without task information gets 1 CPU, rounded up to 1 core (2 CPUs), and 2048MB per CPU.
+	const singleTaskCPU, singleTaskMem = "2", "4096Mi"
 
 	tests := []struct {
 		name         string
@@ -336,6 +337,86 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 		)
 	})
 
+	// slurmrestd reports cpus_per_task=1 for a job without -c. The TRES strings use the real record format.
+	t.Run("Success - Resource Calculation - CpusPerTres (GPU) with reported CpusPerTask", func(t *testing.T) {
+		const oneL4PerNode = "gres/gpu:l4:1"
+		tests := []struct {
+			name        string
+			tasks       int32
+			tresPerNode string
+			cpusPerTres string
+			wantCPU     resource.Quantity
+			wantMem     resource.Quantity
+			wantGPU     resource.Quantity
+		}{
+			{
+				name:        "cpus per GPU above task CPUs",
+				tasks:       1,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "gres/gpu:4",
+				wantCPU:     resource.MustParse("4"),      // max(1 task * 1, 1 GPU * 4)
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+			{
+				name:        "two GPUs per node",
+				tasks:       1,
+				tresPerNode: "gres/gpu:l4:2",
+				cpusPerTres: "gres/gpu:4",
+				wantCPU:     resource.MustParse("8"),       // max(1 task * 1, 2 GPUs * 4)
+				wantMem:     resource.MustParse("16384Mi"), // fallback 8 * 2048 MiB
+				wantGPU:     resource.MustParse("2"),
+			},
+			{
+				name:        "task CPUs above cpus per GPU",
+				tasks:       8,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "gres/gpu:2",
+				wantCPU:     resource.MustParse("8"),       // max(8 tasks * 1, 1 GPU * 2)
+				wantMem:     resource.MustParse("16384Mi"), // fallback 8 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+			{
+				name:        "odd cpus per GPU rounds up to whole cores",
+				tasks:       1,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "gres/gpu:3",
+				wantCPU:     resource.MustParse("4"),      // max(1 task * 1, 1 GPU * 3) = 3, rounded up to 4
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+			{
+				name:        "no cpus per GPU falls back to task CPUs",
+				tasks:       3,
+				tresPerNode: oneL4PerNode,
+				cpusPerTres: "",
+				wantCPU:     resource.MustParse("4"),      // 3 tasks * 1 = 3, rounded up to 4
+				wantMem:     resource.MustParse("8192Mi"), // fallback 4 * 2048 MiB
+				wantGPU:     resource.MustParse("1"),
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				job := newTestJob().
+					withTasks(tt.tasks).
+					withCpusPerTask(1).
+					withTresPerNode(tt.tresPerNode).
+					withCpusPerTres(tt.cpusPerTres).
+					build()
+
+				obj, err := translator.Translate(job, wmSpec, controller)
+
+				verifyJobSet(t, obj, err, "123", 1,
+					withRequests(corev1.ResourceList{
+						corev1.ResourceCPU:                       tt.wantCPU,
+						corev1.ResourceMemory:                    tt.wantMem,
+						corev1.ResourceName(testGpuResourceName): tt.wantGPU,
+					}),
+				)
+			})
+		}
+	})
+
 	t.Run("Success - Resource Calculation - Fallback CPU and MemoryPerCpu", func(t *testing.T) {
 		job := newTestJob().
 			withNodes(2).
@@ -345,10 +426,10 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 
-		// CPUs = Fallback (1) * TasksPerNode (ceil(2/2) = 1) = 1
-		wantCPU := resource.MustParse("1")
-		// Memory = Max(MemoryPerCpu (4096MB) * CPUs (1) = 4096MB, fallback (1 * 2048 = 2048MB)) = 4096Mi
-		wantMem := resource.MustParse("4096Mi")
+		// CPUs = Fallback (1) * TasksPerNode (ceil(2/2) = 1) = 1, rounded up to 1 whole core = 2
+		wantCPU := resource.MustParse("2")
+		// Memory = Max(MemoryPerCpu (4096MB) * CPUs (2) = 8192MB, fallback (2 * 2048 = 4096MB)) = 8192Mi
+		wantMem := resource.MustParse("8192Mi")
 
 		verifyJobSet(t, obj, err, "123", 2,
 			withRequests(corev1.ResourceList{
@@ -366,9 +447,9 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 
 		obj, err := translator.Translate(job, wmSpec, controller)
 
-		// CPUs = Fallback (1) * TasksPerNode (1) = 1
-		wantCPU := resource.MustParse("1")
-		// Memory = Max(MemoryPerTres (8192MB) * GPU_placeholder (1) = 8192MB, fallback (1 * 2048 = 2048MB)) = 8192Mi
+		// CPUs = Fallback (1) * TasksPerNode (1) = 1, rounded up to 1 whole core = 2
+		wantCPU := resource.MustParse("2")
+		// Memory = Max(MemoryPerTres (8192MB) * GPU_placeholder (1) = 8192MB, fallback (2 * 2048 = 4096MB)) = 8192Mi
 		wantMem := resource.MustParse("8192Mi")
 
 		verifyJobSet(t, obj, err, "123", 1,
@@ -378,6 +459,128 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 			}),
 		)
 	})
+
+	t.Run("Success - Resource Calculation - ThreadsPerCore rounding", func(t *testing.T) {
+		tests := []struct {
+			name                    string
+			cpusPerTask             int32
+			threadsPerCore          *int32
+			partitionThreadsPerCore *int32
+			otherPartThreadsPerCore *int32
+			wantCPU                 resource.Quantity
+			wantMem                 resource.Quantity
+		}{
+			{
+				name:           "nil threadsPerCore uses default 2 and rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: nil,
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:           "threadsPerCore 1 keeps 3 as 3",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(1)),
+				wantCPU:        resource.MustParse("3"),
+				wantMem:        resource.MustParse("6144Mi"),
+			},
+			{
+				name:           "threadsPerCore 2 rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(2)),
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:           "threadsPerCore 4 rounds 5 up to 8",
+				cpusPerTask:    5,
+				threadsPerCore: ptr.To(int32(4)),
+				wantCPU:        resource.MustParse("8"),
+				wantMem:        resource.MustParse("16384Mi"),
+			},
+			{
+				name:           "threadsPerCore 0 uses default 2 and rounds 3 up to 4",
+				cpusPerTask:    3,
+				threadsPerCore: ptr.To(int32(0)),
+				wantCPU:        resource.MustParse("4"),
+				wantMem:        resource.MustParse("8192Mi"),
+			},
+			{
+				name:                    "partition threadsPerCore 1 overrides spec threadsPerCore 2",
+				cpusPerTask:             3,
+				threadsPerCore:          ptr.To(int32(2)),
+				partitionThreadsPerCore: ptr.To(int32(1)),
+				wantCPU:                 resource.MustParse("3"),
+				wantMem:                 resource.MustParse("6144Mi"),
+			},
+			{
+				name:                    "partition threadsPerCore 4 overrides spec threadsPerCore 1",
+				cpusPerTask:             5,
+				threadsPerCore:          ptr.To(int32(1)),
+				partitionThreadsPerCore: ptr.To(int32(4)),
+				wantCPU:                 resource.MustParse("8"),
+				wantMem:                 resource.MustParse("16384Mi"),
+			},
+			{
+				name:                    "other partition threadsPerCore does not affect target partition",
+				cpusPerTask:             3,
+				threadsPerCore:          nil,
+				otherPartThreadsPerCore: ptr.To(int32(1)),
+				wantCPU:                 resource.MustParse("4"),
+				wantMem:                 resource.MustParse("8192Mi"),
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				job := newTestJob().
+					withCpusPerTask(tt.cpusPerTask).
+					build()
+				wmBuilder := newTestWMSpec()
+				if tt.threadsPerCore != nil {
+					wmBuilder = wmBuilder.withThreadsPerCore(*tt.threadsPerCore)
+				}
+				if tt.partitionThreadsPerCore != nil {
+					wmBuilder = wmBuilder.withPartitionThreadsPerCore(testDefaultPartition, *tt.partitionThreadsPerCore)
+				}
+				if tt.otherPartThreadsPerCore != nil {
+					wmBuilder = wmBuilder.withPartitionThreadsPerCore("low-prio", *tt.otherPartThreadsPerCore)
+				}
+
+				obj, err := translator.Translate(job, wmBuilder.build(), controller)
+
+				verifyJobSet(t, obj, err, "123", 1,
+					withRequests(corev1.ResourceList{
+						corev1.ResourceCPU:    tt.wantCPU,
+						corev1.ResourceMemory: tt.wantMem,
+					}),
+				)
+			})
+		}
+	})
+}
+
+func TestRoundUpToWholeCores(t *testing.T) {
+	tests := []struct {
+		cpus           int64
+		threadsPerCore int64
+		want           int64
+	}{
+		{cpus: 1, threadsPerCore: 2, want: 2},
+		{cpus: 2, threadsPerCore: 2, want: 2},
+		{cpus: 3, threadsPerCore: 2, want: 4},
+		{cpus: 4, threadsPerCore: 2, want: 4},
+		{cpus: 7, threadsPerCore: 2, want: 8},
+		{cpus: 1, threadsPerCore: 1, want: 1},
+		{cpus: 3, threadsPerCore: 1, want: 3},
+		{cpus: 5, threadsPerCore: 4, want: 8},
+	}
+
+	for _, tt := range tests {
+		if got := roundUpToWholeCores(tt.cpus, tt.threadsPerCore); got != tt.want {
+			t.Errorf("roundUpToWholeCores(%d, %d) = %d, want %d", tt.cpus, tt.threadsPerCore, got, tt.want)
+		}
+	}
 }
 
 func TestParseTresString(t *testing.T) {
@@ -671,6 +874,169 @@ func TestAppendSlurmdArgs(t *testing.T) {
 	})
 }
 
+func envValues(envs []corev1.EnvVar, name string) []string {
+	var values []string
+	for _, env := range envs {
+		if env.Name == name {
+			values = append(values, env.Value)
+		}
+	}
+	return values
+}
+
+func TestAppendSlurmdArgs_PodResourceEnvs(t *testing.T) {
+	slurmdPodSpec := func(requests corev1.ResourceList, env ...corev1.EnvVar) *corev1.PodSpec {
+		return &corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:      ContainerSlurmd,
+					Env:       env,
+					Resources: corev1.ResourceRequirements{Requests: requests},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		requests   corev1.ResourceList
+		wantCPUs   string
+		wantMemory string
+	}{
+		{
+			name: "whole CPUs and MiB from requests",
+			requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			},
+			wantCPUs:   "4",
+			wantMemory: "8192",
+		},
+		{
+			name: "fractional CPUs round up and bytes round down to MiB",
+			requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("1500m"),
+				corev1.ResourceMemory: resource.MustParse("1G"),
+			},
+			wantCPUs:   "2",
+			wantMemory: "953",
+		},
+		{
+			name: "no CPU or memory request gives 0",
+			requests: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+			},
+			wantCPUs:   "0",
+			wantMemory: "0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			podSpec := slurmdPodSpec(tt.requests)
+			if err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, ""); err != nil {
+				t.Fatalf("appendSlurmdArgs() returned unexpected error: %v", err)
+			}
+			c := podSpec.Containers[0]
+			expectedArgs := []string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testFeatureWithPart}
+			if diff := cmp.Diff(expectedArgs, c.Args); diff != "" {
+				t.Errorf("appendSlurmdArgs() set unexpected args (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff([]string{tt.wantCPUs}, envValues(c.Env, envPodCPUs)); diff != "" {
+				t.Errorf("appendSlurmdArgs() set unexpected %s (-want +got):\n%s", envPodCPUs, diff)
+			}
+			if diff := cmp.Diff([]string{tt.wantMemory}, envValues(c.Env, envPodMemory)); diff != "" {
+				t.Errorf("appendSlurmdArgs() set unexpected %s (-want +got):\n%s", envPodMemory, diff)
+			}
+		})
+	}
+
+	t.Run("ReplacesTemplateValues", func(t *testing.T) {
+		const (
+			templateEnv      = "TEMPLATE_ENV"
+			templateEnvValue = "from-template"
+		)
+		podSpec := slurmdPodSpec(
+			corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			},
+			corev1.EnvVar{Name: templateEnv, Value: templateEnvValue},
+			corev1.EnvVar{Name: envPodCPUs, Value: "99"},
+			corev1.EnvVar{Name: envPodMemory, Value: "1"},
+		)
+		if err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, ""); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		c := podSpec.Containers[0]
+		if diff := cmp.Diff([]string{templateEnvValue}, envValues(c.Env, templateEnv)); diff != "" {
+			t.Errorf("Unexpected %s (-want +got):\n%s", templateEnv, diff)
+		}
+		if diff := cmp.Diff([]string{"4"}, envValues(c.Env, envPodCPUs)); diff != "" {
+			t.Errorf("Unexpected %s (-want +got):\n%s", envPodCPUs, diff)
+		}
+		if diff := cmp.Diff([]string{"8192"}, envValues(c.Env, envPodMemory)); diff != "" {
+			t.Errorf("Unexpected %s (-want +got):\n%s", envPodMemory, diff)
+		}
+	})
+}
+
+// TestAppendSlurmdArgs_ManagedEnvNames fails when appendSlurmdArgs and slurmdManagedEnvNames disagree.
+func TestAppendSlurmdArgs_ManagedEnvNames(t *testing.T) {
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: ContainerSlurmd}}}
+	if err := appendSlurmdArgs(podSpec, "123", testConfServerDefault, nil, ""); err != nil {
+		t.Fatalf("appendSlurmdArgs() returned unexpected error: %v", err)
+	}
+	injected := make(map[string]bool, len(podSpec.Containers[0].Env))
+	for _, env := range podSpec.Containers[0].Env {
+		injected[env.Name] = true
+	}
+	if diff := cmp.Diff(slurmdManagedEnvNames, injected); diff != "" {
+		t.Errorf("appendSlurmdArgs() injected env names differ from slurmdManagedEnvNames (-want +got):\n%s", diff)
+	}
+}
+
+func TestTranslateSlurmJobToJobSet_PodResourceEnvs(t *testing.T) {
+	wmSpec := getTestWMSpec()
+	translator := NewJobSetTranslator()
+	controller := getTestController()
+
+	t.Run("Fallback memory", func(t *testing.T) {
+		// 2 tasks per pod => 4 CPUs and 4 * defaultMemoryPerCPUMB per pod.
+		job := newTestJob().
+			withNodes(2).
+			withTasks(4).
+			withCpusPerTask(2).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 2,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testPartitionHighPrio}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8192Mi"),
+			}),
+			withEnv(map[string]string{envPodCPUs: "4", envPodMemory: "8192"}),
+		)
+	})
+
+	t.Run("Explicit memory request", func(t *testing.T) {
+		job := newTestJob().
+			withCpusPerTask(2).
+			withMemoryPerNode(4096).
+			build()
+
+		obj, err := translator.Translate(job, wmSpec, controller)
+		verifyJobSet(t, obj, err, "123", 1,
+			withArgs([]string{argConfServer, testConfServerDefault, argNodeName, valNodeName, "-Z", argConf, testPartitionHighPrio}),
+			withRequests(corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("2"),
+				corev1.ResourceMemory: resource.MustParse("4096Mi"),
+			}),
+			withEnv(map[string]string{envPodCPUs: "2", envPodMemory: "4096"}),
+		)
+	})
+}
+
 //nolint:goconst // Test deliberately duplicates constant literals for contract verification.
 func TestAppendSlurmdArgs_NodeNameAndEnv(t *testing.T) {
 	t.Run("InjectsDeterministicNodeEnvsAndNodeNameArg", func(t *testing.T) {
@@ -764,14 +1130,14 @@ func TestAppendSlurmdArgs_NodeNameAndEnv(t *testing.T) {
 			t.Errorf("Expected last -N value to be %q, got %q", "$(SLURM_NODE_NAME)", lastNodeName)
 		}
 
-		if len(c.Env) != 6 {
-			t.Fatalf("Expected 6 env vars (1 custom + 5 deterministic), got %d: %v", len(c.Env), c.Env)
+		if len(c.Env) != 8 {
+			t.Fatalf("Expected 8 env vars (1 custom + 5 deterministic + 2 resource), got %d: %v", len(c.Env), c.Env)
 		}
 		if c.Env[0].Name != "TEST_INITIAL_ENV" {
 			t.Errorf("Expected TEST_INITIAL_ENV at index 0, got %s", c.Env[0].Name)
 		}
 		// Deterministic env vars must be in order so SLURM_NODE_NAME can reference previous ones
-		expectedOrder := []string{"JOBSET_NAME", "REPLICATED_JOB_NAME", "JOB_INDEX", "POD_INDEX", "SLURM_NODE_NAME"}
+		expectedOrder := []string{"JOBSET_NAME", "REPLICATED_JOB_NAME", "JOB_INDEX", "POD_INDEX", "SLURM_NODE_NAME", "POD_CPUS", "POD_MEMORY"}
 		for i, wantName := range expectedOrder {
 			if c.Env[i+1].Name != wantName {
 				t.Errorf("Expected env at index %d to be %s, got %s", i+1, wantName, c.Env[i+1].Name)

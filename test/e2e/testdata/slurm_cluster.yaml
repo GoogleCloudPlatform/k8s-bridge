@@ -32,6 +32,16 @@ data:
   # Base64 encoded string: "thisismungekeyatleast32byteslong123"
   slurm.key: dGhpc2lzbXVuZ2VrZXlhdGxlYXN0MzJieXRlc2xvbmcxMjM=
 ---
+# Without gres.conf, slurmd finds no GPUs, and a GPU dynamic node registers as INVALID.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-gres-conf
+  namespace: slurm
+data:
+  gres.conf: |
+    AutoDetect=nvidia
+---
 apiVersion: slinky.slurm.net/v1beta1
 kind: Controller
 metadata:
@@ -53,6 +63,7 @@ spec:
   configFileRefs:
     - name: slurm-job-submit-lua
     - name: slurm-cli-filter-lua
+    - name: slurm-gres-conf
   clusterName: slurm
   persistence:
     enabled: false
