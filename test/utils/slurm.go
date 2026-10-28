@@ -83,6 +83,10 @@ var (
 	availFeaturesRegex  = regexp.MustCompile(`\bAvailableFeatures=(\S+)`)
 	activeFeaturesRegex = regexp.MustCompile(`\bActiveFeatures=(\S+)`)
 	nodeReasonRegex     = regexp.MustCompile(`\bReason=(.*?)(?:\s+\[|$)`)
+	cpuEfctvRegex       = regexp.MustCompile(`\bCPUEfctv=(\d+)`)
+	realMemoryRegex     = regexp.MustCompile(`\bRealMemory=(\d+)`)
+	// scontrol prints MemSpecLimit only when the node has a memory reservation.
+	memSpecLimitRegex = regexp.MustCompile(`\bMemSpecLimit=(\d+)`)
 )
 
 // SetupSlinkySlurm deploys the Slinky Slurm operator, JobSubmit and CliFilter Lua configmaps, and Slurm cluster.
@@ -851,6 +855,14 @@ type SlurmNodeState struct {
 	AvailableFeatures string
 	ActiveFeatures    string
 	Reason            string
+	// CPUEfctv and RealMemory-MemSpecLimit (MiB) are what slurmctld can allocate on the node.
+	CPUEfctv     int
+	RealMemory   int
+	MemSpecLimit int
+}
+
+func (s SlurmNodeState) SchedulableMemoryMB() int {
+	return s.RealMemory - s.MemSpecLimit
 }
 
 // QuerySlurmNodeState reads a node's state with scontrol.
@@ -866,7 +878,18 @@ func QuerySlurmNodeState(slurmNamespace, nodeName string) (SlurmNodeState, error
 		AvailableFeatures: extractRegexField(availFeaturesRegex, output),
 		ActiveFeatures:    extractRegexField(activeFeaturesRegex, output),
 		Reason:            extractRegexComment(nodeReasonRegex, output),
+		CPUEfctv:          extractRegexInt(cpuEfctvRegex, output),
+		RealMemory:        extractRegexInt(realMemoryRegex, output),
+		MemSpecLimit:      extractRegexInt(memSpecLimitRegex, output),
 	}, nil
+}
+
+func extractRegexInt(re *regexp.Regexp, s string) int {
+	n, err := strconv.Atoi(extractRegexField(re, s))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // WaitForSlurmNodeState polls until the node enters expectedState and asserts it is not unexpectedly down.
@@ -881,6 +904,26 @@ func WaitForSlurmNodeState(slurmNamespace, nodeName, expectedState string, timeo
 			fmt.Sprintf("Node %s state mismatch: got %s, expected %s", nodeName, ns.State, expectedState))
 		g.Expect(ns.Reason).NotTo(gomega.ContainSubstring("Node unexpected socket down"),
 			fmt.Sprintf("Node %s is down unexpectedly: %s", nodeName, ns.Reason))
+	}, timeout, time.Second).Should(gomega.Succeed())
+}
+
+// VerifySlurmNodeSchedulableResources polls until slurmctld can allocate exactly
+// expectedCPUs CPUs and expectedMemMB MiB on the dynamic node.
+func VerifySlurmNodeSchedulableResources(
+	slurmNamespace, nodeName string, expectedCPUs, expectedMemMB int, timeout time.Duration,
+) {
+	ginkgo.GinkgoHelper()
+	ginkgo.By(fmt.Sprintf("verifying slurmctld can allocate %d CPUs and %d MiB on Slurm node %s",
+		expectedCPUs, expectedMemMB, nodeName))
+
+	gomega.Eventually(func(g gomega.Gomega) {
+		ns, err := QuerySlurmNodeState(slurmNamespace, nodeName)
+		g.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to query Slurm node state for "+nodeName)
+		g.Expect(ns.CPUEfctv).To(gomega.Equal(expectedCPUs),
+			fmt.Sprintf("Node %s has CPUEfctv=%d, expected the pod's CPU request %d", nodeName, ns.CPUEfctv, expectedCPUs))
+		g.Expect(ns.SchedulableMemoryMB()).To(gomega.Equal(expectedMemMB),
+			fmt.Sprintf("Node %s has RealMemory=%d MemSpecLimit=%d, expected %d MiB for jobs, the pod's memory request",
+				nodeName, ns.RealMemory, ns.MemSpecLimit, expectedMemMB))
 	}, timeout, time.Second).Should(gomega.Succeed())
 }
 
