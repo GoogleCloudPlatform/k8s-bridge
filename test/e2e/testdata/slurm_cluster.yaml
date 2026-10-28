@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# test/e2e/testdata/slurm_cluster_persistent.yaml is a copy of this file with slurmctld
+# persistence enabled. When you change this file, change the copy too.
 apiVersion: v1
 kind: Secret
 metadata:

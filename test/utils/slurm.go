@@ -42,6 +42,10 @@ const (
 	StaticSlurmNodeCPUs        = 1
 	staticSlurmNodeSetManifest = "test/e2e/testdata/slurm_static_nodeset.yaml"
 
+	// DefaultSlurmClusterManifest contains the Slurm Controller and RestApi that
+	// SetupSlinkySlurm deploys. Its Controller has persistence disabled.
+	DefaultSlurmClusterManifest = "test/e2e/testdata/slurm_cluster.yaml"
+
 	// LINT.IfChange(slurm_version_pair)
 	// DefaultSlinkyOperatorVersion and DefaultSlurmImageTag define the pinned,
 	// immutable Slinky operator + Slurm 26.05 daemon version pair used across E2E tests.
@@ -50,6 +54,7 @@ const (
 	// LINT.ThenChange(
 	//   test/e2e/testdata/slurm_operator.yaml,
 	//   test/e2e/testdata/slurm_cluster.yaml:slurm_version_pair,
+	//   test/e2e/testdata/slurm_cluster_persistent.yaml:slurm_version_pair,
 	//   test/e2e/testdata/slurm_login.yaml:slurm_version_pair,
 	//   test/e2e/testdata/slurm_static_nodeset.yaml:slurm_version_pair,
 	//   test/e2e/testdata/workloadmixing_template.yaml:slurm_version_pair,
@@ -71,6 +76,8 @@ var (
 	derivedECRegex  = regexp.MustCompile(`\bDerivedEC=(\S+)`)
 	nodeListRegex   = regexp.MustCompile(`\bNodeList=(\S+)`)
 	allocNodesRegex = regexp.MustCompile(`\bAllocNodes=(\S+)`)
+	startTimeRegex  = regexp.MustCompile(`\bStartTime=(\S+)`)
+	restartsRegex   = regexp.MustCompile(`\bRestarts=(\S+)`)
 	// requeueRegex matches Slurm's "Requeue=0|1" field: 0 when the job was submitted
 	// with --no-requeue (or JobRequeue=0 is configured), 1 otherwise.
 	requeueRegex = regexp.MustCompile(`\bRequeue=(\S+)`)
@@ -87,6 +94,13 @@ var (
 
 // SetupSlinkySlurm deploys the Slinky Slurm operator, JobSubmit and CliFilter Lua configmaps, and Slurm cluster.
 func SetupSlinkySlurm() {
+	ginkgo.GinkgoHelper()
+	SetupSlinkySlurmWithCluster(DefaultSlurmClusterManifest)
+}
+
+// SetupSlinkySlurmWithCluster does the same as SetupSlinkySlurm, but deploys the
+// Slurm Controller and RestApi from clusterManifest.
+func SetupSlinkySlurmWithCluster(clusterManifest string) {
 	ginkgo.GinkgoHelper()
 
 	ginkgo.By("creating slinky namespace")
@@ -186,10 +200,10 @@ func SetupSlinkySlurm() {
 	_, err = Run(cmd)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-	ginkgo.By("deploying Slurm Controller and RestApi CRs")
+	ginkgo.By("deploying Slurm Controller and RestApi CRs from " + clusterManifest)
 	cmd = exec.Command(
 		"kubectl", "apply", "--server-side", "--force-conflicts",
-		"-f", "test/e2e/testdata/slurm_cluster.yaml",
+		"-f", clusterManifest,
 	)
 	_, err = Run(cmd)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to deploy Slurm resources")
@@ -261,11 +275,18 @@ func TeardownStaticSlurmNode() {
 // TeardownSlinkySlurm deletes Slurm resources and namespaces.
 func TeardownSlinkySlurm() {
 	ginkgo.GinkgoHelper()
+	TeardownSlinkySlurmWithCluster(DefaultSlurmClusterManifest)
+}
+
+// TeardownSlinkySlurmWithCluster does the same as TeardownSlinkySlurm for a Slurm
+// cluster that SetupSlinkySlurmWithCluster deployed from clusterManifest.
+func TeardownSlinkySlurmWithCluster(clusterManifest string) {
+	ginkgo.GinkgoHelper()
 
 	teardownSlurmLoginNode()
 
 	ginkgo.By("deleting Slurm resources")
-	cmd := exec.Command("kubectl", "delete", "-f", "test/e2e/testdata/slurm_cluster.yaml", "--ignore-not-found")
+	cmd := exec.Command("kubectl", "delete", "-f", clusterManifest, "--ignore-not-found")
 	if _, err := Run(cmd); err != nil {
 		WarnError(err)
 	}
@@ -645,6 +666,10 @@ type SlurmJobState struct {
 	DerivedEC  string
 	NodeList   string
 	AllocNodes string
+	// StartTime and Restarts change when Slurm starts the job again, for
+	// example after a requeue.
+	StartTime string
+	Restarts  string
 	// Requeue is Slurm's "Requeue=0|1" flag: "0" when the job may not be requeued
 	// (sbatch --no-requeue or JobRequeue=0), "1" otherwise.
 	Requeue string
@@ -710,6 +735,8 @@ func QuerySlurmJobState(slurmNamespace, jobID string) (SlurmJobState, error) {
 		DerivedEC:  extractRegexField(derivedECRegex, output),
 		NodeList:   extractRegexField(nodeListRegex, output),
 		AllocNodes: extractRegexField(allocNodesRegex, output),
+		StartTime:  extractRegexField(startTimeRegex, output),
+		Restarts:   extractRegexField(restartsRegex, output),
 		Requeue:    extractRegexField(requeueRegex, output),
 		NumCPUs:    extractRegexField(numCPUsRegex, output),
 		UserName:   userName,
@@ -933,6 +960,15 @@ func VerifySlurmdNotKilledByProbes(slurmNamespace, podName string) {
 		expectNoSlurmdRestart(gomega.Default, evidence)
 	}
 	expectSlurmdNotKilledByProbes(gomega.Default, evidence)
+}
+
+// VerifyNoSlurmdLivenessFailure asserts that the kubelet reported no failed livenessProbe
+// for the slurmd container of podName. The kubelet restarts the container only after
+// several failed probes, so a check of the restart count alone can miss short failures.
+func VerifyNoSlurmdLivenessFailure(slurmNamespace, podName string) {
+	ginkgo.GinkgoHelper()
+	ginkgo.By("verifying that the slurmd livenessProbe did not fail on pod " + podName)
+	expectNoSlurmdLivenessFailure(gomega.Default, readSlurmdProbeEvidence(gomega.Default, slurmNamespace, podName))
 }
 
 // VerifySlurmdProbesStayHealthy asserts that the slurmd probes on podNames keep
