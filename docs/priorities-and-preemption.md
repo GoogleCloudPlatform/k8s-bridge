@@ -34,7 +34,7 @@ Complete the base setup from the [Quickstart guide](quickstart.md):
 
 [`docs/examples/priority-preemption/kueue-resources.yaml`](examples/priority-preemption/kueue-resources.yaml) defines:
 - `WorkloadPriorityClass` resources for each priority tier (`prod-high` with value `100`, and `batch-low` with value `10`).
-- `ClusterQueue` (`cluster-queue`) with `spec.preemption.withinClusterQueue: LowerPriority`, allowing high-priority workloads to preempt low-priority workloads when the 2 CPU quota is saturated.
+- `ClusterQueue` (`cluster-queue`) with `spec.preemption.withinClusterQueue: LowerPriority`, allowing high-priority workloads to preempt low-priority workloads when the 4 CPU and 8Gi memory quota is saturated.
 - `LocalQueue` (`slurm-queue`) in the `slurm` namespace.
 
 Create the `slurm` namespace and apply the Kueue priority resources:
@@ -112,15 +112,15 @@ export LOGIN="deploy/slurm-login-slinky"
 
 ### Step 4.1: Saturate quota with low-priority batch job
 
-Submit a low-priority batch job across 2 dynamic nodes that consumes the entire 2 CPU quota of `cluster-queue`:
+Submit a low-priority batch job across 2 dynamic nodes that consumes the entire 4 CPU and 8Gi memory quota of `cluster-queue`:
 
 ```bash
 kubectl -n slurm exec -it $LOGIN -c login -- \
   sbatch --partition=batch \
          --nodes=2 \
          --ntasks-per-node=1 \
-         --cpus-per-task=1 \
-         --mem=2G \
+         --cpus-per-task=2 \
+         --mem=4G \
          --time=00:10:00 \
          --wrap="echo 'Batch job started'; sleep 300; echo 'Batch job finished'"
 ```
@@ -141,15 +141,15 @@ Expected status:
 
 ### Step 4.2: Submit high-priority production job to trigger preemption
 
-While the batch job is running, submit a production job requesting 1 dynamic node (1 CPU):
+While the batch job is running, submit a production job requesting 1 dynamic node (2 CPUs and 4Gi memory):
 
 ```bash
 kubectl -n slurm exec -it $LOGIN -c login -- \
   sbatch --partition=prod \
          --nodes=1 \
          --ntasks-per-node=1 \
-         --cpus-per-task=1 \
-         --mem=2G \
+         --cpus-per-task=2 \
+         --mem=4G \
          --time=00:05:00 \
          --wrap="echo 'Production job started'; sleep 60; echo 'Production job finished'"
 ```
