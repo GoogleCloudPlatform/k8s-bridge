@@ -28,7 +28,7 @@ manager:
   leaderElection:
     enabled: true
   healthProbeBindAddress: ":8081"
-  metricsBindAddress: ":8080"
+  metricsBindAddress: ":8443"
   # Log level passed to --zap-log-level: debug, info, error, or an integer verbosity.
   logLevel: info
 
@@ -47,8 +47,6 @@ rbac:
 
 metrics:
   enabled: true
-  serviceMonitor:
-    enabled: false
 
 podAnnotations: {}
 podLabels: {}

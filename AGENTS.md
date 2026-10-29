@@ -1,320 +1,116 @@
-# k8s-bridge - AI Agent Guide
+# k8s-bridge — Agent Instructions
 
-## Project Structure
+## 1. Project Overview & Runtime Lifecycle
 
-**Single-group layout (default):**
-```
-cmd/main.go                    Manager entry (registers controllers/webhooks)
-api/<version>/*_types.go       CRD schemas (+kubebuilder markers)
-api/<version>/zz_generated.*   Auto-generated (DO NOT EDIT)
-internal/controller/*          Reconciliation logic
-internal/webhook/*             Validation/defaulting (if present)
-config/crd/bases/*             Generated CRDs (DO NOT EDIT)
-config/rbac/role.yaml          Generated RBAC (DO NOT EDIT)
-config/samples/*               Example CRs (edit these)
-Makefile                       Build/test/deploy commands
-PROJECT                        Kubebuilder metadata Auto-generated (DO NOT EDIT)
-```
+- **What this repository does:** `k8s-bridge` is a Kubernetes operator and Slurm plugin suite that shares compute resources between Slurm (deployed via the Slinky Slurm operator) and Kubernetes. It intercepts Slurm jobs submitted to bridged partitions and runs dynamic `slurmd` worker pods managed by Kubernetes `JobSet` and `Kueue`.
+- **Runtime Workload Lifecycle:**
+  1. **Submission Interception (`hack/cli_filter.lua`, `hack/job_submit.lua`):** On bridged partitions (`WORKLOAD_MIXING_PARTITIONS`), `cli_filter.lua` (login pods) validates CLI flags and `job_submit.lua` (`slurmctld`) places single-partition jobs into auto-hold (`AutoHoldMarker` in `translator.go`) and rejects multi-partition bridged jobs.
+  2. **Client Sync & Polling (`internal/controller/{workloadmixing,slurmclientsync,slurmjob/poller.go}`, `internal/clientmap/`):** Reconcilers validate Slinky `Controller`/`RestApi` refs and sync JWT clients into `ClientMap`; `SlurmPoller` polls `slurmrestd` to enqueue deduplicated admission and teardown events.
+  3. **Translation & Admission (`internal/controller/slurmjob/`):** `SlurmJobReconciler` and `JobSetTranslator` translate held jobs into suspended `JobSet` objects (`slurm-job-<jobID>`) mapped to a Kueue `LocalQueue` and optional `WorkloadPriorityClass`.
+  4. **Dynamic Node Registration & Release:** `SlurmJobReconciler` releases the Slurm hold with per-job feature constraints (`UniqueFeaturePrefix` in `translator.go`); once Kueue admits the `JobSet`, dynamic `slurmd` pods register with `slurmctld`.
+  5. **Preemption, Teardown & Metrics (`internal/controller/slurmjob/teardown_reconciler.go`, `internal/metrics/`):** Kueue preemption suspends the `JobSet`; on job termination, reconcilers delete dynamic Slurm nodes, remove `FinalizerJobSet`, delete the `JobSet`, and record Prometheus metrics.
 
-**Multi-group layout** (for projects with multiple API groups):
-```
-api/<group>/<version>/*_types.go       CRD schemas by group
-internal/controller/<group>/*          Controllers by group
-internal/webhook/<group>/<version>/*   Webhooks by group and version (if present)
-```
+---
 
-Multi-group layout organizes APIs by group name (e.g., `batch`, `apps`). Check the `PROJECT` file for `multigroup: true`.
+## 2. Start Here — Persona Triage, Lifecycle Order & Environment Matrix
 
-**To convert to multi-group layout:**
-1. Run: `kubebuilder edit --multigroup=true`
-2. Move APIs: `mkdir -p api/<group> && mv api/<version> api/<group>/`
-3. Move controllers: `mkdir -p internal/controller/<group> && mv internal/controller/*.go internal/controller/<group>/`
-4. Move webhooks (if present): `mkdir -p internal/webhook/<group> && mv internal/webhook/<version> internal/webhook/<group>/`
-5. Update import paths in all files
-6. Fix `path` in `PROJECT` file for each resource
-7. Update test suite CRD paths (add one more `..` to relative paths)
+Determine which workflow track applies before running commands or editing files:
 
-## Critical Rules
+### 2.1 Two-Track Procedural Lifecycle
+- **Track A — Software Contributor Lifecycle (Code, Plugins, Packaging, Tests & PRs):**
+  `dev-api-and-codegen` (schemas/RBAC/packaging) -> `dev-controller-and-translator` / `dev-slurm-lua` -> `test-unit-and-lint` -> `test-e2e-cluster` -> `dev-api-and-codegen` (pre-PR parity audit)
+- **Track B — Cluster Operator Lifecycle (Infra, Deployment, Config & Day-2 Ops):**
+  `infra-provision-cluster` (if cloud) -> `infra-deploy-stack` -> `infra-configure-crs` -> `test-e2e-cluster` (optional validation) -> `ops-diagnose-workload` (read-only triage) -> `ops-cleanup-state` (remediation)
 
-### Never Edit These (Auto-Generated)
-- `config/crd/bases/*.yaml` - from `make manifests`
-- `config/rbac/role.yaml` - from `make manifests`
-- `config/webhook/manifests.yaml` - from `make manifests`
-- `**/zz_generated.*.go` - from `make generate`
-- `PROJECT` - from `kubebuilder [OPTIONS]`
+### 2.2 Pre-Flight Context Check (For Cluster / Cloud Operations)
+Before mutating any cluster or cloud environment, use read-only commands (`kubectl config current-context`) or ask the user to verify:
+1. **Target Environment** (see matrix below)
+2. **Kubernetes Context & Namespace** (`kubectl config current-context`, default Slurm namespace `slurm`, operator namespace `k8s-bridge-system`)
+3. **Container Image Registry & Tag** (`IMG=<registry>/k8s-bridge:<tag>`)
 
-### Never Remove Scaffold Markers
-Do NOT delete `// +kubebuilder:scaffold:*` comments. CLI injects code at these markers.
+| Environment | Acceleration & Workload Profile | Node Provisioning Skill | Environment-Specific Configuration & Notes |
+|---|---|---|---|
+| **Local Kind** | CPU only / inner-loop dev & E2E | *(Managed by Kind harness)* | Default CPU partition (`k8s-partition`), Kind E2E harness (`test-e2e-cluster`), no cloud quotas |
+| **Cloud CPU** | Standard CPU node pools or GKE CCC | `infra-provision-cluster` | Pre-provisioned CPU node pool (`default-flavor`) or optional GKE Node Auto-Provisioning + `ComputeClass` (`infra-configure-crs`) |
+| **Cloud GPU** | Hardware GPUs (pre-provisioned or DWS) | `infra-provision-cluster` (DWS / GPU) | DWS Flex-start (`--flex-start`) or labeled GPU nodes, typed/untyped GPU `mappedResources` (`infra-configure-crs`) |
 
-### Keep Project Structure
-Do not move files around. The CLI expects files in specific locations.
+*(Base stack deployment via `infra-deploy-stack` and verification via `test-e2e-cluster` apply to all environments.)*
 
-### Always Use CLI Commands
-Always use `kubebuilder create api` and `kubebuilder create webhook` to scaffold. Do NOT create files manually.
+---
 
-### E2E Tests Require an Isolated Kind Cluster
-The e2e tests are designed to validate the solution in an isolated environment (similar to GitHub Actions CI).
-Ensure you run them against a dedicated [Kind](https://kind.sigs.k8s.io/) cluster (not your “real” dev/prod cluster).
+## 3. Global Guardrails & Safety Gates
 
-## After Making Changes
+### 3.1 Code & Repository Guardrails
+- **Generated & Paired Artifacts (Do Not Hand-Edit Derived Outputs):** Never manually edit generated DeepCopy, CRD, RBAC, or `PROJECT` files; regenerate and sync paired artifacts via `make manifests generate` and `make version-sync` (see [skills/dev-api-and-codegen/references/parity-checklist.md](skills/dev-api-and-codegen/references/parity-checklist.md)).
+- **Required Post-Edit Checks:**
+  - After Go or Lua code changes: run `make fmt vet lint test` (`test-unit-and-lint`).
+  - Before submitting a pull request or after API/CRD/RBAC/chart/doc edits: run `make version-sync manifests generate fmt`, verify `git diff --exit-code`, and audit parity (`dev-api-and-codegen`).
 
-**After editing `*_types.go` or markers:**
-```
-make manifests  # Regenerate CRDs/RBAC from markers
-make generate   # Regenerate DeepCopy methods
-```
+### 3.2 Cluster & Cloud Operational Guardrails
+- **Confirmation Gate (Billable & Destructive Actions):** Present the planned commands and obtain user confirmation before:
+  1. Creating, resizing, or deleting cloud clusters or node pools (`infra-provision-cluster`).
+  2. Installing, upgrading, or uninstalling cluster-wide CRDs, webhooks, or Helm releases (`infra-deploy-stack`, `infra-configure-crs`).
+  3. Cancelling active Slurm jobs, draining nodes, deleting Kubernetes resources (`ops-cleanup-state`), or mutating cluster/tenant policies and other tenants' workloads.
+- **Pod Termination Safety:** Never delete dynamic `slurmd` pods with `--force --grace-period=0` (causes `BadConstraints`; see `ops-cleanup-state`).
+- **Non-Root Verification:** Test Slurm submissions and modifications via `runuser -u <user> -- ...` (login pods default to `root`, which bypasses `hack/job_submit.lua` checks; see `dev-slurm-lua`).
 
-**After editing `*.go` files:**
-```
-make lint-fix   # Auto-fix code style
-make test       # Run unit tests
-```
+---
 
-## CLI Commands Cheat Sheet
+## 4. Repository Layout
 
-### Create API (your own types)
-```bash
-kubebuilder create api --group <group> --version <version> --kind <Kind>
+```text
+.
+├── api/v1alpha1/        # WorkloadMixing CRD Go types (canonical schema source)
+├── cmd/                 # Manager binary entrypoint (cmd/main.go) and CLI flags
+├── config/              # Kustomize bases (crd, rbac, manager, prometheus, network-policy, samples)
+├── docs/                # User guides and scenario example manifests (docs/examples/)
+├── hack/                # Slurm Lua plugins (job_submit.lua, cli_filter.lua) and helper scripts
+├── helm/                # Local Helm chart (Chart.yaml, values.yaml, crds/, templates/)
+├── internal/            # Go packages (clientmap, controller/{slurmclientsync,slurmjob,workloadmixing}, metrics, utils, version)
+├── skills/              # On-demand Agent Skills (skills/<category>-<name>/SKILL.md)
+└── test/                # Ginkgo E2E suites (test/e2e/, test/e2e/gpu/), infra scripts, and mocks (test/utils/)
 ```
 
-### Deploy Image Plugin (scaffold to deploy/manage ANY container image)
+---
 
-Generate a controller that deploys and manages a container image (nginx, redis, memcached, your app, etc.):
+## 5. Skill Routing Table
 
-```bash
-# Example: deploying memcached
-kubebuilder create api --group example.com --version v1alpha1 --kind Memcached \
-  --image=memcached:alpine \
-  --plugins=deploy-image.go.kubebuilder.io/v1-alpha
-```
+**The 1-Sentence Trigger + Pointer Rule:** When a task matches a trigger below, read the target `SKILL.md` file before taking action (all `skills/...`, `hack/...`, and `docs/...` paths and script invocations are relative to and must be run from the repository root containing `Makefile` and `PROJECT`). Do not guess procedures from memory.
 
-Scaffolds good-practice code: reconciliation logic, status conditions, finalizers, RBAC. Use as a reference implementation.
+**Subagent Delegation Protocol:** Include in every subagent prompt: (1) Target Environment and Kubernetes context/namespace, (2) the `skills/<skill-name>/SKILL.md` path to read first before running commands or editing files, and (3) whether access is read-only or allows state mutation after user confirmation.
 
+### Code Development (`dev-*`)
+| Task / Trigger | Canonical Skill |
+|---|---|
+| Modifying `WorkloadMixing` Go types in `api/`, Kubebuilder/RBAC markers, Kustomize bases, Helm chart templates/values, or auditing pre-PR parity across `config/`, `helm/`, and `docs/examples/` | [skills/dev-api-and-codegen/SKILL.md](skills/dev-api-and-codegen/SKILL.md) |
+| Modifying Go reconcilers, `SlurmPoller`, `JobSetTranslator`, `ClientMap`, JWT sync, or Prometheus metrics in `internal/` | [skills/dev-controller-and-translator/SKILL.md](skills/dev-controller-and-translator/SKILL.md) |
+| Modifying or testing the Slurm Lua plugins (`hack/job_submit.lua` and `hack/cli_filter.lua`) | [skills/dev-slurm-lua/SKILL.md](skills/dev-slurm-lua/SKILL.md) |
 
-### Create Webhooks
-```bash
-# Validation + defaulting
-kubebuilder create webhook --group <group> --version <version> --kind <Kind> \
-  --defaulting --programmatic-validation
+### Testing & Verification (`test-*`)
+| Task / Trigger | Canonical Skill |
+|---|---|
+| Writing or running Go unit tests, `envtest` controller specs, Slurm REST client mocks, or linters (`make fmt vet lint test`) | [skills/test-unit-and-lint/SKILL.md](skills/test-unit-and-lint/SKILL.md) |
+| Running, writing, or debugging Ginkgo E2E test suites on local Kind CPU clusters or GKE GPU clusters | [skills/test-e2e-cluster/SKILL.md](skills/test-e2e-cluster/SKILL.md) |
 
-# Conversion webhook (for multi-version APIs)
-kubebuilder create webhook --group <group> --version v1 --kind <Kind> \
-  --conversion --spoke v2
-```
+### Infrastructure & Cluster Configuration (`infra-*`)
+| Task / Trigger | Canonical Skill |
+|---|---|
+| Creating, resizing, updating, or deleting GKE clusters and CPU (standard or CCC) or GPU (pre-provisioned or DWS Flex-start) node pools, or labeling GPU nodes | [skills/infra-provision-cluster/SKILL.md](skills/infra-provision-cluster/SKILL.md) |
+| Installing, upgrading, or tearing down the base operators and Helm charts (`cert-manager`, `slurm-operator`, `JobSet`, `Kueue`, `k8s-bridge`) without CR configuration | [skills/infra-deploy-stack/SKILL.md](skills/infra-deploy-stack/SKILL.md) |
+| Configuring, applying, or removing Kueue CRs, GKE `ComputeClass` CRs, Slinky `slurm` partitions/Lua plugins, `WorkloadMixing` CRs (CPU/GPU/priority), and non-root users | [skills/infra-configure-crs/SKILL.md](skills/infra-configure-crs/SKILL.md) |
 
-### Controller for Core Kubernetes Types
-```bash
-# Watch Pods
-kubebuilder create api --group core --version v1 --kind Pod \
-  --controller=true --resource=false
+### Day-2 Operations & Troubleshooting (`ops-*`)
+| Task / Trigger | Canonical Skill |
+|---|---|
+| Read-only diagnosis of rejected, held, suspended, pending, preempted, or cancelled jobs and diagnostic snapshot collection | [skills/ops-diagnose-workload/SKILL.md](skills/ops-diagnose-workload/SKILL.md) |
+| Draining and cleaning up wedged Slurm jobs, orphaned `JobSet` objects, dynamic `slurmd` pods, and stale Slurm nodes | [skills/ops-cleanup-state/SKILL.md](skills/ops-cleanup-state/SKILL.md) |
 
-# Watch Deployments
-kubebuilder create api --group apps --version v1 --kind Deployment \
-  --controller=true --resource=false
-```
+---
 
-### Controller for External Types (e.g., from other operators)
+## 6. Core Architectural & Ownership Invariants
 
-Watch resources from external APIs (cert-manager, Argo CD, Istio, etc.):
-
-```bash
-# Example: watching cert-manager Certificate resources
-kubebuilder create api \
-  --group cert-manager --version v1 --kind Certificate \
-  --controller=true --resource=false \
-  --external-api-path=github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1 \
-  --external-api-domain=io \
-  --external-api-module=github.com/cert-manager/cert-manager
-```
-
-**Note:** Use `--external-api-module=<module>@<version>` only if you need a specific version. Otherwise, omit `@<version>` to use what's in go.mod.
-
-### Webhook for External Types
-
-```bash
-# Example: validating external resources
-kubebuilder create webhook \
-  --group cert-manager --version v1 --kind Issuer \
-  --defaulting \
-  --external-api-path=github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1 \
-  --external-api-domain=io \
-  --external-api-module=github.com/cert-manager/cert-manager
-```
-
-## Testing & Development
-
-```bash
-make test              # Run unit tests (uses envtest: real K8s API + etcd)
-make run               # Run locally (uses current kubeconfig context)
-```
-
-Tests use **Ginkgo + Gomega** (BDD style). Check `suite_test.go` for setup.
-
-## Deployment Workflow
-
-```bash
-# 1. Regenerate manifests
-make manifests generate
-
-# 2. Build & deploy
-export IMG=<registry>/<project>:tag
-make docker-build docker-push IMG=$IMG  # Or: kind load docker-image $IMG --name <cluster>
-make deploy IMG=$IMG
-
-# 3. Test
-kubectl apply -k config/samples/
-
-# 4. Debug
-kubectl logs -n <project>-system deployment/<project>-controller-manager -c manager -f
-```
-
-### API Design
-
-**Key markers for** `api/<version>/*_types.go`:
-
-```go
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Namespaced
-// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].status"
-
-// On fields:
-// +kubebuilder:validation:Required
-// +kubebuilder:validation:Minimum=1
-// +kubebuilder:validation:MaxLength=100
-// +kubebuilder:validation:Pattern="^[a-z]+$"
-// +kubebuilder:default="value"
-```
-
-- **Use** `metav1.Condition` for status (not custom string fields)
-- **Use predefined types**: `metav1.Time` instead of `string` for dates
-- **Follow K8s API conventions**: Standard field names (`spec`, `status`, `metadata`)
-
-### Controller Design
-
-**RBAC markers in** `internal/controller/*_controller.go`:
-
-```go
-// +kubebuilder:rbac:groups=mygroup.example.com,resources=mykinds,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=mygroup.example.com,resources=mykinds/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=mygroup.example.com,resources=mykinds/finalizers,verbs=update
-// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-```
-
-**Implementation rules:**
-- **Idempotent reconciliation**: Safe to run multiple times
-- **Re-fetch before updates**: `r.Get(ctx, req.NamespacedName, obj)` before `r.Update` to avoid conflicts
-- **Structured logging**: `log := log.FromContext(ctx); log.Info("msg", "key", val)`
-- **Owner references**: Enable automatic garbage collection (`SetControllerReference`)
-- **Watch secondary resources**: Use `.Owns()` or `.Watches()`, not just `RequeueAfter`
-- **Finalizers**: Clean up external resources (buckets, VMs, DNS entries)
-
-### Logging
-
-**Follow Kubernetes logging message style guidelines:**
-
-- Start from a capital letter
-- Do not end the message with a period
-- Active voice: subject present (`"Deployment could not create Pod"`) or omitted (`"Could not create Pod"`)
-- Past tense: `"Could not delete Pod"` not `"Cannot delete Pod"`
-- Specify object type: `"Deleted Pod"` not `"Deleted"`
-- Balanced key-value pairs
-
-```go
-log.Info("Starting reconciliation")
-log.Info("Created Deployment", "name", deploy.Name)
-log.Error(err, "Failed to create Pod", "name", name)
-```
-
-**Reference:** https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md#message-style-guidelines
-
-### Webhooks
-- **Create all types together**: `--defaulting --programmatic-validation --conversion`
-- **When`--force`is used**: Backup custom logic first, then restore after scaffolding
-- **For multi-version APIs**: Use hub-and-spoke pattern (`--conversion --spoke v2`)
-  - Hub version: Usually oldest stable version (v1)
-  - Spoke versions: Newer versions that convert to/from hub (v2, v3)
-  - Example: `--group crew --version v1 --kind Captain --conversion --spoke v2` (v1 is hub, v2 is spoke)
-
-### Learning from Examples
-
-The **deploy-image plugin** scaffolds a complete controller following good practices. Use it as a reference implementation:
-
-```bash
-kubebuilder create api --group example --version v1alpha1 --kind MyApp \
-  --image=<your-image> --plugins=deploy-image.go.kubebuilder.io/v1-alpha
-```
-
-Generated code includes: status conditions (`metav1.Condition`), finalizers, owner references, events, idempotent reconciliation.
-
-## Distribution Options
-
-### Option 1: YAML Bundle (Kustomize)
-
-```bash
-# Generate dist/install.yaml from Kustomize manifests
-make build-installer IMG=<registry>/<project>:tag
-```
-
-**Key points:**
-- The `dist/install.yaml` is generated from Kustomize manifests (CRDs, RBAC, Deployment)
-- Commit this file to your repository for easy distribution
-- Users only need `kubectl` to install (no additional tools required)
-
-**Example:** Users install with a single command:
-```bash
-kubectl apply -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/dist/install.yaml
-```
-
-### Option 2: Helm Chart
-
-```bash
-kubebuilder edit --plugins=helm/v2-alpha                      # Generates dist/chart/ (default)
-kubebuilder edit --plugins=helm/v2-alpha --output-dir=charts  # Generates charts/chart/
-```
-
-**For development:**
-```bash
-make helm-deploy IMG=<registry>/<project>:<tag>          # Deploy manager via Helm
-make helm-deploy IMG=$IMG HELM_EXTRA_ARGS="--set ..."    # Deploy with custom values
-make helm-status                                         # Show release status
-make helm-uninstall                                      # Remove release
-make helm-history                                        # View release history
-make helm-rollback                                       # Rollback to previous version
-```
-
-**For end users/production:**
-```bash
-helm install my-release ./<output-dir>/chart/ --namespace <ns> --create-namespace
-```
-
-**Important:** If you add webhooks or modify manifests after initial chart generation:
-1. Backup any customizations in `<output-dir>/chart/values.yaml` and `<output-dir>/chart/manager/manager.yaml`
-2. Re-run: `kubebuilder edit --plugins=helm/v2-alpha --force` (use same `--output-dir` if customized)
-3. Manually restore your custom values from the backup
-
-### Publish Container Image
-
-```bash
-export IMG=<registry>/<project>:<version>
-make docker-build docker-push IMG=$IMG
-```
-
-## References
-
-### Essential Reading
-- **Kubebuilder Book**: https://book.kubebuilder.io (comprehensive guide)
-- **controller-runtime FAQ**: https://github.com/kubernetes-sigs/controller-runtime/blob/main/FAQ.md (common patterns and questions)
-- **Good Practices**: https://book.kubebuilder.io/reference/good-practices.html (why reconciliation is idempotent, status conditions, etc.)
-- **Logging Conventions**: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-instrumentation/logging.md#message-style-guidelines (message style, verbosity levels)
-
-### API Design & Implementation
-- **API Conventions**: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md
-- **Operator Pattern**: https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
-- **Markers Reference**: https://book.kubebuilder.io/reference/markers.html
-
-### Tools & Libraries
-- **controller-runtime**: https://github.com/kubernetes-sigs/controller-runtime
-- **controller-tools**: https://github.com/kubernetes-sigs/controller-tools
-- **Kubebuilder Repo**: https://github.com/kubernetes-sigs/kubebuilder
+- **State Ownership (Single Source of Truth):**
+  - **Slurm (`slurmctld` / `slurmrestd`):** Owns job submission, user/admin hold states, job state transitions, and task execution on dynamic `slurmd` nodes.
+  - **Kubernetes & Kueue:** Own cluster resource quotas, `Workload` admission gating, priority preemption decisions, and `JobSet` pod lifecycle.
+  - **`k8s-bridge`:** Stateless translator and synchronizer maintaining a 1:1 mapping between Slurm jobs on bridged partitions and Kubernetes `JobSet` (`slurm-job-<jobID>`) objects in the same namespace.
+- **Configuration Parity Invariant:** Bridged partition names and `dynamicNodeFeature` values must match across `slurmctld` env, `slurm.conf` (`CliFilterParameters` and `NodeSet`), and `WorkloadMixing.spec.partitionsMapping` (see [skills/infra-configure-crs/SKILL.md](skills/infra-configure-crs/SKILL.md)).

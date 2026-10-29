@@ -190,6 +190,8 @@ Remove the DWS GPU resources, follow the [Quickstart cleanup steps](../quickstar
 
 ```bash
 kubectl delete -f docs/examples/gpu-dws/workloadmixing-gpu.yaml
+# Wait until this returns no resources before deleting Kueue resources:
+kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
 kubectl delete -f docs/examples/gpu-dws/kueue-resources.yaml
 
 gcloud container clusters delete <CLUSTER_NAME> \

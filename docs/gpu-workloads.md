@@ -134,5 +134,7 @@ Remove the GPU resources and follow the [Quickstart cleanup steps](quickstart.md
 
 ```bash
 kubectl delete -f docs/examples/gpu/workloadmixing-gpu.yaml
+# Wait until this returns no resources before deleting Kueue resources:
+kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
 kubectl delete -f docs/examples/gpu/kueue-resources.yaml
 ```

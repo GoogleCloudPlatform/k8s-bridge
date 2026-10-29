@@ -202,5 +202,7 @@ Remove the priority and preemption resources, and follow the [Quickstart cleanup
 
 ```bash
 kubectl delete -f docs/examples/priority-preemption/workloadmixing-priority.yaml
+# Wait until this returns no resources before deleting Kueue resources:
+kubectl get jobsets -A -l app.kubernetes.io/managed-by=k8s-bridge
 kubectl delete -f docs/examples/priority-preemption/kueue-resources.yaml
 ```

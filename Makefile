@@ -150,7 +150,7 @@ export GPU_CLUSTER_NAME ?= k8s-bridge-gpu-e2e
 export GPU_TEST_TIMEOUT ?= 45m
 export GCP_ZONE ?= us-central1-a
 export GPU_NODE_COUNT ?= 1
-export GPU_ACCELERATOR_TYPE ?= nvidia-tesla-t4
+export GPU_ACCELERATOR_TYPE ?= nvidia-l4
 export GPU_ACCELERATOR_COUNT ?= 1
 
 .PHONY: setup-infra-gpu
