@@ -21,6 +21,7 @@ import (
 	"math"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -63,6 +64,8 @@ const (
 	envJobIndex                 = "JOB_INDEX"
 	envPodIndex                 = "POD_INDEX"
 	envSlurmNodeName            = "SLURM_NODE_NAME"
+	envPodCPUs                  = "POD_CPUS"
+	envPodMemory                = "POD_MEMORY"
 	fieldPathJobSetName         = "metadata.labels['jobset.sigs.k8s.io/jobset-name']"
 	fieldPathReplicatedJobName  = "metadata.labels['jobset.sigs.k8s.io/replicatedjob-name']"
 	fieldPathJobIndex           = "metadata.labels['jobset.sigs.k8s.io/job-index']"
@@ -181,7 +184,7 @@ func (t *JobSetTranslator) Translate(
 	}
 
 	// 3. Resource Calculation
-	resources, gresInfo, err := resolvePodResources(job, replicas, wmSpec)
+	resources, gresInfo, err := resolvePodResources(job, replicas, mapping, wmSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -705,6 +708,54 @@ func resolveTasksPerNode(job *slurmclienttypes.V0044JobInfo, replicas int32) int
 	return (tasks + int64(replicas) - 1) / int64(replicas)
 }
 
+// defaultThreadsPerCore is the threads per core that the translator assumes when
+// neither PartitionMapping.threadsPerCore nor WorkloadMixing.spec.threadsPerCore is set.
+const (
+	// LINT.IfChange(default_threads_per_core)
+	defaultThreadsPerCore int32 = 2
+	// LINT.ThenChange(api/v1alpha1/workloadmixing_types.go:default_threads_per_core)
+)
+
+// resolveThreadsPerCore returns mapping.threadsPerCore when set, otherwise spec.threadsPerCore,
+// or defaultThreadsPerCore when neither field is set.
+func resolveThreadsPerCore(mapping *k8sbridgev1alpha1.PartitionMapping, wmSpec *k8sbridgev1alpha1.WorkloadMixingSpec) int64 {
+	if n := ptr.Deref(mapping.ThreadsPerCore, 0); n > 0 {
+		return int64(n)
+	}
+	if n := ptr.Deref(wmSpec.ThreadsPerCore, defaultThreadsPerCore); n > 0 {
+		return int64(n)
+	}
+	return int64(defaultThreadsPerCore)
+}
+
+// resolveCPUsPerPod returns max(cpus_per_task * tasksPerNode, GPUs per pod * --cpus-per-gpu)
+// rounded up to whole cores. The Slurm CLI rejects --cpus-per-task together with --cpus-per-gpu,
+// so slurmrestd reports the default cpus_per_task=1 for a --cpus-per-gpu job.
+func resolveCPUsPerPod(job *slurmclienttypes.V0044JobInfo, tasksPerNode int64, gpu *resolvedGRES, threadsPerCore int64) int64 {
+	cpusPerTask := int64(1)
+	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
+		if n := int64(ptr.Deref(job.CpusPerTask.Number, 0)); n > 0 {
+			cpusPerTask = n
+		}
+	}
+	cpu := cpusPerTask * tasksPerNode
+	if gpu != nil {
+		if cpusPerGPU, ok := lookupTres(ptr.Deref(job.CpusPerTres, ""), GRESGPU, gpu.resourceType); ok {
+			cpu = max(cpu, gpu.count*cpusPerGPU)
+		}
+	}
+	return roundUpToWholeCores(cpu, threadsPerCore)
+}
+
+// roundUpToWholeCores rounds cpus up to a multiple of threadsPerCore, because Slurm
+// allocates whole cores by default (CR_Core in slurm.conf(5)).
+func roundUpToWholeCores(cpus, threadsPerCore int64) int64 {
+	if threadsPerCore <= 1 {
+		return cpus
+	}
+	return (cpus + threadsPerCore - 1) / threadsPerCore * threadsPerCore
+}
+
 func parseGRES(tresStr string) ([]gresRequest, error) {
 	var reqs []gresRequest
 	if tresStr == "" {
@@ -839,7 +890,12 @@ func findGRESMapping(resName string, resType string, wmSpec *k8sbridgev1alpha1.W
 	return nil
 }
 
-func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmSpec *k8sbridgev1alpha1.WorkloadMixingSpec) (corev1.ResourceRequirements, *GresResolutionInfo, error) {
+func resolvePodResources(
+	job *slurmclienttypes.V0044JobInfo,
+	replicas int32,
+	partMapping *k8sbridgev1alpha1.PartitionMapping,
+	wmSpec *k8sbridgev1alpha1.WorkloadMixingSpec,
+) (corev1.ResourceRequirements, *GresResolutionInfo, error) {
 	if replicas <= 0 {
 		return corev1.ResourceRequirements{}, nil, fmt.Errorf("invalid replicas count: %d", replicas)
 	}
@@ -857,28 +913,16 @@ func resolvePodResources(job *slurmclienttypes.V0044JobInfo, replicas int32, wmS
 
 	if resolvedGPU != nil {
 		gpuRequest = resolvedGPU.count
-		mapping := findGRESMapping(GRESGPU, resolvedGPU.resourceType, wmSpec)
-		if mapping == nil {
+		gresMapping := findGRESMapping(GRESGPU, resolvedGPU.resourceType, wmSpec)
+		if gresMapping == nil {
 			return corev1.ResourceRequirements{}, nil, fmt.Errorf("missing GRES mapping for gpu:%s", resolvedGPU.resourceType)
 		}
-		k8sGpuResourceName = mapping.K8sResourceName
+		k8sGpuResourceName = gresMapping.K8sResourceName
 		// Copy the map so that the JobSet does not share it with the WorkloadMixing spec.
-		nodeSelectors = maps.Clone(mapping.NodeSelectors)
+		nodeSelectors = maps.Clone(gresMapping.NodeSelectors)
 	}
 
-	// Resolve CPUs per pod
-	var cpu int64
-	if job.CpusPerTask != nil && ptr.Deref(job.CpusPerTask.Set, false) {
-		cpu = int64(ptr.Deref(job.CpusPerTask.Number, 0)) * tasksPerNode
-	} else if resolvedGPU != nil {
-		if gpuCpus, ok := lookupTres(ptr.Deref(job.CpusPerTres, ""), GRESGPU, resolvedGPU.resourceType); ok {
-			cpu = gpuRequest * gpuCpus
-		} else {
-			cpu = 1 * tasksPerNode
-		}
-	} else {
-		cpu = 1 * tasksPerNode
-	}
+	cpu := resolveCPUsPerPod(job, tasksPerNode, resolvedGPU, resolveThreadsPerCore(partMapping, wmSpec))
 
 	// Resolve Memory per pod
 	var memCandidates []int64
@@ -1033,6 +1077,59 @@ var dynamicNodeFeatureRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 const UniqueFeaturePrefix = "k8s-id-"
 
+// slurmdManagedEnvNames are the env vars that appendSlurmdArgs sets on the
+// slurmd container. A pod template value with one of these names is dropped.
+var slurmdManagedEnvNames = map[string]bool{
+	envJobSetName:        true,
+	envReplicatedJobName: true,
+	envJobIndex:          true,
+	envPodIndex:          true,
+	envSlurmNodeName:     true,
+	envPodCPUs:           true,
+	envPodMemory:         true,
+}
+
+// slurmdResourceEnvs returns POD_CPUS and POD_MEMORY for the slurmd container.
+// The Slinky slurmd entrypoint turns them into CoreSpecCount and MemSpecLimit,
+// so slurmctld schedules the container resources and not the host hardware
+// that slurmd detects.
+//
+// Like the Slinky slurm-operator, the values are literal and not rounded to
+// whole cores. The operator reads the container limits. k8s-bridge reads the
+// requests, because it sets no CPU or memory limit. The entrypoint computes
+// CoreSpecCount = hostCores - POD_CPUS/threadsPerCore with integer division.
+// On a node with 2 threads per core an odd request loses 1 CPU, and a request
+// below 2 CPUs reserves only 1 core, because slurmctld resets a CoreSpecCount
+// that covers all cores to 1 (src/common/read_config.c). Memory is exact.
+//
+// References:
+//   - https://github.com/SlinkyProject/containers/blob/accd6cea1501092bf970966591916dc1cb5072c8/schedmd/slurm/26.05/ubuntu24.04/files/usr/local/bin/slurmd-entrypoint.sh
+//   - https://github.com/SlinkyProject/slurm-operator/blob/v1.1.1/internal/builder/workerbuilder/worker_app.go
+func slurmdResourceEnvs(requests corev1.ResourceList) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: envPodCPUs, Value: strconv.FormatInt(containerCPUs(requests), 10)},
+		{Name: envPodMemory, Value: strconv.FormatInt(containerMemoryMiB(requests), 10)},
+	}
+}
+
+// containerCPUs returns the CPU request rounded up to whole CPUs, or 0 without a request.
+func containerCPUs(requests corev1.ResourceList) int64 {
+	qty, ok := requests[corev1.ResourceCPU]
+	if !ok {
+		return 0
+	}
+	return qty.Value()
+}
+
+// containerMemoryMiB returns the memory request rounded down to MiB, or 0 without a request.
+func containerMemoryMiB(requests corev1.ResourceList) int64 {
+	qty, ok := requests[corev1.ResourceMemory]
+	if !ok {
+		return 0
+	}
+	return qty.Value() / (1024 * 1024)
+}
+
 func appendSlurmdArgs(podSpec *corev1.PodSpec, jobIDStr string, confServer string, gresList []resolvedGRES, dynamicNodeFeature string) error {
 	for i := range podSpec.Containers {
 		c := &podSpec.Containers[i]
@@ -1090,20 +1187,14 @@ func appendSlurmdArgs(podSpec *corev1.PodSpec, jobIDStr string, confServer strin
 					Value: fmt.Sprintf("$(%s)-$(%s)-$(%s)-$(%s)", envJobSetName, envReplicatedJobName, envJobIndex, envPodIndex),
 				},
 			}
-			managedEnvNames := map[string]bool{
-				envJobSetName:        true,
-				envReplicatedJobName: true,
-				envJobIndex:          true,
-				envPodIndex:          true,
-				envSlurmNodeName:     true,
-			}
-			filteredEnvs := make([]corev1.EnvVar, 0, len(c.Env)+len(deterministicNodeEnvs))
+			managedEnvs := slices.Concat(deterministicNodeEnvs, slurmdResourceEnvs(c.Resources.Requests))
+			filteredEnvs := make([]corev1.EnvVar, 0, len(c.Env)+len(managedEnvs))
 			for _, env := range c.Env {
-				if !managedEnvNames[env.Name] {
+				if !slurmdManagedEnvNames[env.Name] {
 					filteredEnvs = append(filteredEnvs, env)
 				}
 			}
-			c.Env = append(filteredEnvs, deterministicNodeEnvs...)
+			c.Env = append(filteredEnvs, managedEnvs...)
 
 			var confParts []string
 			var features []string
