@@ -75,7 +75,7 @@ Before mutating any cluster or cloud environment, use read-only commands (`kubec
 
 ## 5. Skill Routing Table
 
-**The 1-Sentence Trigger + Pointer Rule:** When a task matches a trigger below, read the target `SKILL.md` file before taking action. Do not guess procedures from memory.
+**The 1-Sentence Trigger + Pointer Rule:** When a task matches a trigger below, read the target `SKILL.md` file before taking action (all `skills/...`, `hack/...`, and `docs/...` paths and script invocations are relative to and must be run from the repository root containing `Makefile` and `PROJECT`). Do not guess procedures from memory.
 
 **Subagent Delegation Protocol:** Include in every subagent prompt: (1) Target Environment and Kubernetes context/namespace, (2) the `skills/<skill-name>/SKILL.md` path to read first before running commands or editing files, and (3) whether access is read-only or allows state mutation after user confirmation.
 

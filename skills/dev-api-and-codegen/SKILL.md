@@ -32,7 +32,7 @@ Before modifying API schemas, RBAC markers, or chart templates, or running a pre
 ## 3. Step-by-Step Procedure
 
 ### Step 1: Edit `WorkloadMixing` Go Types or Controller `+kubebuilder:rbac` Markers
-1. **CRD Schema & Validation:** Edit struct fields and Kubebuilder markers in `api/v1alpha1/workloadmixing_types.go` (keep runtime `DynamicNodeFeature` validation in `internal/controller/slurmjob/translator.go` in sync).
+1. **CRD Schema & Validation:** Edit struct fields and Kubebuilder markers in `api/v1alpha1/workloadmixing_types.go` (keep paired validation and defaults in `internal/controller/slurmjob/translator.go` in sync; see [references/parity-checklist.md](references/parity-checklist.md)).
 2. **Controller RBAC Permissions:** If controller permissions changed, update the `+kubebuilder:rbac` annotations above `Reconcile` in `internal/controller/*/*_controller.go`.
 
 ### Step 2: Run Code and Manifest Generation

@@ -52,7 +52,7 @@ KIND=./bin/kind KIND_CLUSTER=k8s-bridge-test-e2e go test -tags=e2e ./test/e2e/ -
 3. **Existing cluster execution (skip cluster creation and teardown):** When the GKE GPU cluster is already running in `kubectl config current-context`, run `make run-test-e2e-gpu IMG=$IMG`.
 
 ### Step 4: Write New E2E Test Specs (`test/e2e/`)
-Reuse the E2E job submission (`DefaultSlurmTestUser`), state verification, and cluster reset helpers in `test/utils/slurm.go`, `test/utils/login.go`, and `test/utils/jobset.go`, following the patterns in `test/e2e/e2e_test.go`, `test/e2e/slurm_flag_rejection_test.go`, and `test/e2e/gpu/gpu_test.go`.
+Reuse the E2E job submission (`DefaultSlurmTestUser`), state verification, and cluster reset helpers in `test/utils/slurm.go`, `test/utils/login_node.go`, and `test/utils/jobset.go`, following the patterns in `test/e2e/e2e_test.go`, `test/e2e/slurm_flag_rejection_test.go`, and `test/e2e/gpu/gpu_test.go`.
 
 ---
 

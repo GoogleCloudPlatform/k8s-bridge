@@ -62,7 +62,7 @@ Follow the Slurm installation section in your selected scenario guide from Secti
 
 ### Step 3: Apply the `WorkloadMixing` CR
 Apply the `WorkloadMixing` manifest for your scenario from Section 1 (delete any previous `WorkloadMixing` CR in namespace `slurm` first if switching scenarios on the same cluster).
-- **`podTemplate` merge & mutation rules (`internal/controller/slurmjob/translator.go`):** Only `slurmd` `cpu`/`memory` `requests` (with the `defaultMemoryPerCPUMB` per-CPU floor) and `gpu` `requests`/`limits` are overwritten; static `podTemplate` or `LimitRange` `limits` must cover that floor, and extra/sidecar requests must be in `ClusterQueue` `coveredResources`. Custom `/etc/slurm` `volumeMounts` or `--conf-server` `args` skip automatic secret/controller injection. `WorkloadMixing` edits apply only to new `JobSet`s.
+- **`podTemplate` merge & mutation rules (`internal/controller/slurmjob/translator.go`):** Only `slurmd` `cpu`/`memory` `requests` (CPU rounded up to `threadsPerCore`, default `2`; memory enforcing the `defaultMemoryPerCPUMB` per-CPU floor), `gpu` `requests`/`limits`, and `slurmdManagedEnvNames` env vars are overwritten. Static `podTemplate` or `LimitRange` `limits` must cover those rounded requests, and extra/sidecar requests must be in `ClusterQueue` `coveredResources`. Custom `/etc/slurm` `volumeMounts` or `--conf-server` `args` skip automatic secret/controller injection. `WorkloadMixing` edits apply only to new `JobSet`s.
 
 *(Stop here and proceed to Section 4 Verification when configuring partitions or CRs. Run Step 4 only when asked to remove the CRs and Slurm release.)*
 
