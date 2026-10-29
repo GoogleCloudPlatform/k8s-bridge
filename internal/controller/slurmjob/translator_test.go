@@ -326,7 +326,7 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 
 		// CPUs = GPU_placeholder (1) * CpusPerTres (4) = 4
 		wantCPU := resource.MustParse("4")
-		// Memory = Max(MemoryPerNode (16384MB), fallback (4 * 2048 = 8192MB)) = 16384Mi
+		// Memory = MemoryPerNode (16384MB) = 16384Mi
 		wantMem := resource.MustParse("16384Mi")
 
 		verifyJobSet(t, obj, err, "123", 1,
@@ -428,7 +428,7 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 
 		// CPUs = Fallback (1) * TasksPerNode (ceil(2/2) = 1) = 1, rounded up to 1 whole core = 2
 		wantCPU := resource.MustParse("2")
-		// Memory = Max(MemoryPerCpu (4096MB) * CPUs (2) = 8192MB, fallback (2 * 2048 = 4096MB)) = 8192Mi
+		// Memory = MemoryPerCpu (4096MB) * CPUs (2) = 8192Mi
 		wantMem := resource.MustParse("8192Mi")
 
 		verifyJobSet(t, obj, err, "123", 2,
@@ -449,7 +449,7 @@ func TestTranslateSlurmJobToJobSet_Resources(t *testing.T) {
 
 		// CPUs = Fallback (1) * TasksPerNode (1) = 1, rounded up to 1 whole core = 2
 		wantCPU := resource.MustParse("2")
-		// Memory = Max(MemoryPerTres (8192MB) * GPU_placeholder (1) = 8192MB, fallback (2 * 2048 = 4096MB)) = 8192Mi
+		// Memory = MemoryPerTres (8192MB) * GPU_placeholder (1) = 8192Mi
 		wantMem := resource.MustParse("8192Mi")
 
 		verifyJobSet(t, obj, err, "123", 1,
@@ -2187,8 +2187,8 @@ func TestTranslateSlurmJobToJobSet_JobNameLabel(t *testing.T) {
 // slurmd container needs more CPUs or memory than the slurmd limits in the podTemplate.
 // The translator rounds the CPU need up to whole cores. The test uses the default
 // threadsPerCore of 2, so a job that needs 1 CPU gets 2 CPUs.
-// The memory need follows the current memory rule: the larger of the memory option and
-// 2048 MiB for each CPU.
+// The memory need is the memory option of the job. A job without a memory value above 0
+// needs 2048 MiB for each CPU.
 func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
 	translator := NewJobSetTranslator()
 	controller := getTestController()
@@ -2245,12 +2245,15 @@ func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
 			wantErr:  "job needs 4 CPUs and 8192 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 6144 MiB",
 		},
 		{
-			// The current memory rule takes the larger of --mem and 2048 MiB for each CPU.
-			name:     "Failure - -N1 -n4 --mem=1024 still needs 2048 MiB for each CPU",
-			cpuLimit: "4",
-			memLimit: "6Gi",
-			job:      newTestJob().withTasks(4).withMemoryPerNode(1024).build(),
-			wantErr:  "job needs 4 CPUs and 8192 MiB per node, but the maximum node size of partition high-prio is 4 CPUs and 6144 MiB",
+			// The review example: the default of 2048 MiB for each CPU (8192 MiB) is above
+			// the limit, but --mem=4096 is below it.
+			name:         "Success - -N1 -n4 --mem=4096 fits a 6Gi limit",
+			cpuLimit:     "4",
+			memLimit:     "6Gi",
+			job:          newTestJob().withTasks(4).withMemoryPerNode(4096).build(),
+			wantReplicas: 1,
+			wantRequests: requests("4", "4096Mi"),
+			wantLimits:   limits("4", "6Gi"),
 		},
 		{
 			name:          "Success - -N1 -n48 without podTemplate has no maximum node size",
@@ -2293,7 +2296,7 @@ func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
 			wantErr:  "job needs 4 CPUs and 8192 MiB per node, but the maximum node size of partition high-prio is 3.5 CPUs and 8192 MiB",
 		},
 		{
-			// The current memory rule gives --mem=0 the default of 2048 MiB for each CPU.
+			// --mem=0 gets the default of 2048 MiB for each CPU.
 			// The job needs 1 CPU, which rounds up to 1 whole core (2 CPUs).
 			name:         "Success - --mem=0 gets the default memory and fits",
 			cpuLimit:     "4",
@@ -2419,6 +2422,71 @@ func TestFormatMiB(t *testing.T) {
 			if got := formatMiB(resource.MustParse(tt.quantity)); got != tt.want {
 				t.Errorf("formatMiB(%q) = %q, want %q", tt.quantity, got, tt.want)
 			}
+		})
+	}
+}
+
+// TestTranslateSlurmJobToJobSet_MemoryOption verifies that the memory option of a job sets
+// the memory request of the slurmd container, also when the option is below the default of
+// 2048 MiB for each CPU. The default applies only when the job has no memory value above 0.
+// The test uses the default threadsPerCore of 2.
+func TestTranslateSlurmJobToJobSet_MemoryOption(t *testing.T) {
+	translator := NewJobSetTranslator()
+	controller := getTestController()
+	wmSpec := getTestWMSpec()
+
+	tests := []struct {
+		name       string
+		job        *slurmclienttypes.V0044JobInfo
+		wantCPU    string
+		wantMemMiB string
+	}{
+		{
+			name:       "--mem below the default",
+			job:        newTestJob().withTasks(4).withMemoryPerNode(4096).build(),
+			wantCPU:    "4",
+			wantMemMiB: "4096",
+		},
+		{
+			name:       "--mem-per-cpu below the default",
+			job:        newTestJob().withTasks(4).withMemoryPerCpu(512).build(),
+			wantCPU:    "4",
+			wantMemMiB: "2048",
+		},
+		{
+			name: "--mem-per-gpu below the default",
+			job: newTestJob().
+				withTresPerNode("gres/gpu:l4=1").
+				withCpusPerTres("gres/gpu:l4=4").
+				withMemoryPerTres("gres/gpu:l4=1024").
+				build(),
+			wantCPU:    "4",
+			wantMemMiB: "1024",
+		},
+		{
+			name:       "--mem=0 gets the default",
+			job:        newTestJob().withTasks(4).withMemoryPerNode(0).build(),
+			wantCPU:    "4",
+			wantMemMiB: "8192",
+		},
+		{
+			name:       "No memory option gets the default",
+			job:        newTestJob().withTasks(4).build(),
+			wantCPU:    "4",
+			wantMemMiB: "8192",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj, err := translator.Translate(tt.job, wmSpec, controller)
+			verifyJobSet(t, obj, err, "123", 1,
+				withRequests(corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse(tt.wantCPU),
+					corev1.ResourceMemory: resource.MustParse(tt.wantMemMiB + "Mi"),
+				}),
+				withEnv(map[string]string{envPodCPUs: tt.wantCPU, envPodMemory: tt.wantMemMiB}),
+			)
 		})
 	}
 }

@@ -1013,14 +1013,17 @@ func resolvePodResources(
 			memCandidates = append(memCandidates, gpuMem*gpuRequest)
 		}
 	}
-	// Fallback memory
-	memCandidates = append(memCandidates, defaultMemoryPerCPUMB*cpu)
-
 	var maxMemMB int64
 	for _, mem := range memCandidates {
 		if mem > maxMemMB {
 			maxMemMB = mem
 		}
+	}
+	// Use the default only when the job has no memory value above 0. slurmrestd
+	// reports memory_per_node=0 for --mem=0, and for a job without a memory option
+	// when slurm.conf sets neither DefMemPerCPU nor DefMemPerNode.
+	if maxMemMB == 0 {
+		maxMemMB = defaultMemoryPerCPUMB * cpu
 	}
 
 	cpuQuantity, err := resource.ParseQuantity(strconv.FormatInt(cpu, 10))
