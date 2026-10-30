@@ -2206,6 +2206,34 @@ func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 	}
 }
 
+func TestReconcile_NewJobAboveMaxNodeSize_CancelsJob(t *testing.T) {
+	job := newReconTestJob().
+		withTasks(8).
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		build()
+	podTemplate := &corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{slurmdWithLimits("4", testSlurmdMemoryLimit)}},
+	}
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job), withWMPodTemplate(podTemplate))
+	initTranslationErrors := env.jobsSyncCount(metrics.StatusError, metrics.ReasonTranslationError)
+
+	res, err := env.reconcile(t.Context())
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if res != (ctrl.Result{}) {
+		t.Errorf("Expected empty result, got %v", res)
+	}
+
+	env.verifySlurmCancellation("Translation failed: job needs 8 CPUs and 16384 MiB per node, " +
+		"but the maximum node size of partition " + reconPartitionName + " is 4 CPUs and 8192 MiB")
+	env.verifyJobSetNotFound()
+	if got := env.jobsSyncCount(metrics.StatusError, metrics.ReasonTranslationError); got != initTranslationErrors+1 {
+		t.Errorf("Expected JobsSync(translation_error) delta +1, got %f", got-initTranslationErrors)
+	}
+}
+
 func TestReconcile_NewJob_ExplicitHold_DefersWithoutLoggingOrMetrics(t *testing.T) {
 	tests := []struct {
 		name        string

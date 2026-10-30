@@ -17,11 +17,13 @@ package slurmjob
 import (
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -59,6 +61,7 @@ const (
 	testUserVolumeName      = "user-vol"
 	testHighPrioQueue       = "high-prio-queue"
 	testHighPrioClass       = "high-prio-class"
+	testSlurmdMemoryLimit   = "8Gi"
 
 	wantLabelAppName      = "app.kubernetes.io/name"
 	wantLabelAppComponent = "app.kubernetes.io/component"
@@ -189,6 +192,25 @@ func (b *testWMSpecBuilder) build() *k8sbridgev1alpha1.WorkloadMixingSpec {
 
 func getTestWMSpec() *k8sbridgev1alpha1.WorkloadMixingSpec {
 	return newTestWMSpec().build()
+}
+
+func cpuMemory(cpu, memory string) corev1.ResourceList {
+	list := corev1.ResourceList{}
+	if cpu != "" {
+		list[corev1.ResourceCPU] = resource.MustParse(cpu)
+	}
+	if memory != "" {
+		list[corev1.ResourceMemory] = resource.MustParse(memory)
+	}
+	return list
+}
+
+func slurmdWithLimits(cpu, memory string) corev1.Container {
+	return corev1.Container{
+		Name:      ContainerSlurmd,
+		Image:     testCustomSlurmdImage,
+		Resources: corev1.ResourceRequirements{Limits: cpuMemory(cpu, memory)},
+	}
 }
 
 const (
@@ -617,14 +639,18 @@ func verifyJobSetOptions(t *testing.T, js *jobsetv1alpha2.JobSet, podSpec *corev
 
 func verifyJobSetResources(t *testing.T, slurmd *corev1.Container, v *jobSetVerifier) {
 	t.Helper()
-	if _, wantCPULimit := v.wantLimits[corev1.ResourceCPU]; !wantCPULimit {
-		if _, hasCPULimit := slurmd.Resources.Limits[corev1.ResourceCPU]; hasCPULimit {
-			t.Errorf("Translate() set unexpected CPU limit %v on slurmd container", slurmd.Resources.Limits[corev1.ResourceCPU])
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if diff := cmp.Diff(slurmd.Resources.Requests[name], slurmd.Resources.Limits[name]); diff != "" {
+			t.Errorf("Translate() set a slurmd %s limit that is not equal to the request (-request +limit):\n%s", name, diff)
 		}
 	}
-	if _, wantMemLimit := v.wantLimits[corev1.ResourceMemory]; !wantMemLimit {
-		if _, hasMemLimit := slurmd.Resources.Limits[corev1.ResourceMemory]; hasMemLimit {
-			t.Errorf("Translate() set unexpected memory limit %v on slurmd container", slurmd.Resources.Limits[corev1.ResourceMemory])
+	wantPodEnvs := map[string]string{
+		envPodCPUs:   strconv.FormatInt(containerCPUs(slurmd.Resources.Limits), 10),
+		envPodMemory: strconv.FormatInt(containerMemoryMiB(slurmd.Resources.Limits), 10),
+	}
+	for _, env := range slurmd.Env {
+		if want, ok := wantPodEnvs[env.Name]; ok && env.Value != want {
+			t.Errorf("Translate() set %s=%s, want %s from the slurmd limits", env.Name, env.Value, want)
 		}
 	}
 	if v.wantRequests != nil {
