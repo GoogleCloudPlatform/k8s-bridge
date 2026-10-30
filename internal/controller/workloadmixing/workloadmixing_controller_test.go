@@ -221,14 +221,17 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					createCR(ctx)
 					wm := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, wm)).To(Succeed())
-					wm.Spec.PodTemplate = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
-						Name:  slurmjob.ContainerSlurmd,
-						Image: "slurmd",
-						Resources: corev1.ResourceRequirements{
-							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
-							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+					wm.Spec.PodTemplate = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+						{
+							Name:  slurmjob.ContainerSlurmd,
+							Image: "slurmd",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+								Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+							},
 						},
-					}}}}
+						{Name: "sidecar", Image: "sidecar"},
+					}}}
 					Expect(k8sClient.Update(ctx, wm)).To(Succeed())
 				},
 				teardown:       deleteCR,
@@ -240,6 +243,8 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					Expect(fakeRec.Events).To(Receive(Equal("Warning MaxNodeSizeNotConfigured Maximum node size not configured: " +
 						"the slurmd container in spec.podTemplate has no limit for memory")))
 					Expect(fakeRec.Events).To(Receive(ContainSubstring("SlurmdRequestsIgnored")))
+					Expect(fakeRec.Events).To(Receive(Equal("Warning ContainersWithoutLimits Containers in spec.podTemplate have no cpu or memory limit: " +
+						"sidecar. Without pod-level resources, the pods have no cgroup limit")))
 					Expect(fakeRec.Events).To(Receive(ContainSubstring("WorkloadMixing successfully reconciled")))
 
 					r := &WorkloadMixingReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: rec}

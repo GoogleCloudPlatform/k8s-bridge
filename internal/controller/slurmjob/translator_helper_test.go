@@ -620,6 +620,7 @@ func verifyJobSetOptions(t *testing.T, js *jobsetv1alpha2.JobSet, podSpec *corev
 		}
 	}
 	verifyJobSetResources(t, slurmd, v)
+	verifyPodLevelResources(t, podSpec, slurmd)
 	verifyJobSetLifecycle(t, slurmd, v)
 	for name, wantValue := range v.wantEnv {
 		var gotValues []string
@@ -639,7 +640,7 @@ func verifyJobSetOptions(t *testing.T, js *jobsetv1alpha2.JobSet, podSpec *corev
 
 func verifyJobSetResources(t *testing.T, slurmd *corev1.Container, v *jobSetVerifier) {
 	t.Helper()
-	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+	for _, name := range cpuAndMemory {
 		if diff := cmp.Diff(slurmd.Resources.Requests[name], slurmd.Resources.Limits[name]); diff != "" {
 			t.Errorf("Translate() set a slurmd %s limit that is not equal to the request (-request +limit):\n%s", name, diff)
 		}
@@ -667,6 +668,21 @@ func verifyJobSetResources(t *testing.T, slurmd *corev1.Container, v *jobSetVeri
 			if diff := cmp.Diff(wantQty, gotQty); diff != "" {
 				t.Errorf("Translate() returned unexpected slurmd resource limit for %s (-want +got):\n%s", resName, diff)
 			}
+		}
+	}
+}
+
+func verifyPodLevelResources(t *testing.T, podSpec *corev1.PodSpec, slurmd *corev1.Container) {
+	t.Helper()
+	if podSpec.Resources == nil {
+		t.Errorf("Translate() returned a pod without pod-level resources")
+		return
+	}
+	for _, name := range cpuAndMemory {
+		request, limit, slurmdRequest := podSpec.Resources.Requests[name], podSpec.Resources.Limits[name], slurmd.Resources.Requests[name]
+		if request.Cmp(slurmdRequest) < 0 || limit.Cmp(request) < 0 {
+			t.Errorf("Translate() set pod-level %s request %s and limit %s for slurmd request %s",
+				name, request.String(), limit.String(), slurmdRequest.String())
 		}
 	}
 }
