@@ -85,7 +85,8 @@ type WorkloadMixingSpec struct {
 	// PodTemplate is an optional template for the Pods that will be created.
 	// The CPU and memory limits of the slurmd container are the maximum node size.
 	// k8s-bridge cancels a Slurm job that needs more on one node. For each job, it sets
-	// the slurmd requests and limits.
+	// the slurmd requests and limits and the pod-level resources. Without the
+	// PodLevelResources feature, set CPU and memory limits on all containers.
 	// +optional
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 

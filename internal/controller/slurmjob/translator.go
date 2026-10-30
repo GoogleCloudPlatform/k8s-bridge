@@ -211,6 +211,9 @@ func (t *JobSetTranslator) Translate(
 		podTemplate = buildPodTemplate(jobIDStr, sanitizedJobName, resources, gresInfo.NodeSelectors)
 	}
 
+	// 6. Set pod-level resources
+	setPodLevelResources(&podTemplate.Spec)
+
 	if err := injectSlurmVolumes(&podTemplate.Spec, controller); err != nil {
 		return nil, fmt.Errorf("failed to inject slurm volumes: %w", err)
 	}
@@ -358,6 +361,97 @@ func slurmdTemplateLimits(template *corev1.PodTemplateSpec) corev1.ResourceList 
 		return slurmd.Resources.Limits
 	}
 	return nil
+}
+
+var cpuAndMemory = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
+
+// setPodLevelResources limits the whole pod to its requests. The slurmd container is
+// privileged, so Slurm (cgroup/v2) creates the job cgroups under the pod cgroup and not
+// under the slurmd container cgroup.
+func setPodLevelResources(spec *corev1.PodSpec) {
+	requests := aggregateContainerRequests(spec)
+	if len(requests) == 0 {
+		return
+	}
+	if spec.Resources == nil {
+		spec.Resources = &corev1.ResourceRequirements{}
+	}
+	if spec.Resources.Requests == nil {
+		spec.Resources.Requests = corev1.ResourceList{}
+	}
+	if spec.Resources.Limits == nil {
+		spec.Resources.Limits = corev1.ResourceList{}
+	}
+	for name, request := range requests {
+		// The API server rejects a container limit above the pod-level limit.
+		limit := request.DeepCopy()
+		for i := range spec.Containers {
+			if containerLimit, ok := spec.Containers[i].Resources.Limits[name]; ok && containerLimit.Cmp(limit) > 0 {
+				limit = containerLimit.DeepCopy()
+			}
+		}
+		spec.Resources.Requests[name] = request
+		spec.Resources.Limits[name] = limit
+	}
+}
+
+// aggregateContainerRequests returns the CPU and memory requests of the pod in the same
+// way as the Kubernetes resource helpers, with init containers and sidecars.
+func aggregateContainerRequests(spec *corev1.PodSpec) corev1.ResourceList {
+	total := corev1.ResourceList{}
+	for i := range spec.Containers {
+		addCPUAndMemory(total, effectiveRequests(&spec.Containers[i]))
+	}
+	sidecars := corev1.ResourceList{}
+	initPeak := corev1.ResourceList{}
+	for i := range spec.InitContainers {
+		container := &spec.InitContainers[i]
+		requests := effectiveRequests(container)
+		running := corev1.ResourceList{}
+		addCPUAndMemory(running, sidecars)
+		addCPUAndMemory(running, requests)
+		if ptr.Deref(container.RestartPolicy, "") == corev1.ContainerRestartPolicyAlways {
+			addCPUAndMemory(total, requests)
+			addCPUAndMemory(sidecars, requests)
+		}
+		maxCPUAndMemory(initPeak, running)
+	}
+	maxCPUAndMemory(total, initPeak)
+	return total
+}
+
+// effectiveRequests uses the limit as the request when a container sets no request,
+// as the API server does for pods.
+func effectiveRequests(container *corev1.Container) corev1.ResourceList {
+	requests := corev1.ResourceList{}
+	for _, name := range cpuAndMemory {
+		if quantity, ok := container.Resources.Requests[name]; ok {
+			requests[name] = quantity
+		} else if quantity, ok := container.Resources.Limits[name]; ok {
+			requests[name] = quantity
+		}
+	}
+	return requests
+}
+
+func addCPUAndMemory(dst, src corev1.ResourceList) {
+	for _, name := range cpuAndMemory {
+		if quantity, ok := src[name]; ok {
+			sum := dst[name]
+			sum.Add(quantity)
+			dst[name] = sum
+		}
+	}
+}
+
+func maxCPUAndMemory(dst, src corev1.ResourceList) {
+	for _, name := range cpuAndMemory {
+		if quantity, ok := src[name]; ok {
+			if current, ok := dst[name]; !ok || quantity.Cmp(current) > 0 {
+				dst[name] = quantity.DeepCopy()
+			}
+		}
+	}
 }
 
 // formatCPUs formats a CPU quantity, for example "1 CPU", "4 CPUs", or "3.5 CPUs".

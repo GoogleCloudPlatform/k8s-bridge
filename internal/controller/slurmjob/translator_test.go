@@ -2267,6 +2267,94 @@ func TestTranslateSlurmJobToJobSet_MaxNodeSize(t *testing.T) {
 	}
 }
 
+func TestSetPodLevelResources(t *testing.T) {
+	container := func(name string, requests, limits corev1.ResourceList) corev1.Container {
+		return corev1.Container{Name: name, Resources: corev1.ResourceRequirements{Requests: requests, Limits: limits}}
+	}
+	always := corev1.ContainerRestartPolicyAlways
+	slurmd := container(ContainerSlurmd, cpuMemory("4", "8Gi"), cpuMemory("4", "8Gi"))
+	withHugePages := func(list corev1.ResourceList) corev1.ResourceList {
+		list["hugepages-2Mi"] = resource.MustParse("2Mi")
+		return list
+	}
+
+	tests := []struct {
+		name         string
+		spec         corev1.PodSpec
+		wantRequests corev1.ResourceList
+		wantLimits   corev1.ResourceList
+	}{
+		{
+			name:         "Only slurmd",
+			spec:         corev1.PodSpec{Containers: []corev1.Container{slurmd}},
+			wantRequests: cpuMemory("4", "8Gi"),
+			wantLimits:   cpuMemory("4", "8Gi"),
+		},
+		{
+			name: "A container limit above the requests raises the pod-level limit",
+			spec: corev1.PodSpec{Containers: []corev1.Container{
+				container(ContainerSlurmd, cpuMemory("1", "1Gi"), cpuMemory("1", "1Gi")),
+				container(testSidecarName, cpuMemory("100m", "64Mi"), cpuMemory("2", "4Gi")),
+			}},
+			wantRequests: cpuMemory("1100m", "1088Mi"),
+			wantLimits:   cpuMemory("2", "4Gi"),
+		},
+		{
+			name: "A container limit without a request counts as the request",
+			spec: corev1.PodSpec{Containers: []corev1.Container{
+				slurmd,
+				container(testSidecarName, nil, cpuMemory("500m", "1Gi")),
+			}},
+			wantRequests: cpuMemory("4500m", "9Gi"),
+			wantLimits:   cpuMemory("4500m", "9Gi"),
+		},
+		{
+			name: "An init container runs next to the sidecars that start before it",
+			spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{
+					{
+						Name:          "native-sidecar",
+						RestartPolicy: &always,
+						Resources:     corev1.ResourceRequirements{Limits: cpuMemory("500m", "512Mi")},
+					},
+					container("init", nil, cpuMemory("6", "1Gi")),
+				},
+				Containers: []corev1.Container{slurmd},
+			},
+			wantRequests: cpuMemory("6500m", "8704Mi"),
+			wantLimits:   cpuMemory("6500m", "8704Mi"),
+		},
+		{
+			name: "Template pod-level CPU and memory are replaced, other resources stay",
+			spec: corev1.PodSpec{
+				Resources: &corev1.ResourceRequirements{
+					Requests: withHugePages(cpuMemory("1", "")),
+					Limits:   withHugePages(cpuMemory("1", "")),
+				},
+				Containers: []corev1.Container{slurmd},
+			},
+			wantRequests: withHugePages(cpuMemory("4", "8Gi")),
+			wantLimits:   withHugePages(cpuMemory("4", "8Gi")),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := tt.spec.DeepCopy()
+			setPodLevelResources(spec)
+			if spec.Resources == nil {
+				t.Fatal("setPodLevelResources() did not set spec.resources")
+			}
+			if diff := cmp.Diff(tt.wantRequests, spec.Resources.Requests); diff != "" {
+				t.Errorf("Pod-level requests mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.wantLimits, spec.Resources.Limits); diff != "" {
+				t.Errorf("Pod-level limits mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestFormatCPUs(t *testing.T) {
 	for quantity, want := range map[string]string{"1": "1 CPU", "4": "4 CPUs", "3500m": "3.5 CPUs"} {
 		if got := formatCPUs(resource.MustParse(quantity)); got != want {

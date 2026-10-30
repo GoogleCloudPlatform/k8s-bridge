@@ -19,6 +19,7 @@ package workloadmixing
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -107,10 +108,19 @@ func (r *WorkloadMixingReconciler) warnAboutPodTemplate(wm *k8sbridgev1alpha1.Wo
 		return
 	}
 	var slurmd corev1.ResourceRequirements
+	var containersWithoutLimits []string
 	if wm.Spec.PodTemplate != nil {
-		for _, c := range wm.Spec.PodTemplate.Spec.Containers {
+		spec := wm.Spec.PodTemplate.Spec
+		for _, c := range spec.Containers {
 			if c.Name == slurmjob.ContainerSlurmd {
 				slurmd = c.Resources
+			}
+		}
+		for _, c := range slices.Concat(spec.InitContainers, spec.Containers) {
+			_, hasCPULimit := c.Resources.Limits[corev1.ResourceCPU]
+			_, hasMemLimit := c.Resources.Limits[corev1.ResourceMemory]
+			if c.Name != slurmjob.ContainerSlurmd && (!hasCPULimit || !hasMemLimit) {
+				containersWithoutLimits = append(containersWithoutLimits, c.Name)
 			}
 		}
 	}
@@ -129,6 +139,11 @@ func (r *WorkloadMixingReconciler) warnAboutPodTemplate(wm *k8sbridgev1alpha1.Wo
 	if hasCPURequest || hasMemRequest {
 		r.Recorder.Event(wm, corev1.EventTypeWarning, "SlurmdRequestsIgnored",
 			"Ignored requests in spec.podTemplate: k8s-bridge sets the cpu and memory requests of the slurmd container for each Slurm job")
+	}
+	if len(containersWithoutLimits) > 0 {
+		r.Recorder.Eventf(wm, corev1.EventTypeWarning, "ContainersWithoutLimits",
+			"Containers in spec.podTemplate have no cpu or memory limit: %s. Without pod-level resources, the pods have no cgroup limit",
+			strings.Join(containersWithoutLimits, ", "))
 	}
 }
 
