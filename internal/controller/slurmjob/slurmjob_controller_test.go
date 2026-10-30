@@ -2206,8 +2206,10 @@ func TestReconcile_NewJobLogOnlyOnInitialAdmission(t *testing.T) {
 	}
 }
 
-// maxNodeSizeWarning is the log message for a WorkloadMixing whose slurmd container has no CPU or memory limit.
-const maxNodeSizeWarning = "Maximum node size not configured: the slurmd container in spec.podTemplate has no cpu or memory limit"
+const (
+	maxNodeSizeWarning    = "Maximum node size not configured: the slurmd container in spec.podTemplate has no cpu or memory limit"
+	slurmdRequestsWarning = "Ignored requests in spec.podTemplate: k8s-bridge sets the cpu and memory requests of the slurmd container for each Slurm job"
+)
 
 func TestReconcile_NewJobAboveMaxNodeSize_CancelsJob(t *testing.T) {
 	job := newReconTestJob().
@@ -2241,85 +2243,89 @@ func TestReconcile_NewJobAboveMaxNodeSize_CancelsJob(t *testing.T) {
 	}
 }
 
-func TestReconcile_MaxNodeSizeUnset_WarnsOncePerWorkloadMixing(t *testing.T) {
-	const secondJobID = reconJobID + 1
-	newPendingJob := func(jobID int32) *slurmclienttypes.V0044JobInfo {
-		return newReconTestJob().
-			withJobID(jobID).
-			withTasks(48).
-			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-			withHold(true).
-			build()
-	}
-	env := newReconcileTestEnv(t, withPendingSlurmJobs(newPendingJob(reconJobID), newPendingJob(secondJobID)))
+func TestReconcile_MaxNodeSizeUnset_Warns(t *testing.T) {
+	job := newReconTestJob().
+		withTasks(48).
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
 	ctx, recorded := newObservedLoggerContext(t.Context())
 
-	for _, jobID := range []int32{reconJobID, secondJobID} {
-		req := ctrl.Request{NamespacedName: types.NamespacedName{
-			Namespace: reconNamespace,
-			Name:      fmt.Sprintf("slurm-job-%s-%d", reconWmName, jobID),
-		}}
-		if _, err := env.reconciler.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile of job %d failed: %v", jobID, err)
-		}
-		var js jobsetv1alpha2.JobSet
-		key := types.NamespacedName{Namespace: reconNamespace, Name: fmt.Sprintf("slurm-job-%d", jobID)}
-		if err := env.baseClient.Get(ctx, key, &js); err != nil {
-			t.Errorf("Expected JobSet %s for job %d, got error: %v", key.Name, jobID, err)
-		}
+	if _, err := env.reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
 	}
-
 	warnings := recorded.FilterMessage(maxNodeSizeWarning).All()
 	if len(warnings) != 1 {
-		t.Fatalf("Expected 1 missing-limit warning for two jobs, got %d", len(warnings))
+		t.Fatalf("Expected 1 missing-limit warning, got %d", len(warnings))
 	}
-	fields := warnings[0].ContextMap()
-	if got := fmt.Sprint(fields["workloadMixing"]); !strings.Contains(got, reconWmName) {
-		t.Errorf("Expected workloadMixing field to name %q, got %q", reconWmName, got)
-	}
-	if got := fmt.Sprint(fields["missingLimits"]); got != "[cpu memory]" {
+	if got := fmt.Sprint(warnings[0].ContextMap()["missingLimits"]); got != "[cpu memory]" {
 		t.Errorf("Expected missingLimits field [cpu memory], got %q", got)
 	}
 }
 
-func TestWarnIfMaxNodeSizeUnset(t *testing.T) {
+func TestWarnAboutPodTemplate(t *testing.T) {
+	slurmdWithRequests := slurmdWithLimits("4", testSlurmdMemoryLimit)
+	slurmdWithRequests.Resources.Requests = cpuMemory("2", "")
+
+	tests := []struct {
+		name       string
+		containers []corev1.Container
+		wantMsg    string
+		wantKey    string
+		wantValue  string
+	}{
+		{
+			name:       "slurmd without a memory limit",
+			containers: []corev1.Container{slurmdWithLimits("4", "")},
+			wantMsg:    maxNodeSizeWarning,
+			wantKey:    "missingLimits",
+			wantValue:  "[memory]",
+		},
+		{
+			name:       "slurmd with requests",
+			containers: []corev1.Container{slurmdWithRequests},
+			wantMsg:    slurmdRequestsWarning,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, recorded := newObservedLoggerContext(t.Context())
+			wm := &k8sbridgev1alpha1.WorkloadMixing{
+				ObjectMeta: metav1.ObjectMeta{Name: reconWmName, Namespace: reconNamespace},
+				Spec: k8sbridgev1alpha1.WorkloadMixingSpec{PodTemplate: &corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: tt.containers},
+				}},
+			}
+			(&SlurmJobReconciler{}).warnAboutPodTemplate(ctx, wm)
+			if recorded.Len() != 1 || recorded.FilterMessage(tt.wantMsg).Len() != 1 {
+				t.Fatalf("Expected only the warning %q, got %v", tt.wantMsg, recorded.All())
+			}
+			if tt.wantKey == "" {
+				return
+			}
+			if got := fmt.Sprint(recorded.All()[0].ContextMap()[tt.wantKey]); got != tt.wantValue {
+				t.Errorf("Expected %s field %s, got %s", tt.wantKey, tt.wantValue, got)
+			}
+		})
+	}
+}
+
+func TestWarnOnce(t *testing.T) {
+	const msg = "Test warning"
 	r := &SlurmJobReconciler{}
 	ctx, recorded := newObservedLoggerContext(t.Context())
-	warningCount := func() int { return recorded.FilterMessage(maxNodeSizeWarning).Len() }
-	wm := &k8sbridgev1alpha1.WorkloadMixing{
-		ObjectMeta: metav1.ObjectMeta{Name: reconWmName, Namespace: reconNamespace},
-	}
+	wm := types.NamespacedName{Namespace: reconNamespace, Name: reconWmName}
+	other := types.NamespacedName{Namespace: reconNamespace, Name: "other-wm"}
 
-	r.warnIfMaxNodeSizeUnset(ctx, wm)
-	r.warnIfMaxNodeSizeUnset(ctx, wm)
-	if got := warningCount(); got != 1 {
-		t.Fatalf("Expected 1 warning for a WorkloadMixing without podTemplate, got %d", got)
-	}
-
-	wm.Spec.PodTemplate = &corev1.PodTemplateSpec{
-		Spec: corev1.PodSpec{Containers: []corev1.Container{slurmdWithLimits("4", testSlurmdMemoryLimit)}},
-	}
-	r.warnIfMaxNodeSizeUnset(ctx, wm)
-	if got := warningCount(); got != 1 {
-		t.Fatalf("Expected no new warning after the slurmd limits were added, got %d warnings", got)
-	}
-
-	wm.Spec.PodTemplate.Spec.Containers[0] = slurmdWithLimits("4", "")
-	r.warnIfMaxNodeSizeUnset(ctx, wm)
-	warnings := recorded.FilterMessage(maxNodeSizeWarning).All()
-	if len(warnings) != 2 {
-		t.Fatalf("Expected a new warning after the memory limit was removed, got %d warnings", len(warnings))
-	}
-	if got := fmt.Sprint(warnings[1].ContextMap()["missingLimits"]); got != "[memory]" {
-		t.Errorf("Expected missingLimits field [memory], got %q", got)
-	}
-
-	other := &k8sbridgev1alpha1.WorkloadMixing{
-		ObjectMeta: metav1.ObjectMeta{Name: "other-wm", Namespace: reconNamespace},
-	}
-	r.warnIfMaxNodeSizeUnset(ctx, other)
-	if got := warningCount(); got != 3 {
-		t.Errorf("Expected a separate warning for another WorkloadMixing, got %d warnings", got)
+	r.warnOnce(ctx, wm, true, msg)
+	r.warnOnce(ctx, wm, true, msg)
+	r.warnOnce(ctx, wm, false, msg)
+	r.warnOnce(ctx, wm, true, msg)
+	r.warnOnce(ctx, other, true, msg)
+	if got := recorded.FilterMessage(msg).Len(); got != 3 {
+		t.Errorf("Expected 3 warnings: the first one, one after the condition cleared, and one for another WorkloadMixing, got %d", got)
 	}
 }
 

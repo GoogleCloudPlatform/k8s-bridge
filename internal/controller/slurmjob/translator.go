@@ -188,6 +188,9 @@ func (t *JobSetTranslator) Translate(
 	if err != nil {
 		return nil, err
 	}
+	if err := enforceMaxNodeSize(resources.Requests, slurmdTemplateLimits(wmSpec.PodTemplate), mapping.Partition); err != nil {
+		return nil, err
+	}
 
 	// 4. Resolve ConfServer
 	confServer, err := resolveConfServer(controller)
@@ -206,11 +209,6 @@ func (t *JobSetTranslator) Translate(
 		applyPodTemplateOverrides(&podTemplate, jobIDStr, sanitizedJobName, resources, gresInfo.NodeSelectors)
 	} else {
 		podTemplate = buildPodTemplate(jobIDStr, sanitizedJobName, resources, gresInfo.NodeSelectors)
-	}
-
-	// 6. Reject a job that needs more than the maximum node size of the partition
-	if err := enforcePodLimitsForPartition(&podTemplate.Spec, mapping.Partition); err != nil {
-		return nil, err
 	}
 
 	if err := injectSlurmVolumes(&podTemplate.Spec, controller); err != nil {
@@ -301,8 +299,7 @@ func applyPodTemplateOverrides(
 }
 
 // mergeContainerResources applies Slurm-calculated resources onto the slurmd container
-// from podTemplate while preserving unrelated custom resources (e.g. ephemeral-storage)
-// and any limits explicitly configured in podTemplate.
+// from podTemplate while preserving unrelated custom resources (e.g. ephemeral-storage).
 func mergeContainerResources(container *corev1.Container, calculated corev1.ResourceRequirements, jobIDStr string) {
 	logger := log.Log.WithName("translator")
 
@@ -329,20 +326,12 @@ func mergeContainerResources(container *corev1.Container, calculated corev1.Reso
 	}
 }
 
-// enforcePodLimitsForPartition returns an error when the CPU or memory request of
-// the slurmd container is above its limit. The limits come from the slurmd container
-// in the WorkloadMixing podTemplate, and they are the maximum node size of the
-// partition. The check skips a resource that has no limit. It does not check GPUs,
-// because the translator sets the GPU limit equal to the GPU request.
-func enforcePodLimitsForPartition(podSpec *corev1.PodSpec, partition string) error {
-	slurmd := findContainer(podSpec, ContainerSlurmd)
-	if slurmd == nil {
-		return nil
-	}
-	cpuNeed := slurmd.Resources.Requests[corev1.ResourceCPU]
-	memNeed := slurmd.Resources.Requests[corev1.ResourceMemory]
-	cpuLimit, hasCPULimit := slurmd.Resources.Limits[corev1.ResourceCPU]
-	memLimit, hasMemLimit := slurmd.Resources.Limits[corev1.ResourceMemory]
+// enforceMaxNodeSize returns an error when the CPU or memory requests are above maxNodeSize.
+func enforceMaxNodeSize(requests, maxNodeSize corev1.ResourceList, partition string) error {
+	cpuNeed := requests[corev1.ResourceCPU]
+	memNeed := requests[corev1.ResourceMemory]
+	cpuLimit, hasCPULimit := maxNodeSize[corev1.ResourceCPU]
+	memLimit, hasMemLimit := maxNodeSize[corev1.ResourceMemory]
 
 	cpuFits := !hasCPULimit || cpuNeed.Cmp(cpuLimit) <= 0
 	memFits := !hasMemLimit || memNeed.Cmp(memLimit) <= 0
@@ -350,37 +339,30 @@ func enforcePodLimitsForPartition(podSpec *corev1.PodSpec, partition string) err
 		return nil
 	}
 
-	var maxNodeSize []string
+	var limits []string
 	if hasCPULimit {
-		maxNodeSize = append(maxNodeSize, formatCPUs(cpuLimit))
+		limits = append(limits, formatCPUs(cpuLimit))
 	}
 	if hasMemLimit {
-		maxNodeSize = append(maxNodeSize, formatMiB(memLimit))
+		limits = append(limits, formatMiB(memLimit))
 	}
 	return fmt.Errorf("job needs %s and %s per node, but the maximum node size of partition %s is %s",
-		formatCPUs(cpuNeed), formatMiB(memNeed), partition, strings.Join(maxNodeSize, " and "))
+		formatCPUs(cpuNeed), formatMiB(memNeed), partition, strings.Join(limits, " and "))
 }
 
-// missingSlurmdLimits returns the CPU and memory limits that the slurmd container in
-// the pod template does not set. enforcePodLimitsForPartition does not check these
-// resources.
-func missingSlurmdLimits(template *corev1.PodTemplateSpec) []corev1.ResourceName {
-	var limits corev1.ResourceList
-	if template != nil {
-		if slurmd := findContainer(&template.Spec, ContainerSlurmd); slurmd != nil {
-			limits = slurmd.Resources.Limits
-		}
+func slurmdTemplateLimits(template *corev1.PodTemplateSpec) corev1.ResourceList {
+	if template == nil {
+		return nil
 	}
-	var missing []corev1.ResourceName
-	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
-		if _, ok := limits[name]; !ok {
-			missing = append(missing, name)
-		}
+	if slurmd := findContainer(&template.Spec, ContainerSlurmd); slurmd != nil {
+		return slurmd.Resources.Limits
 	}
-	return missing
+	return nil
 }
 
-// formatCPUs formats a CPU quantity for a message, for example "1 CPU", "4 CPUs", or "3.5 CPUs".
+var cpuAndMemory = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
+
+// formatCPUs formats a CPU quantity, for example "1 CPU", "4 CPUs", or "3.5 CPUs".
 func formatCPUs(q resource.Quantity) string {
 	milliCPUs := q.MilliValue()
 	unit := "CPUs"
@@ -390,8 +372,8 @@ func formatCPUs(q resource.Quantity) string {
 	return strconv.FormatFloat(float64(milliCPUs)/1000, 'f', -1, 64) + " " + unit
 }
 
-// formatMiB formats a memory quantity in MiB for a message, for example "8192 MiB".
-// A quantity that is not a whole number of MiB keeps its own notation, for example "1G".
+// formatMiB formats a memory quantity as "8192 MiB". A quantity that is not a whole
+// number of MiB keeps its own notation, for example "1G".
 func formatMiB(q resource.Quantity) string {
 	const bytesPerMiB = 1 << 20
 	if bytes := q.Value(); bytes%bytesPerMiB == 0 {
@@ -1019,9 +1001,8 @@ func resolvePodResources(
 			maxMemMB = mem
 		}
 	}
-	// Use the default only when the job has no memory value above 0. slurmrestd
-	// reports memory_per_node=0 for --mem=0, and for a job without a memory option
-	// when slurm.conf sets neither DefMemPerCPU nor DefMemPerNode.
+	// slurmrestd reports 0 for --mem=0, and for a job without a memory option when
+	// slurm.conf sets no DefMemPerCPU or DefMemPerNode.
 	if maxMemMB == 0 {
 		maxMemMB = defaultMemoryPerCPUMB * cpu
 	}
@@ -1039,7 +1020,10 @@ func resolvePodResources(
 		corev1.ResourceCPU:    cpuQuantity,
 		corev1.ResourceMemory: memQuantity,
 	}
-	var limits corev1.ResourceList
+	limits := corev1.ResourceList{
+		corev1.ResourceCPU:    cpuQuantity.DeepCopy(),
+		corev1.ResourceMemory: memQuantity.DeepCopy(),
+	}
 
 	if gpuRequest > 0 {
 		gpuQuantity, err := resource.ParseQuantity(strconv.FormatInt(gpuRequest, 10))
@@ -1047,9 +1031,7 @@ func resolvePodResources(
 			return corev1.ResourceRequirements{}, nil, fmt.Errorf("failed to parse GPU quantity: %w", err)
 		}
 		reqs[corev1.ResourceName(k8sGpuResourceName)] = gpuQuantity
-		limits = corev1.ResourceList{
-			corev1.ResourceName(k8sGpuResourceName): gpuQuantity,
-		}
+		limits[corev1.ResourceName(k8sGpuResourceName)] = gpuQuantity.DeepCopy()
 	}
 
 	var gresList []resolvedGRES
@@ -1175,7 +1157,7 @@ var slurmdManagedEnvNames = map[string]bool{
 //
 // Like the Slinky slurm-operator, the values are literal and not rounded to
 // whole cores. The operator reads the container limits. k8s-bridge reads the
-// requests, because it sets no CPU or memory limit. The entrypoint computes
+// requests, which are equal to the limits. The entrypoint computes
 // CoreSpecCount = hostCores - POD_CPUS/threadsPerCore with integer division.
 // On a node with 2 threads per core an odd request loses 1 CPU, and a request
 // below 2 CPUs reserves only 1 core, because slurmctld resets a CoreSpecCount

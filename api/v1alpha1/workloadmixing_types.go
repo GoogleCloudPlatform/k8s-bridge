@@ -83,10 +83,9 @@ type WorkloadMixingSpec struct {
 	MappedResources []GenericResourceMapping `json:"mappedResources,omitempty"`
 
 	// PodTemplate is an optional template for the Pods that will be created.
-	// k8s-bridge calculates the CPU and memory requests of the slurmd container for
-	// each Slurm job, so the slurmd container must not set them. The CPU and memory
-	// limits of the slurmd container are the maximum node size: k8s-bridge cancels a
-	// Slurm job that needs more CPUs or memory on one node.
+	// The CPU and memory limits of the slurmd container are the maximum node size.
+	// k8s-bridge cancels a Slurm job that needs more on one node. For each job, it sets
+	// the slurmd requests and limits.
 	// +optional
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 

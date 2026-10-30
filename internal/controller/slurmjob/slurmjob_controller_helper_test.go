@@ -262,7 +262,6 @@ func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
 	}
 }
 
-// withWMPodTemplate sets the podTemplate of the WorkloadMixing in the test environment.
 func withWMPodTemplate(podTemplate *corev1.PodTemplateSpec) reconcileEnvOpt {
 	return func(c *reconcileEnvConfig) {
 		c.podTemplate = podTemplate

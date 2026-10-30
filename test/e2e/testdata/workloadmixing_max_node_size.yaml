@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The CPU and memory limits of the slurmd container are the maximum node size
-# of workloadmixing-partition. k8s-bridge cancels a job that needs more CPUs or
-# memory per node. The shared template in workloadmixing_template.yaml keeps no
-# limits, so the other tests are not affected.
 apiVersion: k8s-bridge.x-k8s.io/v1alpha1
 kind: WorkloadMixing
 metadata:
