@@ -954,10 +954,7 @@ func TestSlurmJobReconciler_Start(t *testing.T) {
 	t.Run("Event is forwarded to genericEvents channel", func(t *testing.T) {
 		var buf bytes.Buffer
 		testLogger := zap.New(zap.WriteTo(&buf), zap.UseDevMode(true))
-		logf.SetLogger(testLogger)
-		ctx := t.Context()
-
-		ctx = logf.IntoContext(ctx, testLogger)
+		ctx, cancel := context.WithCancel(logf.IntoContext(t.Context(), testLogger))
 
 		cfg := &rest.Config{Host: "http://localhost:0"}
 		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
@@ -983,11 +980,18 @@ func TestSlurmJobReconciler_Start(t *testing.T) {
 			t.Fatalf("SetupWithManager failed: %v", err)
 		}
 
+		done := make(chan struct{})
 		go func() {
+			defer close(done)
 			if err := reconciler.Start(ctx); err != nil {
-				logf.Log.Error(err, "Reconciler failed to start")
+				t.Errorf("Start() returned error: %v", err)
 			}
 		}()
+		// Stop the forwarding loop and wait for it, so it does not write logs after the test ends.
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
 
 		ev := slurmtypes.SlurmJobAdmissionEvent{
 			JobID: "54321",

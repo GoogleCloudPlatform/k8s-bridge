@@ -162,6 +162,15 @@ func (b *testWMSpecBuilder) withPodTemplateLabels(labels map[string]string) *tes
 	return b
 }
 
+func (b *testWMSpecBuilder) withPodTemplateAnnotations(annotations map[string]string) *testWMSpecBuilder {
+	b.ensurePodTemplate()
+	if b.spec.PodTemplate.Annotations == nil {
+		b.spec.PodTemplate.Annotations = make(map[string]string)
+	}
+	maps.Copy(b.spec.PodTemplate.Annotations, annotations)
+	return b
+}
+
 func (b *testWMSpecBuilder) withThreadsPerCore(threads int32) *testWMSpecBuilder {
 	b.spec.ThreadsPerCore = ptr.To(threads)
 	return b
@@ -367,6 +376,11 @@ func (b *testJobBuilder) withComment(comment string) *testJobBuilder {
 
 func (b *testJobBuilder) withFeatures(features string) *testJobBuilder {
 	b.job.Features = ptr.To(features)
+	return b
+}
+
+func (b *testJobBuilder) withExtra(extra string) *testJobBuilder {
+	b.job.Extra = ptr.To(extra)
 	return b
 }
 
