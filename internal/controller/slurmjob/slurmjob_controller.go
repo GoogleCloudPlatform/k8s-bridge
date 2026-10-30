@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -65,6 +66,14 @@ const (
 	ReasonJobSetMissing   = "JobSet missing"
 
 	UnheldCommentPrefix = "Unheld by k8s-bridge:"
+
+	admissionRejectedCommentPrefix = "JobSet admission rejected: "
+	admissionWebhookMarker         = "admission webhook"
+	admissionDeniedMarker          = "denied the request"
+	// maxSlurmCommentLength is the longest job comment, in bytes, that slurmctld accepts on job
+	// submission and update.
+	maxSlurmCommentLength  = 1024
+	truncatedCommentSuffix = "..."
 )
 
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
@@ -752,6 +761,9 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 
 	created, err := r.createK8sResource(ctx, obj)
 	if err != nil {
+		if isPermanentAdmissionRejection(err) {
+			return ctrl.Result{}, r.handleJobSetAdmissionRejection(ctx, wm, slurmClient, jobInfo, jobID, partition, err)
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -876,6 +888,72 @@ func (r *SlurmJobReconciler) createK8sResource(ctx context.Context, obj client.O
 	return true, nil
 }
 
+// isPermanentAdmissionRejection reports whether a JobSet Create error is a permanent rejection
+// that retrying cannot fix: a 422 Invalid error, or a 403 returned by a validating admission
+// webhook (for example Kueue's JobSet webhook rejecting invalid TAS annotations). Other 403
+// errors, such as RBAC denials or terminating namespaces, and server errors stay retriable.
+func isPermanentAdmissionRejection(err error) bool {
+	if apierrors.IsInvalid(err) {
+		return true
+	}
+	if apierrors.IsForbidden(err) {
+		msg := admissionRejectionMessage(err)
+		return strings.Contains(msg, admissionWebhookMarker) && strings.Contains(msg, admissionDeniedMarker)
+	}
+	return false
+}
+
+// admissionRejectionMessage returns the API status message of err, falling back to err.Error().
+func admissionRejectionMessage(err error) string {
+	var status apierrors.APIStatus
+	if errors.As(err, &status) {
+		if msg := status.Status().Message; msg != "" {
+			return msg
+		}
+	}
+	return err.Error()
+}
+
+// handleJobSetAdmissionRejection cancels a held Slurm job whose JobSet was permanently rejected
+// at creation, recording the rejection reason in the Slurm job comment.
+func (r *SlurmJobReconciler) handleJobSetAdmissionRejection(
+	ctx context.Context,
+	wm *k8sbridgev1alpha1.WorkloadMixing,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	jobID string,
+	partition string,
+	createErr error,
+) error {
+	logger := log.FromContext(ctx)
+	msg := admissionRejectionMessage(createErr)
+
+	metrics.RecordJobSync(metrics.StatusError, metrics.ReasonJobSetAdmissionRejected, wm.Name, partition)
+	logger.Error(createErr, "JobSet creation was rejected, cancelling Slurm job", "partition", partition)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(wm, corev1.EventTypeWarning, "JobSetAdmissionRejected", "JobSet for Slurm job %s was rejected: %s", jobID, msg)
+	}
+
+	comment := admissionRejectedCommentPrefix + msg
+	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, comment); err != nil {
+		return fmt.Errorf("failed to cancel job after JobSet admission rejection: %w (rejection: %v)", err, createErr)
+	}
+	return nil
+}
+
+// truncateComment shortens a Slurm job comment to maxSlurmCommentLength bytes without splitting
+// a UTF-8 character.
+func truncateComment(comment string) string {
+	if len(comment) <= maxSlurmCommentLength {
+		return comment
+	}
+	cut := maxSlurmCommentLength - len(truncatedCommentSuffix)
+	for cut > 0 && !utf8.RuneStart(comment[cut]) {
+		cut--
+	}
+	return comment[:cut] + truncatedCommentSuffix
+}
+
 func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, comment string) error {
 	if jobInfo == nil {
 		return nil
@@ -888,6 +966,11 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 	}
 
 	// 1. Set failure comment in Slurm
+	if truncated := truncateComment(comment); len(truncated) != len(comment) {
+		logger.Info("Truncated Slurm job comment to fit Slurm's limit",
+			"originalLength", len(comment), "maxLength", maxSlurmCommentLength)
+		comment = truncated
+	}
 	commentReq := slurmapi.V0044JobDescMsg{
 		Comment: ptr.To(comment),
 	}
