@@ -23,7 +23,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -80,7 +79,6 @@ type SlurmJobReconciler struct {
 	Translator            JobTranslator
 	slurmCallTimeout      time.Duration
 	reconciliationTimeout time.Duration
-	podTemplateWarned     sync.Map // podTemplateWarningKey -> struct{}
 }
 
 func (r *SlurmJobReconciler) getSlurmCallTimeout() time.Duration {
@@ -825,8 +823,6 @@ func (r *SlurmJobReconciler) translateSlurmJobToJobset(ctx context.Context, wm *
 		return nil, ReconciliationDone, fmt.Errorf("failed to fetch Controller %s: %w", controllerKey, err)
 	}
 
-	r.warnAboutPodTemplate(ctx, wm)
-
 	start := time.Now()
 	obj, err := translator.Translate(jobInfo, &wm.Spec, controllerCR)
 	duration := time.Since(start)
@@ -858,54 +854,6 @@ func (r *SlurmJobReconciler) translateSlurmJobToJobset(ctx context.Context, wm *
 	}
 
 	return obj, ReconciliationContinue, nil
-}
-
-type podTemplateWarningKey struct {
-	workloadMixing types.NamespacedName
-	message        string
-}
-
-// warnAboutPodTemplate logs each podTemplate warning once for each WorkloadMixing.
-func (r *SlurmJobReconciler) warnAboutPodTemplate(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) {
-	var slurmd corev1.ResourceRequirements
-	if template := wm.Spec.PodTemplate; template != nil {
-		if c := findContainer(&template.Spec, ContainerSlurmd); c != nil {
-			slurmd = c.Resources
-		}
-	}
-	missingLimits := missingCPUOrMemory(slurmd.Limits)
-	_, hasCPURequest := slurmd.Requests[corev1.ResourceCPU]
-	_, hasMemRequest := slurmd.Requests[corev1.ResourceMemory]
-
-	wmKey := client.ObjectKeyFromObject(wm)
-	r.warnOnce(ctx, wmKey, len(missingLimits) > 0,
-		"Maximum node size not configured: the slurmd container in spec.podTemplate has no cpu or memory limit",
-		"missingLimits", missingLimits)
-	r.warnOnce(ctx, wmKey, hasCPURequest || hasMemRequest,
-		"Ignored requests in spec.podTemplate: k8s-bridge sets the cpu and memory requests of the slurmd container for each Slurm job")
-}
-
-// warnOnce logs msg once while active is true. It forgets msg when active is false.
-func (r *SlurmJobReconciler) warnOnce(ctx context.Context, wmKey types.NamespacedName, active bool, msg string, keysAndValues ...any) {
-	key := podTemplateWarningKey{workloadMixing: wmKey, message: msg}
-	if !active {
-		r.podTemplateWarned.Delete(key)
-		return
-	}
-	if _, warned := r.podTemplateWarned.LoadOrStore(key, struct{}{}); warned {
-		return
-	}
-	log.FromContext(ctx).Info(msg, keysAndValues...)
-}
-
-func missingCPUOrMemory(list corev1.ResourceList) []corev1.ResourceName {
-	var missing []corev1.ResourceName
-	for _, name := range cpuAndMemory {
-		if _, ok := list[name]; !ok {
-			missing = append(missing, name)
-		}
-	}
-	return missing
 }
 
 func (r *SlurmJobReconciler) createK8sResource(ctx context.Context, obj client.Object) (bool, error) {

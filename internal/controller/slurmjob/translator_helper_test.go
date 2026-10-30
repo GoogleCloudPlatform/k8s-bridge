@@ -639,7 +639,7 @@ func verifyJobSetOptions(t *testing.T, js *jobsetv1alpha2.JobSet, podSpec *corev
 
 func verifyJobSetResources(t *testing.T, slurmd *corev1.Container, v *jobSetVerifier) {
 	t.Helper()
-	for _, name := range cpuAndMemory {
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 		if diff := cmp.Diff(slurmd.Resources.Requests[name], slurmd.Resources.Limits[name]); diff != "" {
 			t.Errorf("Translate() set a slurmd %s limit that is not equal to the request (-request +limit):\n%s", name, diff)
 		}

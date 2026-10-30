@@ -360,8 +360,6 @@ func slurmdTemplateLimits(template *corev1.PodTemplateSpec) corev1.ResourceList 
 	return nil
 }
 
-var cpuAndMemory = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
-
 // formatCPUs formats a CPU quantity, for example "1 CPU", "4 CPUs", or "3.5 CPUs".
 func formatCPUs(q resource.Quantity) string {
 	milliCPUs := q.MilliValue()
