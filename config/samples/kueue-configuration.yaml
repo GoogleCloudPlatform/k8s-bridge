@@ -14,7 +14,7 @@
 
 ---
 # 1. Define the ResourceFlavor to target the specific GKE nodes
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: e2-medium-default-pool
@@ -26,7 +26,7 @@ spec:
 
 ---
 # 2. Define the ClusterQueue named "test"
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: test
@@ -44,7 +44,7 @@ spec:
 
 ---
 # 3. Define a LocalQueue in your working namespace
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   namespace: default # Change this to the namespace where your jobs will run
