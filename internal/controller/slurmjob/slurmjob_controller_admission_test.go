@@ -172,8 +172,7 @@ func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			job := newReconTestJob().
 				withNodes(2).
-				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-				withHold(true).
+				withAutoHold().
 				build()
 			env := newReconcileTestEnv(t, withPendingSlurmJobs(job), withInterceptors(rejectJobSetCreate(tc.createErr)))
 
@@ -221,8 +220,7 @@ func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
 func TestReconcile_InvalidExtra_CancelsWithTranslationError(t *testing.T) {
 	job := newReconTestJob().
 		withNodes(2).
-		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-		withHold(true).
+		withAutoHold().
 		withExtra(testAnnotationRequiredTopology + "=" + testTopologyBlock + ",oops").
 		build()
 	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
@@ -237,8 +235,7 @@ func TestReconcile_InvalidExtra_CancelsWithTranslationError(t *testing.T) {
 func TestReconcile_LongTranslationError_TruncatesComment(t *testing.T) {
 	job := newReconTestJob().
 		withNodes(2).
-		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-		withHold(true).
+		withAutoHold().
 		withExtra(strings.Repeat("x", maxSlurmCommentLength)).
 		build()
 	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
@@ -264,8 +261,7 @@ func TestReconcile_LongTranslationError_TruncatesComment(t *testing.T) {
 func TestReconcile_ValidExtra_AnnotatesJobSetPodTemplate(t *testing.T) {
 	job := newReconTestJob().
 		withNodes(2).
-		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-		withHold(true).
+		withAutoHold().
 		withExtra(testAnnotationRequiredTopology + "=" + testTopologySubblock).
 		build()
 	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))

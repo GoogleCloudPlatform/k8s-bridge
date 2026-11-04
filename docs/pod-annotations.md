@@ -33,7 +33,8 @@ sbatch -p a4x -N 16 --gpus-per-node=4 \
 - Whitespace around `,`, keys, and values is trimmed. An empty or whitespace-only `--extra` is ignored.
 - Empty entries, for example from a trailing comma, are skipped.
 - Slurm itself limits `--extra` to 1024 bytes.
-- Each entry must contain `=` and a non-empty key. Values may be empty. Duplicate keys are rejected.
+- Each entry must contain `=` and a non-empty key. Only the first `=` separates the key from the value, so values may contain `=`. Values may be empty. Duplicate keys are rejected.
+- Values cannot contain `,`, because `,` always separates entries and cannot be escaped. For example, `cfg=a=1,b=2` yields two annotations: `cfg: a=1` and `b: 2`.
 - The resulting annotations must be valid Kubernetes annotations.
 
 If `--extra` is invalid, k8s-bridge cancels the Slurm job and sets its comment to one of:
