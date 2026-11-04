@@ -889,14 +889,16 @@ func (r *SlurmJobReconciler) createK8sResource(ctx context.Context, obj client.O
 }
 
 // isPermanentAdmissionRejection reports whether a JobSet Create error is a permanent rejection
-// that retrying cannot fix: a 422 Invalid error, or a 403 returned by a validating admission
-// webhook (for example Kueue's JobSet webhook rejecting invalid TAS annotations). Other 403
-// errors, such as RBAC denials or terminating namespaces, and server errors stay retriable.
+// that retrying cannot fix: a 422 Invalid error, or a 400 or 403 returned by a validating
+// admission webhook (for example Kueue's JobSet webhook rejecting invalid TAS annotations).
+// controller-runtime webhooks deny with 403, while the API server turns denials without an
+// explicit status code into 400. Other 400 and 403 errors, such as RBAC denials or terminating
+// namespaces, and server errors stay retriable.
 func isPermanentAdmissionRejection(err error) bool {
 	if apierrors.IsInvalid(err) {
 		return true
 	}
-	if apierrors.IsForbidden(err) {
+	if apierrors.IsForbidden(err) || apierrors.IsBadRequest(err) {
 		msg := admissionRejectionMessage(err)
 		return strings.Contains(msg, admissionWebhookMarker) && strings.Contains(msg, admissionDeniedMarker)
 	}

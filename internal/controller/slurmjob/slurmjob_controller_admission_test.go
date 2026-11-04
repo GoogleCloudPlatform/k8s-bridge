@@ -37,9 +37,14 @@ import (
 	slurmclienttypes "github.com/SlinkyProject/slurm-client/pkg/types"
 )
 
-const testKueueWebhookDenial = `admission webhook "vjobset.kb.io" denied the request: ` +
-	`spec.replicatedJobs[0].template.spec.template.metadata.annotations: Invalid value: ` +
-	`must not contain more than one topology annotation`
+const (
+	testKueueWebhookDenial = `admission webhook "vjobset.kb.io" denied the request: ` +
+		`spec.replicatedJobs[0].template.spec.template.metadata.annotations: Invalid value: ` +
+		`must not contain more than one topology annotation`
+	// testPolicyWebhookDenial is the message the API server builds for a webhook that denies a
+	// request without an explicit status code, which the API server reports as 400 Bad Request.
+	testPolicyWebhookDenial = `admission webhook "policy.example.com" denied the request: jobsets are not allowed`
+)
 
 var (
 	testJobSetGroupKind     = schema.GroupKind{Group: jobsetv1alpha2.GroupVersion.Group, Kind: "JobSet"}
@@ -51,6 +56,15 @@ func newWebhookDeniedError(message string) error {
 		Status:  metav1.StatusFailure,
 		Code:    http.StatusForbidden,
 		Reason:  metav1.StatusReasonForbidden,
+		Message: message,
+	}}
+}
+
+func newBadRequestWebhookDeniedError(message string) error {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{
+		Status:  metav1.StatusFailure,
+		Code:    http.StatusBadRequest,
+		Reason:  metav1.StatusReasonBadRequest,
 		Message: message,
 	}}
 }
@@ -82,6 +96,8 @@ func TestIsPermanentAdmissionRejection(t *testing.T) {
 		{name: "wrapped invalid", err: fmt.Errorf("failed to create: %w", newInvalidJobSetError()), want: true},
 		{name: "validating webhook denial", err: newWebhookDeniedError(testKueueWebhookDenial), want: true},
 		{name: "wrapped validating webhook denial", err: fmt.Errorf("failed to create: %w", newWebhookDeniedError(testKueueWebhookDenial)), want: true},
+		{name: "400 validating webhook denial", err: newBadRequestWebhookDeniedError(testPolicyWebhookDenial), want: true},
+		{name: "400 without webhook denial", err: apierrors.NewBadRequest("the server could not read the request body"), want: false},
 		{
 			name: "rbac forbidden",
 			err:  apierrors.NewForbidden(testJobSetGroupResource, "slurm-job-1", errors.New(`User "system:serviceaccount:slurm:k8s-bridge" cannot create resource "jobsets"`)),
@@ -153,6 +169,12 @@ func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
 			createErr:       newWebhookDeniedError(testKueueWebhookDenial),
 			wantCancelled:   true,
 			wantCommentPart: admissionRejectedCommentPrefix + testKueueWebhookDenial,
+		},
+		{
+			name:            "400 validating webhook denial cancels Slurm job",
+			createErr:       newBadRequestWebhookDeniedError(testPolicyWebhookDenial),
+			wantCancelled:   true,
+			wantCommentPart: admissionRejectedCommentPrefix + testPolicyWebhookDenial,
 		},
 		{
 			name:      "403 rbac forbidden is retried",

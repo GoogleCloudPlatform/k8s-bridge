@@ -48,4 +48,4 @@ Annotations in `spec.podTemplate.metadata.annotations` act as defaults. `--extra
 
 ## Admission errors
 
-k8s-bridge does not check Kueue TAS rules itself. Kueue's `JobSet` validating webhook checks them when k8s-bridge creates the `JobSet`. If the webhook or the API server rejects the `JobSet` (HTTP 422, or HTTP 403 from a validating webhook), k8s-bridge cancels the Slurm job and sets its comment to `JobSet admission rejected: <reason>`. Transient errors are retried.
+k8s-bridge does not check Kueue TAS rules itself. Kueue's `JobSet` validating webhook checks them when k8s-bridge creates the `JobSet`. If the webhook or the API server rejects the `JobSet` (HTTP 422, or HTTP 400 or 403 from a validating webhook), k8s-bridge cancels the Slurm job and sets its comment to `JobSet admission rejected: <reason>`. Transient errors are retried.
