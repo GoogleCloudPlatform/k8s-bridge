@@ -384,6 +384,13 @@ func isExplicitUserOrAdminHold(stateReason string) bool {
 	return stateReason == ReasonJobHeldUser || stateReason == ReasonJobHeldAdmin
 }
 
+// hasAutoHoldMarker reports whether a Slurm job comment has the AutoHoldMarker that
+// hack/job_submit.lua adds to jobs it holds for k8s-bridge. isJobExplicitlyHeld, isJobTranslated and
+// buildJobComment must agree on this check for failed cancellations to be retried.
+func hasAutoHoldMarker(comment string) bool {
+	return strings.Contains(comment, AutoHoldMarker)
+}
+
 func isJobExplicitlyHeld(job *slurmclienttypes.V0044JobInfo) bool {
 	if job == nil {
 		return false
@@ -399,7 +406,7 @@ func isJobExplicitlyHeld(job *slurmclienttypes.V0044JobInfo) bool {
 		return true
 	}
 	if stateReason == ReasonJobHeldUser {
-		return !strings.Contains(ptr.Deref(job.Comment, ""), AutoHoldMarker)
+		return !hasAutoHoldMarker(ptr.Deref(job.Comment, ""))
 	}
 	return false
 }

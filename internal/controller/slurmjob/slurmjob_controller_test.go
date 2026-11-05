@@ -1105,8 +1105,8 @@ func TestReconcile_JobSetCompleted(t *testing.T) {
 	}
 
 	// The Cancelled status replaces the Unheld status rather than being appended to it.
-	env.verifySlurmCancellation(CancelledCommentPrefix + " " + ReasonJobSetCompleted)
-	if got := env.updatedComment(0); strings.Contains(got, UnheldCommentPrefix) {
+	env.verifySlurmCancellation(cancelledStatus(ReasonJobSetCompleted))
+	if got := env.firstUpdatedComment(); strings.Contains(got, UnheldCommentPrefix) {
 		t.Errorf("Comment = %q, want the %q status replaced", got, UnheldCommentPrefix)
 	}
 	env.verifyJobSetNotFound()
@@ -1132,7 +1132,7 @@ func TestReconcile_JobSetFailed(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifySlurmCancellation(CancelledCommentPrefix + " " + ReasonJobSetFailed)
+	env.verifySlurmCancellation(cancelledStatus(ReasonJobSetFailed))
 	env.verifyJobSetNotFound()
 }
 
@@ -1291,7 +1291,7 @@ func TestCancelJobWithComment_PartConfigUnavailable422_DoesNotLogError(t *testin
 
 			env.verifySlurmCancellation(ReasonJobSetCompleted)
 
-			hasErrLog := strings.Contains(buf.String(), "Failed to set failure comment on Slurm job")
+			hasErrLog := strings.Contains(buf.String(), "Failed to set cancellation comment on Slurm job")
 			if hasErrLog != tc.wantErrorLog {
 				t.Errorf("Error log presence = %v, want %v (logs: %s)", hasErrLog, tc.wantErrorLog, buf.String())
 			}

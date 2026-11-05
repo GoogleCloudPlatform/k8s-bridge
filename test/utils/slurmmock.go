@@ -47,7 +47,7 @@ type SlurmClient struct {
 	updatedJobs     []JobUpdate
 	GetError        error
 	UpdateError     error
-	DeleteError     error
+	DeleteJobError  error
 	DeleteNodeError error
 	MutateOnUpdate  bool
 }
@@ -169,8 +169,8 @@ func (s *SlurmClient) Delete(ctx context.Context, obj object.Object, opts ...cli
 	defer s.lock.Unlock()
 
 	if jobInfo, ok := obj.(*slurmclienttypes.V0044JobInfo); ok {
-		if s.DeleteError != nil {
-			return s.DeleteError
+		if s.DeleteJobError != nil {
+			return s.DeleteJobError
 		}
 		jobID := ptr.Deref(jobInfo.JobId, 0)
 		s.deletedJobs = append(s.deletedJobs, jobID)

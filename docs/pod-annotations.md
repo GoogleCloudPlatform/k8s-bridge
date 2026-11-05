@@ -37,7 +37,7 @@ sbatch -p a4x -N 16 --gpus-per-node=4 \
 - Values cannot contain `,`, because `,` always separates entries and cannot be escaped. For example, `cfg=a=1,b=2` yields two annotations: `cfg: a=1` and `b: 2`.
 - The resulting annotations must be valid Kubernetes annotations.
 
-If `--extra` is invalid, k8s-bridge cancels the Slurm job and sets its comment to one of:
+If `--extra` is invalid, k8s-bridge cancels the Slurm job. Its comment keeps the user's own text and gets `Cancelled by k8s-bridge:` followed by one of:
 
 - `Translation failed: invalid --extra: ...` when the `--extra` syntax is invalid.
 - `Translation failed: invalid PodTemplate annotations: ...` when the resulting annotations are not valid Kubernetes annotations. The message names the offending key.
@@ -48,4 +48,4 @@ Annotations in `spec.podTemplate.metadata.annotations` act as defaults. `--extra
 
 ## Admission errors
 
-k8s-bridge does not check Kueue TAS rules itself. Kueue's `JobSet` validating webhook checks them when k8s-bridge creates the `JobSet`. If the webhook or the API server rejects the `JobSet` (HTTP 422, or HTTP 400 or 403 from a validating webhook), k8s-bridge cancels the Slurm job and sets its comment to `JobSet admission rejected: <reason>`. Transient errors are retried.
+k8s-bridge does not check Kueue TAS rules itself. Kueue's `JobSet` validating webhook checks them when k8s-bridge creates the `JobSet`. If the webhook or the API server rejects the `JobSet` (HTTP 422, or HTTP 400 or 403 from a validating webhook), k8s-bridge cancels the Slurm job and adds `Cancelled by k8s-bridge: JobSet admission rejected: <reason>` to its comment. Transient errors are retried.
