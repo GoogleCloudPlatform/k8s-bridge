@@ -19,6 +19,7 @@ package workloadmixing
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -89,11 +90,46 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	logger.V(1).Info("Reconciling WorkloadMixing", "controllerRef", workloadMixing.Spec.ControllerRef.Name)
 
+	r.warnAboutPodTemplate(workloadMixing)
+
 	if err := r.updateAvailabilityStatus(ctx, workloadMixing, original); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// warnAboutPodTemplate sends a Warning Event for each problem in the podTemplate. It runs
+// only for a spec generation that the Available condition does not show yet.
+func (r *WorkloadMixingReconciler) warnAboutPodTemplate(wm *k8sbridgev1alpha1.WorkloadMixing) {
+	available := meta.FindStatusCondition(wm.Status.Conditions, conditionTypeAvailable)
+	if r.Recorder == nil || (available != nil && available.ObservedGeneration == wm.Generation) {
+		return
+	}
+	var slurmd corev1.ResourceRequirements
+	if wm.Spec.PodTemplate != nil {
+		for _, c := range wm.Spec.PodTemplate.Spec.Containers {
+			if c.Name == slurmjob.ContainerSlurmd {
+				slurmd = c.Resources
+			}
+		}
+	}
+	var missingLimits []string
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if _, ok := slurmd.Limits[name]; !ok {
+			missingLimits = append(missingLimits, string(name))
+		}
+	}
+	if len(missingLimits) > 0 {
+		r.Recorder.Event(wm, corev1.EventTypeWarning, "MaxNodeSizeNotConfigured",
+			"Maximum node size not configured: the slurmd container in spec.podTemplate has no limit for "+strings.Join(missingLimits, " and "))
+	}
+	_, hasCPURequest := slurmd.Requests[corev1.ResourceCPU]
+	_, hasMemRequest := slurmd.Requests[corev1.ResourceMemory]
+	if hasCPURequest || hasMemRequest {
+		r.Recorder.Event(wm, corev1.EventTypeWarning, "SlurmdRequestsIgnored",
+			"Ignored requests in spec.podTemplate: k8s-bridge sets the cpu and memory requests of the slurmd container for each Slurm job")
+	}
 }
 
 func (r *WorkloadMixingReconciler) cleanupWorkloadMixingMetrics(ctx context.Context, name string) {

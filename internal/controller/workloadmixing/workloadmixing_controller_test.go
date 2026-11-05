@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -213,6 +214,38 @@ var _ = Describe("WorkloadMixing Controller", func() {
 
 					fakeRec := rec.(*record.FakeRecorder)
 					Eventually(fakeRec.Events).Should(Receive(ContainSubstring("WorkloadMixing successfully reconciled")))
+				},
+			}),
+			Entry("podTemplate problems send Warning Events once for each spec generation", testCase{
+				setup: func(ctx context.Context) {
+					createCR(ctx)
+					wm := &k8sbridgev1alpha1.WorkloadMixing{}
+					Expect(k8sClient.Get(ctx, typeNamespacedName, wm)).To(Succeed())
+					wm.Spec.PodTemplate = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+						Name:  slurmjob.ContainerSlurmd,
+						Image: "slurmd",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+						},
+					}}}}
+					Expect(k8sClient.Update(ctx, wm)).To(Succeed())
+				},
+				teardown:       deleteCR,
+				getRecorder:    func() record.EventRecorder { return record.NewFakeRecorder(10) },
+				req:            reconcile.Request{NamespacedName: typeNamespacedName},
+				expectedResult: reconcile.Result{},
+				validate: func(ctx context.Context, rec record.EventRecorder) {
+					fakeRec := rec.(*record.FakeRecorder)
+					Expect(fakeRec.Events).To(Receive(Equal("Warning MaxNodeSizeNotConfigured Maximum node size not configured: " +
+						"the slurmd container in spec.podTemplate has no limit for memory")))
+					Expect(fakeRec.Events).To(Receive(ContainSubstring("SlurmdRequestsIgnored")))
+					Expect(fakeRec.Events).To(Receive(ContainSubstring("WorkloadMixing successfully reconciled")))
+
+					r := &WorkloadMixingReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: rec}
+					_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(fakeRec.Events).NotTo(Receive())
 				},
 			}),
 			Entry("idempotent reconciliation when conditions are already set", testCase{
