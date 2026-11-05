@@ -1524,6 +1524,52 @@ func TestReconcile_ReleaseHold_IdempotentCommentAndConstraints(t *testing.T) {
 	}
 }
 
+// TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus covers a job whose earlier cancellation
+// failed and which translates successfully on a later reconcile (for example after the
+// WorkloadMixing was fixed): the Unheld status replaces the stale Cancelled status.
+func TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus(t *testing.T) {
+	job := newReconTestJob().
+		withNodes(2).
+		withAutoHold().
+		withComment("user-comment, " + CancelledCommentPrefix + " Translation failed: missing GRES mapping, " + AutoHoldMarker).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	want := fmt.Sprintf("user-comment, %s Kubernetes resource slurm-job-%s created successfully", UnheldCommentPrefix, reconJobIDStr)
+	if got := env.firstUpdatedComment(); got != want {
+		t.Errorf("Comment = %q, want %q", got, want)
+	}
+}
+
+// TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit checks that a user comment close to
+// Slurm's limit is truncated, rather than making the unhold update exceed it.
+func TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit(t *testing.T) {
+	userComment := strings.Repeat("u", maxSlurmCommentLength-len(commentSeparator+AutoHoldMarker))
+	job := newReconTestJob().
+		withNodes(2).
+		withAutoHold().
+		withComment(userComment + commentSeparator + AutoHoldMarker).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	got := env.firstUpdatedComment()
+	if len(got) > maxSlurmCommentLength {
+		t.Errorf("len(Comment) = %d, want <= %d", len(got), maxSlurmCommentLength)
+	}
+	wantStatus := fmt.Sprintf("%s Kubernetes resource slurm-job-%s created successfully", UnheldCommentPrefix, reconJobIDStr)
+	if !strings.HasPrefix(got, "uuu") || !strings.HasSuffix(got, truncatedCommentSuffix+commentSeparator+wantStatus) {
+		t.Errorf("Comment = %q, want the truncated user comment followed by %q", got, wantStatus)
+	}
+}
+
 func TestReconcile_ReleaseHold_PartConfigUnavailable422_AppliedInPlace(t *testing.T) {
 	tests := []struct {
 		name              string

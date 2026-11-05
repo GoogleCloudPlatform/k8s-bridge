@@ -990,14 +990,15 @@ func userJobComment(comment string) string {
 }
 
 // buildJobComment returns the Slurm job comment that sets the k8s-bridge status of a job to status,
-// and whether any part of it had to be truncated. It keeps the user's own comment from current,
-// replaces any previous k8s-bridge status, and keeps the AutoHoldMarker if current has it, so a job
-// that is still auto-held stays recognizable as such. The result is stable when applied again to
+// and whether any part of it had to be truncated. It keeps the user's own comment from current and
+// replaces any previous k8s-bridge status. If keepAutoHoldMarker is true and current has the
+// AutoHoldMarker, the marker is kept, so a job that is still auto-held stays recognizable as such;
+// otherwise it is removed. The result is stable when applied again to
 // its own output and never exceeds maxSlurmCommentLength bytes: the marker is never cut, a long
 // status is cut to no less than minStatusBudget bytes, and the user's comment is truncated first.
-func buildJobComment(current, status string) (comment string, truncated bool) {
+func buildJobComment(current, status string, keepAutoHoldMarker bool) (comment string, truncated bool) {
 	markerSuffix := ""
-	if hasAutoHoldMarker(current) {
+	if keepAutoHoldMarker && hasAutoHoldMarker(current) {
 		markerSuffix = commentSeparator + AutoHoldMarker
 	}
 	budget := maxSlurmCommentLength - len(markerSuffix)
@@ -1033,7 +1034,7 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 
 	// 1. Set the k8s-bridge status in the Slurm job comment, unless a previous attempt already did.
 	currentComment := ptr.Deref(jobInfo.Comment, "")
-	comment, truncated := buildJobComment(currentComment, cancelledStatus(reason))
+	comment, truncated := buildJobComment(currentComment, cancelledStatus(reason), true)
 	if comment != currentComment {
 		if truncated {
 			logger.Info("Truncated Slurm job comment to fit Slurm's limit", "maxLength", maxSlurmCommentLength)
@@ -1069,13 +1070,7 @@ func (r *SlurmJobReconciler) releaseHold(ctx context.Context, slurmClient slurmc
 	jobID := ptr.Deref(jobInfo.JobId, 0)
 
 	msg := fmt.Sprintf("%s Kubernetes resource %s created successfully", UnheldCommentPrefix, obj.GetName())
-	existingComment := stripAutoHoldMarker(strings.TrimSpace(ptr.Deref(jobInfo.Comment, "")))
-	newComment := msg
-	if strings.Contains(existingComment, msg) {
-		newComment = existingComment
-	} else if existingComment != "" {
-		newComment = fmt.Sprintf("%s, %s", existingComment, msg)
-	}
+	newComment, _ := buildJobComment(ptr.Deref(jobInfo.Comment, ""), msg, false)
 
 	uniqueFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
 	existingFeatures := strings.TrimSpace(ptr.Deref(jobInfo.Features, ""))

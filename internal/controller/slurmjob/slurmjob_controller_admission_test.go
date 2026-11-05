@@ -165,10 +165,11 @@ func TestBuildJobComment(t *testing.T) {
 	cancelled := cancelledStatus("Translation failed: bad request")
 	unheld := UnheldCommentPrefix + " Kubernetes resource slurm-job-1 created successfully"
 	tests := []struct {
-		name    string
-		current string
-		status  string
-		want    string
+		name       string
+		current    string
+		status     string
+		dropMarker bool
+		want       string
 	}{
 		{name: "empty comment", current: "", status: cancelled, want: cancelled},
 		{name: "user comment is kept", current: "my run", status: cancelled, want: "my run, " + cancelled},
@@ -182,15 +183,17 @@ func TestBuildJobComment(t *testing.T) {
 		{name: "text after a k8s-bridge status is dropped", current: "note " + UnheldCommentPrefix + " x, more", status: cancelled, want: "note, " + cancelled},
 		{name: "commas and whitespace around the user comment are trimmed", current: "  my run ,, ", status: cancelled, want: "my run, " + cancelled},
 		{name: "bare reason from older k8s-bridge versions is kept as user text", current: "JobSet completed", status: cancelled, want: "JobSet completed, " + cancelled},
+		{name: "marker is dropped on request", current: "my run, " + AutoHoldMarker, status: unheld, dropMarker: true, want: "my run, " + unheld},
+		{name: "cancelled status is replaced by unheld and marker is dropped", current: "my run, " + cancelled + marker, status: unheld, dropMarker: true, want: "my run, " + unheld},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, truncated := buildJobComment(tc.current, tc.status)
+			got, truncated := buildJobComment(tc.current, tc.status, !tc.dropMarker)
 			if got != tc.want {
-				t.Errorf("buildJobComment(%q, %q) = %q, want %q", tc.current, tc.status, got, tc.want)
+				t.Errorf("buildJobComment(%q, %q, %v) = %q, want %q", tc.current, tc.status, !tc.dropMarker, got, tc.want)
 			}
 			if truncated {
-				t.Errorf("buildJobComment(%q, %q) reported truncation, want none", tc.current, tc.status)
+				t.Errorf("buildJobComment(%q, %q, %v) reported truncation, want none", tc.current, tc.status, !tc.dropMarker)
 			}
 		})
 	}
@@ -251,14 +254,14 @@ func TestBuildJobComment_FitsSlurmLimit(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, truncated := buildJobComment(tc.current, tc.status)
+			got, truncated := buildJobComment(tc.current, tc.status, true)
 			if got != tc.want {
 				t.Errorf("buildJobComment() =\n%q\nwant\n%q", got, tc.want)
 			}
 			if !truncated {
 				t.Error("buildJobComment() reported no truncation, want truncation")
 			}
-			if again, _ := buildJobComment(got, tc.status); again != got {
+			if again, _ := buildJobComment(got, tc.status, true); again != got {
 				t.Errorf("buildJobComment() is not stable:\nfirst:  %q\nsecond: %q", got, again)
 			}
 		})
@@ -280,7 +283,7 @@ func TestBuildJobComment_StableWithinLimit(t *testing.T) {
 						}
 						status := cancelledStatus(strings.Repeat(statusChar, reasonLen))
 
-						got, _ := buildJobComment(current, status)
+						got, _ := buildJobComment(current, status, true)
 						if len(got) > maxSlurmCommentLength || !utf8.ValidString(got) {
 							t.Fatalf("buildJobComment(%d x %q, %d x %q, marker=%v): length %d, valid UTF-8 %v",
 								userLen, userChar, reasonLen, statusChar, withMarker, len(got), utf8.ValidString(got))
@@ -289,7 +292,7 @@ func TestBuildJobComment_StableWithinLimit(t *testing.T) {
 							t.Fatalf("buildJobComment(%d x %q, %d x %q, marker=%v) ends with marker = %v",
 								userLen, userChar, reasonLen, statusChar, withMarker, hasMarker)
 						}
-						if again, _ := buildJobComment(got, status); again != got {
+						if again, _ := buildJobComment(got, status, true); again != got {
 							t.Fatalf("buildJobComment(%d x %q, %d x %q, marker=%v) is not stable:\nfirst:  %q\nsecond: %q",
 								userLen, userChar, reasonLen, statusChar, withMarker, got, again)
 						}
