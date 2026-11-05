@@ -524,6 +524,20 @@ func (e *reconcileTestEnv) verifySlurmCancellation(wantCommentSubstr string) {
 	}
 }
 
+// updatedComment returns the comment set by the i-th Slurm job update, failing the test if there is none.
+func (e *reconcileTestEnv) updatedComment(i int) string {
+	e.t.Helper()
+	updates := e.mockSlurm.GetUpdatedJobs()
+	if i >= len(updates) {
+		e.t.Fatalf("Expected at least %d Slurm job updates, got %d", i+1, len(updates))
+	}
+	reqMsg, ok := updates[i].Req.(slurmapi.V0044JobDescMsg)
+	if !ok || reqMsg.Comment == nil {
+		e.t.Fatalf("Expected Slurm job update %d to set a comment, got %+v", i, updates[i].Req)
+	}
+	return *reqMsg.Comment
+}
+
 func (e *reconcileTestEnv) verifySlurmNodesDeleted(wantNodes ...string) {
 	e.t.Helper()
 	if gotNodes := e.mockSlurm.GetDeletedNodes(); !slices.Equal(gotNodes, wantNodes) {

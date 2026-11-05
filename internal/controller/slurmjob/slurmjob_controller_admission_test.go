@@ -134,14 +134,14 @@ func TestTruncateComment(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := truncateComment(tc.comment); got != tc.want {
+			if got := truncateComment(tc.comment, maxSlurmCommentLength); got != tc.want {
 				t.Errorf("truncateComment() = %q, want %q", got, tc.want)
 			}
 		})
 	}
 
 	t.Run("does not split multi-byte characters", func(t *testing.T) {
-		got := truncateComment(strings.Repeat("ż", maxSlurmCommentLength))
+		got := truncateComment(strings.Repeat("ż", maxSlurmCommentLength), maxSlurmCommentLength)
 		if len(got) > maxSlurmCommentLength {
 			t.Errorf("truncateComment() length = %d, want <= %d", len(got), maxSlurmCommentLength)
 		}
@@ -149,6 +149,83 @@ func TestTruncateComment(t *testing.T) {
 			t.Errorf("truncateComment() returned invalid UTF-8: %q", got)
 		}
 	})
+}
+
+func TestBuildJobComment(t *testing.T) {
+	const (
+		reason    = "Translation failed: bad request"
+		cancelled = CancelledCommentPrefix + " " + reason
+		unheld    = UnheldCommentPrefix + " Kubernetes resource slurm-job-1 created successfully"
+		marker    = commentSeparator + AutoHoldMarker
+	)
+	tests := []struct {
+		name    string
+		current string
+		status  string
+		want    string
+	}{
+		{name: "empty comment", current: "", status: cancelled, want: cancelled},
+		{name: "user comment is kept", current: "my run", status: cancelled, want: "my run, " + cancelled},
+		{name: "marker alone is kept", current: AutoHoldMarker, status: cancelled, want: cancelled + marker},
+		{name: "user comment and marker are kept", current: "my run, " + AutoHoldMarker, status: cancelled, want: "my run, " + cancelled + marker},
+		{name: "unheld status is replaced", current: "my run, " + unheld, status: CompletedCommentPrefix + " " + ReasonJobSetCompleted, want: "my run, " + CompletedCommentPrefix + " " + ReasonJobSetCompleted},
+		{name: "unheld status alone is replaced", current: unheld, status: cancelled, want: cancelled},
+		{name: "cancelled status is replaced by a newer one", current: "my run, " + CancelledCommentPrefix + " old reason" + marker, status: cancelled, want: "my run, " + cancelled + marker},
+		{name: "repeated call is a no-op", current: "my run, " + cancelled + marker, status: cancelled, want: "my run, " + cancelled + marker},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildJobComment(tc.current, tc.status); got != tc.want {
+				t.Errorf("buildJobComment(%q, %q) = %q, want %q", tc.current, tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildJobComment_FitsSlurmLimit(t *testing.T) {
+	longStatus := CancelledCommentPrefix + " " + strings.Repeat("r", 2*maxSlurmCommentLength)
+	longUser := strings.Repeat("u", 2*maxSlurmCommentLength)
+	tests := []struct {
+		name          string
+		current       string
+		status        string
+		wantMarker    bool
+		wantUserPart  string
+		wantStatusLen int
+	}{
+		{name: "long status without user comment uses the whole limit", current: AutoHoldMarker, status: longStatus, wantMarker: true, wantStatusLen: maxSlurmCommentLength - len(commentSeparator+AutoHoldMarker)},
+		{name: "long status keeps room for a short user comment", current: "my run, " + AutoHoldMarker, status: longStatus, wantMarker: true, wantUserPart: "my run, "},
+		{name: "long user comment is truncated before a short status", current: longUser + ", " + AutoHoldMarker, status: CancelledCommentPrefix + " short", wantMarker: true, wantUserPart: "uuu"},
+		{name: "long user comment and long status share the limit", current: longUser, status: longStatus, wantUserPart: "uuu", wantStatusLen: minStatusLength},
+		{name: "multi-byte characters are not split", current: strings.Repeat("ż", maxSlurmCommentLength) + ", " + AutoHoldMarker, status: CancelledCommentPrefix + " " + strings.Repeat("ł", maxSlurmCommentLength), wantMarker: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildJobComment(tc.current, tc.status)
+			if len(got) > maxSlurmCommentLength {
+				t.Errorf("len(buildJobComment()) = %d, want <= %d", len(got), maxSlurmCommentLength)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("buildJobComment() returned invalid UTF-8: %q", got)
+			}
+			if hasMarker := strings.HasSuffix(got, commentSeparator+AutoHoldMarker); hasMarker != tc.wantMarker {
+				t.Errorf("buildJobComment() ends with marker = %v, want %v (comment %q)", hasMarker, tc.wantMarker, got)
+			}
+			if !strings.HasPrefix(got, tc.wantUserPart) {
+				t.Errorf("buildJobComment() = %q, want prefix %q", got, tc.wantUserPart)
+			}
+			if tc.wantStatusLen > 0 {
+				status := got[strings.Index(got, CancelledCommentPrefix):]
+				status = strings.TrimSuffix(status, commentSeparator+AutoHoldMarker)
+				if len(status) != tc.wantStatusLen {
+					t.Errorf("status length = %d, want %d (comment %q)", len(status), tc.wantStatusLen, got)
+				}
+			}
+			if again := buildJobComment(got, tc.status); again != got {
+				t.Errorf("buildJobComment() is not stable:\nfirst:  %q\nsecond: %q", got, again)
+			}
+		})
+	}
 }
 
 func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
@@ -275,8 +352,66 @@ func TestReconcile_LongTranslationError_TruncatesComment(t *testing.T) {
 	if got := len(*reqMsg.Comment); got != maxSlurmCommentLength {
 		t.Errorf("Comment length = %d, want %d", got, maxSlurmCommentLength)
 	}
-	if !strings.HasSuffix(*reqMsg.Comment, truncatedCommentSuffix) {
-		t.Errorf("Comment = %q, want suffix %q", *reqMsg.Comment, truncatedCommentSuffix)
+	if !strings.HasSuffix(*reqMsg.Comment, truncatedCommentSuffix+commentSeparator+AutoHoldMarker) {
+		t.Errorf("Comment = %q, want the truncated status followed by %q", *reqMsg.Comment, AutoHoldMarker)
+	}
+}
+
+// TestReconcile_FailedCancelOfAutoHeldJob_IsRetried checks that when cancelling an auto-held job
+// fails after its comment was updated, the job keeps the AutoHoldMarker, so the next reconcile does
+// not mistake it for a job held by the user and retries the cancellation.
+func TestReconcile_FailedCancelOfAutoHeldJob_IsRetried(t *testing.T) {
+	const testRetryWebhookDenial = `admission webhook "vjobset.kb.io" denied the request: invalid topology request`
+	tests := []struct {
+		name       string
+		extra      string
+		createErr  error
+		wantReason string
+	}{
+		{
+			name:       "JobSet admission rejected",
+			createErr:  newWebhookDeniedError(testRetryWebhookDenial),
+			wantReason: admissionRejectedCommentPrefix + testRetryWebhookDenial,
+		},
+		{
+			name:       "translation failed",
+			extra:      "oops",
+			wantReason: `Translation failed: invalid --extra: "oops" is not in key=value format`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := newReconTestJob().
+				withNodes(2).
+				withAutoHold().
+				withExtra(tc.extra).
+				build()
+			opts := []reconcileEnvOpt{withPendingSlurmJobs(job), withSlurmUpdateError(nil, true)}
+			if tc.createErr != nil {
+				opts = append(opts, withInterceptors(rejectJobSetCreate(tc.createErr)))
+			}
+			env := newReconcileTestEnv(t, opts...)
+			env.mockSlurm.DeleteError = errors.New("slurmrestd unavailable")
+
+			if _, err := env.reconcile(); err == nil {
+				t.Fatal("First Reconcile() returned nil error, want the cancellation error")
+			}
+			if deleted := env.mockSlurm.GetDeletedJobs(); len(deleted) != 0 {
+				t.Fatalf("Deleted Slurm jobs = %v, want none after a failed cancellation", deleted)
+			}
+			wantComment := CancelledCommentPrefix + " " + tc.wantReason + commentSeparator + AutoHoldMarker
+			if got := env.updatedComment(0); got != wantComment {
+				t.Errorf("Comment after failed cancellation = %q, want %q", got, wantComment)
+			}
+
+			env.mockSlurm.DeleteError = nil
+			if _, err := env.reconcile(); err != nil {
+				t.Fatalf("Second Reconcile() returned unexpected error: %v", err)
+			}
+			// The second reconcile retries the cancellation without rewriting the unchanged comment.
+			env.verifySlurmCancellation(tc.wantReason)
+			env.verifyJobSetNotFound()
+		})
 	}
 }
 

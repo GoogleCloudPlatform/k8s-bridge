@@ -65,7 +65,12 @@ const (
 	ReasonJobSetFailed    = "JobSet failed"
 	ReasonJobSetMissing   = "JobSet missing"
 
-	UnheldCommentPrefix = "Unheld by k8s-bridge:"
+	// UnheldCommentPrefix, CancelledCommentPrefix and CompletedCommentPrefix start the k8s-bridge
+	// status that buildJobComment adds to a Slurm job comment. A comment holds at most one status,
+	// which describes the current state of the job.
+	UnheldCommentPrefix    = "Unheld by k8s-bridge:"
+	CancelledCommentPrefix = "Cancelled by k8s-bridge:"
+	CompletedCommentPrefix = "Completed by k8s-bridge:"
 
 	admissionRejectedCommentPrefix = "JobSet admission rejected: "
 	admissionWebhookMarker         = "admission webhook"
@@ -74,7 +79,14 @@ const (
 	// submission and update.
 	maxSlurmCommentLength  = 1024
 	truncatedCommentSuffix = "..."
+	// minStatusLength is the room, in bytes, that buildJobComment keeps for the k8s-bridge status
+	// when the user's comment and the status do not both fit in maxSlurmCommentLength.
+	minStatusLength  = 512
+	commentSeparator = ", "
 )
+
+// k8sBridgeStatusPrefixes lists the prefixes of every status that k8s-bridge writes to a Slurm job comment.
+var k8sBridgeStatusPrefixes = []string{UnheldCommentPrefix, CancelledCommentPrefix, CompletedCommentPrefix}
 
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
 type SlurmJobReconciler struct {
@@ -641,7 +653,7 @@ func (r *SlurmJobReconciler) handleMissingJobSet(
 	partition string,
 ) (ReconciliationStatus, ctrl.Result, error) {
 	log.FromContext(ctx).Info("JobSet missing for active Slurm job, cancelling job", "jobSet", jobSetNameForJobID(jobID), "partition", partition)
-	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, ReasonJobSetMissing); err != nil {
+	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, ReasonJobSetMissing); err != nil {
 		return ReconciliationDone, ctrl.Result{}, err
 	}
 	if partition != "" {
@@ -683,7 +695,11 @@ func (r *SlurmJobReconciler) handleTerminalJobSet(
 ) (ReconciliationStatus, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Handling terminal JobSet for Slurm job", "jobSet", existingJS.Name, "partition", partition, "reason", reason)
-	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, reason); cancelErr != nil {
+	statusPrefix := CancelledCommentPrefix
+	if reason == ReasonJobSetCompleted {
+		statusPrefix = CompletedCommentPrefix
+	}
+	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, statusPrefix, reason); cancelErr != nil {
 		return ReconciliationDone, ctrl.Result{}, cancelErr
 	}
 	if err := finalizeJobSet(ctx, r.Client, slurmClient, existingJS, r.getSlurmCallTimeout()); err != nil {
@@ -805,7 +821,7 @@ func (r *SlurmJobReconciler) newJobCheckMultiPartition(ctx context.Context, wm *
 				r.Recorder.Eventf(wm, corev1.EventTypeWarning, "JobTranslationFailed", "Multi-partition jobs with multiple mapped partitions are not supported: %s", partition)
 			}
 
-			if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, "Multi-partition jobs with multiple mapped partitions are not supported"); err != nil {
+			if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, "Multi-partition jobs with multiple mapped partitions are not supported"); err != nil {
 				return ReconciliationDone, err
 			}
 			return ReconciliationDone, nil
@@ -847,7 +863,7 @@ func (r *SlurmJobReconciler) translateSlurmJobToJobset(ctx context.Context, wm *
 			r.Recorder.Eventf(wm, corev1.EventTypeWarning, "JobTranslationFailed", "Failed to translate Slurm job %s: %v", jobID, err)
 		}
 
-		cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, fmt.Sprintf("Translation failed: %v", err))
+		cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, fmt.Sprintf("Translation failed: %v", err))
 		if cancelErr != nil {
 			return nil, ReconciliationDone, fmt.Errorf("failed to cancel job after translation failure: %w (translation error: %v)", cancelErr, err)
 		}
@@ -937,26 +953,65 @@ func (r *SlurmJobReconciler) handleJobSetAdmissionRejection(
 	}
 
 	comment := admissionRejectedCommentPrefix + msg
-	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, comment); err != nil {
+	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, comment); err != nil {
 		return fmt.Errorf("failed to cancel job after JobSet admission rejection: %w (rejection: %v)", err, createErr)
 	}
 	return nil
 }
 
-// truncateComment shortens a Slurm job comment to maxSlurmCommentLength bytes without splitting
-// a UTF-8 character.
-func truncateComment(comment string) string {
-	if len(comment) <= maxSlurmCommentLength {
+// truncateComment shortens comment to at most maxLen bytes, ending it with truncatedCommentSuffix,
+// without splitting a UTF-8 character.
+func truncateComment(comment string, maxLen int) string {
+	if len(comment) <= maxLen {
 		return comment
 	}
-	cut := maxSlurmCommentLength - len(truncatedCommentSuffix)
+	cut := max(maxLen-len(truncatedCommentSuffix), 0)
 	for cut > 0 && !utf8.RuneStart(comment[cut]) {
 		cut--
 	}
 	return comment[:cut] + truncatedCommentSuffix
 }
 
-func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, comment string) error {
+// userJobComment returns the part of a Slurm job comment that k8s-bridge does not own: the comment
+// without the AutoHoldMarker and without the k8s-bridge status, which starts at the first status prefix.
+func userJobComment(comment string) string {
+	comment = stripAutoHoldMarker(comment)
+	for _, prefix := range k8sBridgeStatusPrefixes {
+		if idx := strings.Index(comment, prefix); idx >= 0 {
+			comment = comment[:idx]
+		}
+	}
+	return strings.TrimSpace(strings.TrimRight(strings.TrimSpace(comment), ","))
+}
+
+// buildJobComment returns the Slurm job comment that sets the k8s-bridge status of a job to status.
+// It keeps the user's own comment from current, replaces any previous k8s-bridge status, and keeps
+// the AutoHoldMarker if current has it, so a job that is still auto-held stays recognizable as
+// such. The result is stable when applied again to its own output and never exceeds
+// maxSlurmCommentLength bytes: the marker is never cut, the status keeps at least minStatusLength
+// bytes, and the user's comment is truncated first.
+func buildJobComment(current, status string) string {
+	markerSuffix := ""
+	if strings.Contains(current, AutoHoldMarker) {
+		markerSuffix = commentSeparator + AutoHoldMarker
+	}
+	budget := maxSlurmCommentLength - len(markerSuffix)
+
+	userComment := userJobComment(current)
+	if userComment == "" {
+		return truncateComment(status, budget) + markerSuffix
+	}
+
+	budget -= len(commentSeparator)
+	status = truncateComment(status, max(minStatusLength, budget-len(userComment)))
+	userComment = truncateComment(userComment, budget-len(status))
+	return userComment + commentSeparator + status + markerSuffix
+}
+
+// cancelJobWithComment sets the k8s-bridge status of a Slurm job to statusPrefix followed by reason,
+// then cancels the job. It is safe to call again after a failure: an auto-held job keeps its
+// AutoHoldMarker, so the next reconcile still treats it as auto-held and retries the cancellation.
+func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, statusPrefix, reason string) error {
 	if jobInfo == nil {
 		return nil
 	}
@@ -967,23 +1022,27 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 		return nil
 	}
 
-	// 1. Set failure comment in Slurm
-	if truncated := truncateComment(comment); len(truncated) != len(comment) {
+	// 1. Set the k8s-bridge status in the Slurm job comment, unless a previous attempt already did.
+	currentComment := ptr.Deref(jobInfo.Comment, "")
+	status := statusPrefix + " " + reason
+	comment := buildJobComment(currentComment, status)
+	if !strings.Contains(comment, status) {
 		logger.Info("Truncated Slurm job comment to fit Slurm's limit",
-			"originalLength", len(comment), "maxLength", maxSlurmCommentLength)
-		comment = truncated
+			"statusLength", len(status), "maxLength", maxSlurmCommentLength)
 	}
-	commentReq := slurmapi.V0044JobDescMsg{
-		Comment: ptr.To(comment),
-	}
-	updateCtx, updateCancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
-	err := slurmClient.Update(updateCtx, jobInfo, commentReq)
-	updateCancel()
-	if err != nil {
-		if isSlurmPartConfigUnavailable(err) {
-			logger.V(1).Info("Slurm returned partition configuration unavailable when setting failure comment, proceeding with job cancellation", "error", err)
-		} else {
-			logger.Error(err, "Failed to set failure comment on Slurm job, proceeding with job cancellation")
+	if comment != currentComment {
+		commentReq := slurmapi.V0044JobDescMsg{
+			Comment: ptr.To(comment),
+		}
+		updateCtx, updateCancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
+		err := slurmClient.Update(updateCtx, jobInfo, commentReq)
+		updateCancel()
+		if err != nil {
+			if isSlurmPartConfigUnavailable(err) {
+				logger.V(1).Info("Slurm returned partition configuration unavailable when setting failure comment, proceeding with job cancellation", "error", err)
+			} else {
+				logger.Error(err, "Failed to set failure comment on Slurm job, proceeding with job cancellation")
+			}
 		}
 	}
 
@@ -993,7 +1052,7 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 	if err := slurmClient.Delete(deleteCtx, jobInfo); err != nil {
 		return fmt.Errorf("failed to cancel Slurm job: %w", err)
 	}
-	logger.Info("Cancelled Slurm job", "reason", comment)
+	logger.Info("Cancelled Slurm job", "reason", reason)
 
 	return nil
 }
