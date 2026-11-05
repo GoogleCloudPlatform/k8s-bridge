@@ -41,13 +41,16 @@ const (
 	// Reason constants for job synchronization.
 	ReasonJobSetCreated    = "jobset_created"
 	ReasonTranslationError = "translation_error"
-	ReasonJobSetCompleted  = "jobset_completed"
-	ReasonJobSetFailed     = "jobset_failed"
-	ReasonSlurmUpdateError = "slurm_update_error"
-	ReasonJobCompleted     = "job_completed"
-	ReasonJobFailed        = "job_failed"
-	ReasonJobCancelled     = "job_cancelled"
-	ReasonJobOrphaned      = "job_orphaned"
+	// ReasonJobSetAdmissionRejected is recorded when the API server or an admission webhook
+	// (for example Kueue's JobSet validating webhook) permanently rejects JobSet creation.
+	ReasonJobSetAdmissionRejected = "jobset_admission_rejected"
+	ReasonJobSetCompleted         = "jobset_completed"
+	ReasonJobSetFailed            = "jobset_failed"
+	ReasonSlurmUpdateError        = "slurm_update_error"
+	ReasonJobCompleted            = "job_completed"
+	ReasonJobFailed               = "job_failed"
+	ReasonJobCancelled            = "job_cancelled"
+	ReasonJobOrphaned             = "job_orphaned"
 )
 
 var (

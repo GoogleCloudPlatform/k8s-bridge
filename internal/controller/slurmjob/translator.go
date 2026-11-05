@@ -177,6 +177,12 @@ func (t *JobSetTranslator) Translate(
 		return nil, nil // Skip
 	}
 
+	// 1a. Parse PodTemplate annotations passed via Slurm --extra
+	extraAnnotations, err := parseExtraAnnotations(ptr.Deref(job.Extra, ""))
+	if err != nil {
+		return nil, fmt.Errorf("invalid --extra: %w", err)
+	}
+
 	// 2. Resolve Replicas (requested node count)
 	replicas, err := resolveReplicas(job)
 	if err != nil {
@@ -206,6 +212,10 @@ func (t *JobSetTranslator) Translate(
 		applyPodTemplateOverrides(&podTemplate, jobIDStr, sanitizedJobName, resources, gresInfo.NodeSelectors)
 	} else {
 		podTemplate = buildPodTemplate(jobIDStr, sanitizedJobName, resources, gresInfo.NodeSelectors)
+	}
+
+	if err := applyExtraAnnotations(&podTemplate.ObjectMeta, extraAnnotations); err != nil {
+		return nil, fmt.Errorf("invalid PodTemplate annotations: %w", err)
 	}
 
 	if err := injectSlurmVolumes(&podTemplate.Spec, controller); err != nil {

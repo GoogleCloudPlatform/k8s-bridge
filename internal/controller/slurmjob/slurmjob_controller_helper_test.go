@@ -161,6 +161,16 @@ func (b *testJobBuilder) withTranslatedJobMarkers() *testJobBuilder {
 		withComment(fmt.Sprintf("Unheld by k8s-bridge: Kubernetes resource slurm-job-%d created successfully", jobID))
 }
 
+// withAutoHold sets the state that hack/job_submit.lua gives a job submitted to a WorkloadMixing
+// partition: pending, held with priority 0 (StateReason JobHeldUser), and the AutoHoldMarker comment.
+func (b *testJobBuilder) withAutoHold() *testJobBuilder {
+	return b.
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		withStateReason(ReasonJobHeldUser).
+		withComment(AutoHoldMarker)
+}
+
 func newReconTestJob() *testJobBuilder {
 	return newEmptyTestJob().withDefaultReconFields()
 }
