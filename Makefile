@@ -107,21 +107,51 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 KIND_CLUSTER ?= k8s-bridge-test-e2e
 KIND_NODE_IMAGE ?= kindest/node:v1.32.2
 KIND_CONFIG ?= test/e2e/testdata/kind-config.yaml
+# When KIND_KUBECONFIG is set, kind writes the cluster credentials to this file
+# instead of ~/.kube/config, and the current context of ~/.kube/config stays as it is.
+# The e2e tests then read the file through KUBECONFIG.
+KIND_KUBECONFIG ?=
+kind_kubeconfig_flag = $(if $(KIND_KUBECONFIG),--kubeconfig $(KIND_KUBECONFIG))
+
+# The resilience e2e suite stops components while jobs run, so it runs on its own
+# Kind cluster. Its cluster name must not contain KIND_CLUSTER.
+KIND_CLUSTER_RESILIENCE ?= k8s-bridge-e2e-resilience
+KIND_KUBECONFIG_RESILIENCE ?= $(LOCALBIN)/kubeconfig-$(KIND_CLUSTER_RESILIENCE)
+RESILIENCE_TEST_TIMEOUT ?= 40m
 
 .PHONY: setup-test-e2e
 setup-test-e2e: kind ## Set up a Kind cluster for e2e tests if it does not exist
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)' with image $(KIND_NODE_IMAGE)..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) --image=$(KIND_NODE_IMAGE) --config=$(KIND_CONFIG) ;; \
-	esac
+	@if $(KIND) get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)"; then \
+		echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation."; \
+		$(if $(KIND_KUBECONFIG),$(KIND) export kubeconfig --name $(KIND_CLUSTER) $(kind_kubeconfig_flag);) \
+	else \
+		echo "Creating Kind cluster '$(KIND_CLUSTER)' with image $(KIND_NODE_IMAGE)..."; \
+		$(KIND) create cluster --name $(KIND_CLUSTER) --image=$(KIND_NODE_IMAGE) --config=$(KIND_CONFIG) $(kind_kubeconfig_flag); \
+	fi
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 20m
+	$(if $(KIND_KUBECONFIG),KUBECONFIG=$(KIND_KUBECONFIG)) KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 20m
 	$(MAKE) cleanup-test-e2e
+
+.PHONY: run-test-e2e-resilience
+run-test-e2e-resilience: ## Run the resilience e2e tests against the existing resilience Kind cluster
+	KUBECONFIG=$(KIND_KUBECONFIG_RESILIENCE) KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER_RESILIENCE) \
+		go test -tags=e2e ./test/e2e/resilience/ -v -ginkgo.v -timeout $(RESILIENCE_TEST_TIMEOUT)
+
+# The recipe calls setup-test-e2e and cleanup-test-e2e recursively instead of as
+# prerequisites. With make -j2 test-e2e test-e2e-resilience, a shared prerequisite
+# would run only once, with the variables of only one suite. The cleanup also runs
+# when the suite fails, and the recipe then exits with the status of the suite.
+.PHONY: test-e2e-resilience
+test-e2e-resilience: manifests generate fmt vet ## Run the controller failure e2e tests on a dedicated Kind cluster.
+	@status=0; \
+	$(MAKE) setup-test-e2e KIND_CLUSTER=$(KIND_CLUSTER_RESILIENCE) KIND_KUBECONFIG=$(KIND_KUBECONFIG_RESILIENCE) || status=$$?; \
+	if [ $$status -eq 0 ]; then \
+		$(MAKE) run-test-e2e-resilience || status=$$?; \
+	fi; \
+	$(MAKE) cleanup-test-e2e KIND_CLUSTER=$(KIND_CLUSTER_RESILIENCE) KIND_KUBECONFIG=$(KIND_KUBECONFIG_RESILIENCE); \
+	exit $$status
 
 .PHONY: update-e2e-deps
 update-e2e-deps: ## Vendor the pinned cert-manager/JobSet/Kueue manifests used by the e2e suites.
@@ -129,7 +159,7 @@ update-e2e-deps: ## Vendor the pinned cert-manager/JobSet/Kueue manifests used b
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: kind ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	@$(KIND) delete cluster --name $(KIND_CLUSTER) $(kind_kubeconfig_flag)
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

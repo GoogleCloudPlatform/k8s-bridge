@@ -64,3 +64,38 @@ jobs:
           IMAGES=$( (echo "curlimages/curl:8.16.0"; grep -hEo 'image:[[:space:]]*["'\'']?[^"'\''[:space:]]+["'\'']?' test/e2e/testdata/third_party/*.yaml | sed -E 's/^image:[[:space:]]*["'\'']?([^"'\''[:space:]]+)["'\'']?$/\1/' | grep -v '@') | sort -u )
           # LINT.ThenChange(test/utils/utils.go:curl_image)
           docker save -o /tmp/docker-cache/third-party.tar ${IMAGES}
+
+  # The resilience suite stops components while jobs run. It runs on its own runner
+  # and Kind cluster, in parallel with the test-e2e job.
+  test-e2e-resilience:
+    permissions:
+      contents: read
+    name: E2E Resilience Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # Only the test-e2e job saves this cache, so that the two jobs do not race for it.
+      - name: Restore third-party Docker images
+        id: cache-third-party-images
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/docker-cache
+          key: e2e-third-party-images-${{ runner.os }}-${{ hashFiles('test/e2e/testdata/third_party/**', 'test/utils/utils.go') }}
+
+      - name: Load cached third-party Docker images
+        if: steps.cache-third-party-images.outputs.cache-hit == 'true'
+        run: |
+          docker load -i /tmp/docker-cache/third-party.tar
+          rm -f /tmp/docker-cache/third-party.tar
+
+      - name: Running resilience e2e tests
+        run: make test-e2e-resilience
