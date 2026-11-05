@@ -61,16 +61,15 @@ import (
 const (
 	KindWorkloadMixing = "WorkloadMixing"
 
-	ReasonJobSetCompleted = "JobSet completed"
+	ReasonJobSetCompleted = "JobSet completed before the Slurm job finished"
 	ReasonJobSetFailed    = "JobSet failed"
 	ReasonJobSetMissing   = "JobSet missing"
 
-	// UnheldCommentPrefix, CancelledCommentPrefix and CompletedCommentPrefix start the k8s-bridge
-	// status that buildJobComment adds to a Slurm job comment. A comment holds at most one status,
-	// which describes the current state of the job.
+	// UnheldCommentPrefix and CancelledCommentPrefix start the k8s-bridge status that
+	// buildJobComment adds to a Slurm job comment. A comment holds at most one status, which
+	// describes the current state of the job.
 	UnheldCommentPrefix    = "Unheld by k8s-bridge:"
 	CancelledCommentPrefix = "Cancelled by k8s-bridge:"
-	CompletedCommentPrefix = "Completed by k8s-bridge:"
 
 	admissionRejectedCommentPrefix = "JobSet admission rejected: "
 	admissionWebhookMarker         = "admission webhook"
@@ -86,7 +85,7 @@ const (
 )
 
 // k8sBridgeStatusPrefixes lists the prefixes of every status that k8s-bridge writes to a Slurm job comment.
-var k8sBridgeStatusPrefixes = []string{UnheldCommentPrefix, CancelledCommentPrefix, CompletedCommentPrefix}
+var k8sBridgeStatusPrefixes = []string{UnheldCommentPrefix, CancelledCommentPrefix}
 
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
 type SlurmJobReconciler struct {
@@ -653,7 +652,7 @@ func (r *SlurmJobReconciler) handleMissingJobSet(
 	partition string,
 ) (ReconciliationStatus, ctrl.Result, error) {
 	log.FromContext(ctx).Info("JobSet missing for active Slurm job, cancelling job", "jobSet", jobSetNameForJobID(jobID), "partition", partition)
-	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, ReasonJobSetMissing); err != nil {
+	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, ReasonJobSetMissing); err != nil {
 		return ReconciliationDone, ctrl.Result{}, err
 	}
 	if partition != "" {
@@ -695,11 +694,7 @@ func (r *SlurmJobReconciler) handleTerminalJobSet(
 ) (ReconciliationStatus, ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Handling terminal JobSet for Slurm job", "jobSet", existingJS.Name, "partition", partition, "reason", reason)
-	statusPrefix := CancelledCommentPrefix
-	if reason == ReasonJobSetCompleted {
-		statusPrefix = CompletedCommentPrefix
-	}
-	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, statusPrefix, reason); cancelErr != nil {
+	if cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, reason); cancelErr != nil {
 		return ReconciliationDone, ctrl.Result{}, cancelErr
 	}
 	if err := finalizeJobSet(ctx, r.Client, slurmClient, existingJS, r.getSlurmCallTimeout()); err != nil {
@@ -821,7 +816,7 @@ func (r *SlurmJobReconciler) newJobCheckMultiPartition(ctx context.Context, wm *
 				r.Recorder.Eventf(wm, corev1.EventTypeWarning, "JobTranslationFailed", "Multi-partition jobs with multiple mapped partitions are not supported: %s", partition)
 			}
 
-			if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, "Multi-partition jobs with multiple mapped partitions are not supported"); err != nil {
+			if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, "Multi-partition jobs with multiple mapped partitions are not supported"); err != nil {
 				return ReconciliationDone, err
 			}
 			return ReconciliationDone, nil
@@ -863,7 +858,7 @@ func (r *SlurmJobReconciler) translateSlurmJobToJobset(ctx context.Context, wm *
 			r.Recorder.Eventf(wm, corev1.EventTypeWarning, "JobTranslationFailed", "Failed to translate Slurm job %s: %v", jobID, err)
 		}
 
-		cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, fmt.Sprintf("Translation failed: %v", err))
+		cancelErr := r.cancelJobWithComment(ctx, slurmClient, jobInfo, fmt.Sprintf("Translation failed: %v", err))
 		if cancelErr != nil {
 			return nil, ReconciliationDone, fmt.Errorf("failed to cancel job after translation failure: %w (translation error: %v)", cancelErr, err)
 		}
@@ -953,7 +948,7 @@ func (r *SlurmJobReconciler) handleJobSetAdmissionRejection(
 	}
 
 	comment := admissionRejectedCommentPrefix + msg
-	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, CancelledCommentPrefix, comment); err != nil {
+	if err := r.cancelJobWithComment(ctx, slurmClient, jobInfo, comment); err != nil {
 		return fmt.Errorf("failed to cancel job after JobSet admission rejection: %w (rejection: %v)", err, createErr)
 	}
 	return nil
@@ -1008,10 +1003,10 @@ func buildJobComment(current, status string) string {
 	return userComment + commentSeparator + status + markerSuffix
 }
 
-// cancelJobWithComment sets the k8s-bridge status of a Slurm job to statusPrefix followed by reason,
-// then cancels the job. It is safe to call again after a failure: an auto-held job keeps its
+// cancelJobWithComment sets the k8s-bridge status of a Slurm job to CancelledCommentPrefix followed
+// by reason, then cancels the job. It is safe to call again after a failure: an auto-held job keeps its
 // AutoHoldMarker, so the next reconcile still treats it as auto-held and retries the cancellation.
-func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, statusPrefix, reason string) error {
+func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, reason string) error {
 	if jobInfo == nil {
 		return nil
 	}
@@ -1024,7 +1019,7 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 
 	// 1. Set the k8s-bridge status in the Slurm job comment, unless a previous attempt already did.
 	currentComment := ptr.Deref(jobInfo.Comment, "")
-	status := statusPrefix + " " + reason
+	status := CancelledCommentPrefix + " " + reason
 	comment := buildJobComment(currentComment, status)
 	if !strings.Contains(comment, status) {
 		logger.Info("Truncated Slurm job comment to fit Slurm's limit",

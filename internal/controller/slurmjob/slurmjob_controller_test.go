@@ -1104,8 +1104,8 @@ func TestReconcile_JobSetCompleted(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	// The Completed status replaces the Unheld status rather than being appended to it.
-	env.verifySlurmCancellation(CompletedCommentPrefix + " " + ReasonJobSetCompleted)
+	// The Cancelled status replaces the Unheld status rather than being appended to it.
+	env.verifySlurmCancellation(CancelledCommentPrefix + " " + ReasonJobSetCompleted)
 	if got := env.updatedComment(0); strings.Contains(got, UnheldCommentPrefix) {
 		t.Errorf("Comment = %q, want the %q status replaced", got, UnheldCommentPrefix)
 	}
@@ -1233,7 +1233,7 @@ func TestCancelJobWithComment_Idempotent(t *testing.T) {
 
 			r := &SlurmJobReconciler{}
 
-			err := r.cancelJobWithComment(context.Background(), mockSlurm, jobInfo, CancelledCommentPrefix, "test comment")
+			err := r.cancelJobWithComment(context.Background(), mockSlurm, jobInfo, "test comment")
 			if err != nil {
 				t.Errorf("Expected nil error for terminal job, got %v", err)
 			}
@@ -1284,7 +1284,7 @@ func TestCancelJobWithComment_PartConfigUnavailable422_DoesNotLogError(t *testin
 			testLogger := zap.New(zap.WriteTo(&buf), zap.UseDevMode(true))
 			ctx := logf.IntoContext(context.Background(), testLogger)
 
-			err := env.reconciler.cancelJobWithComment(ctx, env.mockSlurm, jobInfo, CompletedCommentPrefix, ReasonJobSetCompleted)
+			err := env.reconciler.cancelJobWithComment(ctx, env.mockSlurm, jobInfo, ReasonJobSetCompleted)
 			if err != nil {
 				t.Fatalf("Expected nil error from cancelJobWithComment, got %v", err)
 			}

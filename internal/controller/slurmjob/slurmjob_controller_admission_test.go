@@ -168,7 +168,7 @@ func TestBuildJobComment(t *testing.T) {
 		{name: "user comment is kept", current: "my run", status: cancelled, want: "my run, " + cancelled},
 		{name: "marker alone is kept", current: AutoHoldMarker, status: cancelled, want: cancelled + marker},
 		{name: "user comment and marker are kept", current: "my run, " + AutoHoldMarker, status: cancelled, want: "my run, " + cancelled + marker},
-		{name: "unheld status is replaced", current: "my run, " + unheld, status: CompletedCommentPrefix + " " + ReasonJobSetCompleted, want: "my run, " + CompletedCommentPrefix + " " + ReasonJobSetCompleted},
+		{name: "unheld status is replaced", current: "my run, " + unheld, status: CancelledCommentPrefix + " " + ReasonJobSetCompleted, want: "my run, " + CancelledCommentPrefix + " " + ReasonJobSetCompleted},
 		{name: "unheld status alone is replaced", current: unheld, status: cancelled, want: cancelled},
 		{name: "cancelled status is replaced by a newer one", current: "my run, " + CancelledCommentPrefix + " old reason" + marker, status: cancelled, want: "my run, " + cancelled + marker},
 		{name: "repeated call is a no-op", current: "my run, " + cancelled + marker, status: cancelled, want: "my run, " + cancelled + marker},
