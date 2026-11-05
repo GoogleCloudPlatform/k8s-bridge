@@ -1283,6 +1283,198 @@ func TestPoll_OrphanedJobSet_PrunesDeletedJobSetsFromTracking(t *testing.T) {
 	}
 }
 
+// newOwnedJobSet returns a JobSet for Slurm job jobID that the test WorkloadMixing owns.
+func newOwnedJobSet(jobID string) *jobsetv1alpha2.JobSet {
+	return newTestJobSet("slurm-job-" + jobID).
+		withNamespace(testNamespace).
+		withLabels(map[string]string{
+			LabelSlurmJobID:     jobID,
+			LabelSlurmPartition: testPartitionName,
+		}).
+		withOwnerReference(metav1.OwnerReference{
+			APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+			Kind:       KindWorkloadMixing,
+			Name:       testWMName,
+			UID:        testWMUID,
+		}).
+		build()
+}
+
+// expectNoTeardownEvent fails the test if the poller sent a teardown event.
+func expectNoTeardownEvent(t *testing.T, teardownChan <-chan slurmtypes.SlurmJobTeardownEvent, step string) {
+	t.Helper()
+	select {
+	case ev := <-teardownChan:
+		t.Fatalf("%s: expected no teardown event, got: %v", step, ev)
+	default:
+	}
+}
+
+// TestPoll_OrphanedJobSet_SlurmUnavailable_NoTeardown checks that the poller does not tear down
+// a JobSet when it cannot read the Slurm job list. If the poller used an empty job list instead,
+// a Slurm outage would tear down all running workloads. When Slurm answers again and the job is
+// still missing, the poller tears down the JobSet at once: two successful polls that are more than
+// the grace period apart did not find the job.
+func TestPoll_OrphanedJobSet_SlurmUnavailable_NoTeardown(t *testing.T) {
+	tests := []struct {
+		name            string
+		makeUnavailable func(ctx context.Context, cMap *clientmap.ClientMap, key types.NamespacedName)
+	}{
+		{
+			name: "Slurm job list fails",
+			makeUnavailable: func(ctx context.Context, cMap *clientmap.ClientMap, key types.NamespacedName) {
+				cMap.Add(ctx, key, &errorClient{})
+			},
+		},
+		{
+			name: "Slurm client not ready",
+			makeUnavailable: func(_ context.Context, cMap *clientmap.ClientMap, key types.NamespacedName) {
+				cMap.Remove(key)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			_ = k8sbridgev1alpha1.AddToScheme(scheme)
+			_ = jobsetv1alpha2.AddToScheme(scheme)
+
+			now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+			wm.UID = testWMUID
+
+			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, newOwnedJobSet("210")).Build()
+			cMap := clientmap.NewClientMap()
+			controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+			cMap.Add(ctx, controllerKey, &utils.SlurmClient{})
+
+			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+			currentTime := now
+			poller := &SlurmPoller{
+				Client:            fakeK8sClient,
+				ClientMap:         cMap,
+				TeardownEvents:    teardownChan,
+				PollInterval:      10 * time.Second,
+				OrphanGracePeriod: 1 * time.Minute,
+				nowFn:             func() time.Time { return currentTime },
+			}
+
+			// Poll cycle 1: Slurm answers without job 210, so the grace period starts.
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll cycle 1 failed: %v", err)
+			}
+			expectNoTeardownEvent(t, teardownChan, "Poll cycle 1")
+
+			// Poll cycle 2: the grace period is over, but Slurm is unavailable. The poller
+			// cannot confirm that job 210 is still missing, so it must keep the JobSet.
+			tc.makeUnavailable(ctx, cMap, controllerKey)
+			currentTime = now.Add(70 * time.Second)
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll cycle 2 failed: %v", err)
+			}
+			expectNoTeardownEvent(t, teardownChan, "Poll cycle 2")
+
+			// Poll cycle 3: Slurm answers again, and job 210 is still missing. This also proves
+			// that poll cycle 1 started the grace period, so poll cycle 2 checked a real case.
+			cMap.Add(ctx, controllerKey, &utils.SlurmClient{})
+			currentTime = now.Add(80 * time.Second)
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll cycle 3 failed: %v", err)
+			}
+			select {
+			case ev := <-teardownChan:
+				if ev.JobID != "210" {
+					t.Errorf("Expected JobID 210, got %s", ev.JobID)
+				}
+			default:
+				t.Fatal("Expected teardown event when Slurm answers again without job 210, got none")
+			}
+		})
+	}
+}
+
+// TestPoll_OrphanedJobSet_SlurmOutage_GracePeriodStartsAfterRecovery checks that a Slurm outage
+// does not start the orphan grace period, also when the outage is longer than the grace period.
+// The job is in Slurm before the outage, so the grace period starts at the first successful poll
+// after the outage that does not find the job.
+func TestPoll_OrphanedJobSet_SlurmOutage_GracePeriodStartsAfterRecovery(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+	wm.UID = testWMUID
+
+	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm, newOwnedJobSet("211")).Build()
+	cMap := clientmap.NewClientMap()
+	mockSlurm := &utils.SlurmClient{}
+	mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{newRunningJob(211, testPartitionName)})
+	controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+	cMap.Add(ctx, controllerKey, mockSlurm)
+
+	teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+	currentTime := now
+	poller := &SlurmPoller{
+		Client:            fakeK8sClient,
+		ClientMap:         cMap,
+		TeardownEvents:    teardownChan,
+		PollInterval:      10 * time.Second,
+		OrphanGracePeriod: 1 * time.Minute,
+		nowFn:             func() time.Time { return currentTime },
+	}
+
+	// Poll cycle 1: job 211 runs in Slurm.
+	if err := poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll cycle 1 failed: %v", err)
+	}
+	expectNoTeardownEvent(t, teardownChan, "Poll cycle 1")
+
+	// Poll cycles 2 to 4: Slurm is unavailable for 3 minutes, which is 3 times the grace period.
+	cMap.Add(ctx, controllerKey, &errorClient{})
+	for _, elapsed := range []time.Duration{10 * time.Second, 70 * time.Second, 3 * time.Minute} {
+		currentTime = now.Add(elapsed)
+		if err := poller.Poll(ctx); err != nil {
+			t.Fatalf("Poll at %s failed: %v", elapsed, err)
+		}
+		expectNoTeardownEvent(t, teardownChan, fmt.Sprintf("Poll at %s with Slurm unavailable", elapsed))
+	}
+
+	// Poll cycle 5: Slurm is available again, but job 211 is gone, for example because slurmctld
+	// lost its state. This poll is the first one that does not find the job, so the grace period
+	// starts now.
+	mockSlurm.SetPendingJobs(testPartitionName, nil)
+	cMap.Add(ctx, controllerKey, mockSlurm)
+	recovery := now.Add(3*time.Minute + 10*time.Second)
+	currentTime = recovery
+	if err := poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll cycle 5 failed: %v", err)
+	}
+	expectNoTeardownEvent(t, teardownChan, "Poll cycle 5")
+
+	// Poll cycle 6: the grace period that started at recovery is over.
+	currentTime = recovery.Add(70 * time.Second)
+	if err := poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll cycle 6 failed: %v", err)
+	}
+	select {
+	case ev := <-teardownChan:
+		if ev.JobID != "211" {
+			t.Errorf("Expected JobID 211, got %s", ev.JobID)
+		}
+		if ev.Reason != metrics.ReasonJobOrphaned {
+			t.Errorf("Expected reason %s, got %s", metrics.ReasonJobOrphaned, ev.Reason)
+		}
+	default:
+		t.Fatal("Expected teardown event after the grace period that started at recovery, got none")
+	}
+}
+
 func TestShouldEmitAdmissionEvent(t *testing.T) {
 	const jobID int32 = 301
 	const jobSetName = "slurm-job-301"
