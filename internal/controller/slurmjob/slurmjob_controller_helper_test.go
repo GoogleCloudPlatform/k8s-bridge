@@ -525,7 +525,7 @@ func (e *reconcileTestEnv) verifySlurmCancellation(wantCommentSubstr string) {
 	}
 }
 
-// firstUpdatedComment returns the comment set by the first Slurm job update, failing the test if there is none.
+// firstUpdatedComment returns the comment set by the first Slurm job update.
 func (e *reconcileTestEnv) firstUpdatedComment() string {
 	e.t.Helper()
 	updates := e.mockSlurm.GetUpdatedJobs()

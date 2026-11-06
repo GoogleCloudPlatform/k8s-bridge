@@ -65,9 +65,7 @@ const (
 	ReasonJobSetFailed    = "JobSet failed"
 	ReasonJobSetMissing   = "JobSet missing"
 
-	// UnheldCommentPrefix and CancelledCommentPrefix start the k8s-bridge status that
-	// buildJobComment adds to a Slurm job comment. A comment holds at most one status, which
-	// describes the current state of the job.
+	// Prefixes of the k8s-bridge status in a Slurm job comment. A comment has at most one status.
 	UnheldCommentPrefix    = "Unheld by k8s-bridge:"
 	CancelledCommentPrefix = "Cancelled by k8s-bridge:"
 
@@ -78,13 +76,12 @@ const (
 	// submission and update.
 	maxSlurmCommentLength  = 1024
 	truncatedCommentSuffix = "..."
-	// minStatusBudget is the room, in bytes, that buildJobComment keeps for a long k8s-bridge status
-	// when it does not fit next to the user's comment. A shorter status is used as is.
+	// minStatusBudget is the minimum room, in bytes, kept for a long status next to the user's comment.
 	minStatusBudget  = 512
 	commentSeparator = ", "
 )
 
-// k8sBridgeStatusPrefixes lists the prefixes of every status that k8s-bridge writes to a Slurm job comment.
+// k8sBridgeStatusPrefixes lists all k8s-bridge status prefixes.
 var k8sBridgeStatusPrefixes = []string{UnheldCommentPrefix, CancelledCommentPrefix}
 
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
@@ -954,8 +951,8 @@ func (r *SlurmJobReconciler) handleJobSetAdmissionRejection(
 	return nil
 }
 
-// truncateComment shortens comment to at most maxLen bytes without splitting a UTF-8 character. A
-// shortened comment ends with truncatedCommentSuffix, unless maxLen is too small to hold it.
+// truncateComment shortens comment to at most maxLen bytes, ending it with truncatedCommentSuffix
+// if it fits, without splitting a UTF-8 character.
 func truncateComment(comment string, maxLen int) string {
 	maxLen = max(maxLen, 0)
 	if len(comment) <= maxLen {
@@ -972,13 +969,12 @@ func truncateComment(comment string, maxLen int) string {
 	return comment[:cut] + suffix
 }
 
-// cancelledStatus returns the k8s-bridge status of a job that k8s-bridge cancelled for reason.
+// cancelledStatus returns the k8s-bridge status for a job cancelled for reason.
 func cancelledStatus(reason string) string {
 	return CancelledCommentPrefix + " " + reason
 }
 
-// userJobComment returns the part of a Slurm job comment that k8s-bridge does not own: the comment
-// without the AutoHoldMarker and without the k8s-bridge status, which starts at the first status prefix.
+// userJobComment returns comment without the AutoHoldMarker and the k8s-bridge status.
 func userJobComment(comment string) string {
 	comment = stripAutoHoldMarker(comment)
 	for _, prefix := range k8sBridgeStatusPrefixes {
@@ -989,13 +985,12 @@ func userJobComment(comment string) string {
 	return strings.TrimSpace(strings.TrimRight(strings.TrimSpace(comment), ","))
 }
 
-// buildJobComment returns the Slurm job comment that sets the k8s-bridge status of a job to status,
-// and whether any part of it had to be truncated. It keeps the user's own comment from current and
-// replaces any previous k8s-bridge status. If keepAutoHoldMarker is true and current has the
-// AutoHoldMarker, the marker is kept, so a job that is still auto-held stays recognizable as such;
-// otherwise it is removed. The result is stable when applied again to
-// its own output and never exceeds maxSlurmCommentLength bytes: the marker is never cut, a long
-// status is cut to no less than minStatusBudget bytes, and the user's comment is truncated first.
+// buildJobComment updates a Slurm job comment with a k8s-bridge status (Unheld or Cancelled)
+// and reports whether any text was truncated. It guarantees that:
+//   - the user's comment is kept, and is truncated before the status if needed,
+//   - an existing AutoHoldMarker is kept if keepAutoHoldMarker is true, and is never truncated,
+//   - at most one k8s-bridge status is present, replacing any earlier one,
+//   - the result fits in maxSlurmCommentLength and is unchanged when applied again.
 func buildJobComment(current, status string, keepAutoHoldMarker bool) (comment string, truncated bool) {
 	markerSuffix := ""
 	if keepAutoHoldMarker && hasAutoHoldMarker(current) {
@@ -1012,15 +1007,14 @@ func buildJobComment(current, status string, keepAutoHoldMarker bool) (comment s
 	budget -= len(commentSeparator)
 	cutStatus := truncateComment(status, max(minStatusBudget, budget-len(userComment)))
 	cutUser := truncateComment(userComment, budget-len(cutStatus))
-	// Cutting the user's comment can free a byte or two when the cut backs off a multi-byte
-	// character. Give them back to the status, so that the result is stable on its own output.
+	// A multi-byte cut of the user's comment may free a byte or two; give them to the status
+	// so that the result is unchanged when applied again.
 	cutStatus = truncateComment(status, budget-len(cutUser))
 	return cutUser + commentSeparator + cutStatus + markerSuffix, cutUser != userComment || cutStatus != status
 }
 
-// cancelJobWithComment sets the k8s-bridge status of a Slurm job to CancelledCommentPrefix followed
-// by reason, then cancels the job. It is safe to call again after a failure: an auto-held job keeps its
-// AutoHoldMarker, so the next reconcile still treats it as auto-held and retries the cancellation.
+// cancelJobWithComment sets the Cancelled status for reason and cancels the job. It keeps the
+// AutoHoldMarker, so a failed cancellation is retried on the next reconcile.
 func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClient slurmclient.Client, jobInfo *slurmclienttypes.V0044JobInfo, reason string) error {
 	if jobInfo == nil {
 		return nil
@@ -1032,7 +1026,7 @@ func (r *SlurmJobReconciler) cancelJobWithComment(ctx context.Context, slurmClie
 		return nil
 	}
 
-	// 1. Set the k8s-bridge status in the Slurm job comment, unless a previous attempt already did.
+	// 1. Set the status in the Slurm job comment, unless it is already set.
 	currentComment := ptr.Deref(jobInfo.Comment, "")
 	comment, truncated := buildJobComment(currentComment, cancelledStatus(reason), true)
 	if comment != currentComment {

@@ -1104,7 +1104,7 @@ func TestReconcile_JobSetCompleted(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	// The Cancelled status replaces the Unheld status rather than being appended to it.
+	// The Cancelled status replaces the Unheld status.
 	env.verifySlurmCancellation(cancelledStatus(ReasonJobSetCompleted))
 	if got := env.firstUpdatedComment(); strings.Contains(got, UnheldCommentPrefix) {
 		t.Errorf("Comment = %q, want the %q status replaced", got, UnheldCommentPrefix)
@@ -1524,9 +1524,8 @@ func TestReconcile_ReleaseHold_IdempotentCommentAndConstraints(t *testing.T) {
 	}
 }
 
-// TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus covers a job whose earlier cancellation
-// failed and which translates successfully on a later reconcile (for example after the
-// WorkloadMixing was fixed): the Unheld status replaces the stale Cancelled status.
+// TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus checks that the Unheld status replaces a
+// Cancelled status left by an earlier failed cancellation.
 func TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus(t *testing.T) {
 	job := newReconTestJob().
 		withNodes(2).
@@ -1545,8 +1544,8 @@ func TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus(t *testing.T) {
 	}
 }
 
-// TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit checks that a user comment close to
-// Slurm's limit is truncated, rather than making the unhold update exceed it.
+// TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit checks that the unhold comment fits
+// Slurm's limit.
 func TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit(t *testing.T) {
 	userComment := strings.Repeat("u", maxSlurmCommentLength-len(commentSeparator+AutoHoldMarker))
 	job := newReconTestJob().

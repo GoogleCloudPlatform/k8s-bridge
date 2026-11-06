@@ -204,10 +204,9 @@ func TestBuildJobComment_FitsSlurmLimit(t *testing.T) {
 	longStatus := cancelledStatus(strings.Repeat("r", 2*maxSlurmCommentLength))
 	longUser := strings.Repeat("u", 2*maxSlurmCommentLength)
 	shortStatus := cancelledStatus("short")
-	// mediumStatus is 525 bytes: longer than minStatusBudget, short enough to be cut by only a few bytes.
+	// mediumStatus (525 bytes) is cut by only a few bytes.
 	mediumStatus := cancelledStatus(strings.Repeat("r", 500))
-	// multiByteStatus has its multi-byte characters at even offsets from 26, so a cut at an odd
-	// offset has to back off.
+	// multiByteStatus forces a cut at an odd offset to back off a multi-byte character.
 	multiByteStatus := cancelledStatus("x" + strings.Repeat("ł", maxSlurmCommentLength))
 	tests := []struct {
 		name    string
@@ -268,8 +267,7 @@ func TestBuildJobComment_FitsSlurmLimit(t *testing.T) {
 	}
 }
 
-// TestBuildJobComment_StableWithinLimit checks the invariants of buildJobComment over many
-// combinations of user comment and status lengths and character widths.
+// TestBuildJobComment_StableWithinLimit checks buildJobComment's guarantees over many input sizes.
 func TestBuildJobComment_StableWithinLimit(t *testing.T) {
 	for _, userChar := range []string{"u", "ż", "€"} {
 		for userLen := 0; userLen <= 700; userLen += 13 {
@@ -429,16 +427,15 @@ func TestReconcile_LongTranslationError_TruncatesComment(t *testing.T) {
 	}
 }
 
-// TestReconcile_FailedCancelOfAutoHeldJob_IsRetried checks that when cancelling an auto-held job
-// fails, the job keeps the AutoHoldMarker, so the next reconcile does not mistake it for a job held
-// by the user and retries the cancellation.
+// TestReconcile_FailedCancelOfAutoHeldJob_IsRetried checks that a failed cancellation of an
+// auto-held job is retried on the next reconcile.
 func TestReconcile_FailedCancelOfAutoHeldJob_IsRetried(t *testing.T) {
 	const testRetryWebhookDenial = `admission webhook "vjobset.kb.io" denied the request: invalid topology request`
 	const invalidExtraReason = `Translation failed: invalid --extra: "oops" is not in key=value format`
 	tests := []struct {
 		name  string
 		extra string
-		// opts are applied after the defaults: comment updates succeed and job cancellations fail.
+		// opts override the defaults: comment updates succeed, cancellations fail.
 		opts        []reconcileEnvOpt
 		wantReason  string
 		wantUpdates int
@@ -456,7 +453,7 @@ func TestReconcile_FailedCancelOfAutoHeldJob_IsRetried(t *testing.T) {
 			wantUpdates: 1,
 		},
 		{
-			// The comment update fails without being applied, so the retry sends it again.
+			// The failed comment update is sent again on retry.
 			name:        "translation failed and the comment update failed too",
 			extra:       "oops",
 			opts:        []reconcileEnvOpt{withSlurmUpdateError(errors.New("connection reset by peer"), false)},
