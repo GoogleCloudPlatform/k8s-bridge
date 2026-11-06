@@ -24,8 +24,8 @@ Before writing or running unit/`envtest` tests and linters, inspect the existing
 ## 2. Guardrails
 
 - **Select the Slurm client mock for the target component:**
-  1. Use `&utils.SlurmClient{}` (inspect `test/utils/slurmmock.go` for supported job/node state and error-injection fields) when testing `SlurmPoller`, `SlurmJobReconciler`, or `JobTeardownReconciler`. It does **not** implement controller ping or inject `List` / job-`Delete` errors.
-  2. Use `slurmclientfake.NewClientBuilder().WithInterceptorFuncs(...).Build()` (`github.com/SlinkyProject/slurm-client/pkg/client/fake`) when testing controller ping in `SlurmClientReconciler` or custom `List`/job-`Delete` error interceptors.
+  1. Use `&utils.SlurmClient{}` (inspect `test/utils/slurmmock.go` for supported job/node state and error-injection fields) when testing `SlurmPoller`, `SlurmJobReconciler`, or `JobTeardownReconciler`. It does **not** implement controller ping or inject `List` errors.
+  2. Use `slurmclientfake.NewClientBuilder().WithInterceptorFuncs(...).Build()` (`github.com/SlinkyProject/slurm-client/pkg/client/fake`) when testing controller ping in `SlurmClientReconciler` or custom `List` error interceptors.
 - **Reuse the shared `slurmjob` test harness and builders:** Use the helpers in `internal/controller/slurmjob/slurmjob_controller_helper_test.go` and `translator_helper_test.go`.
 
 ---
