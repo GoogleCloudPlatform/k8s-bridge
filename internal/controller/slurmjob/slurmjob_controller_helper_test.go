@@ -263,6 +263,7 @@ type reconcileEnvConfig struct {
 	partition              string
 	slurmUpdateError       error
 	slurmMutateOnUpdate    bool
+	slurmDeleteJobError    error
 }
 
 func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
@@ -312,6 +313,12 @@ func withSlurmUpdateError(err error, mutateOnUpdate bool) reconcileEnvOpt {
 	}
 }
 
+func withSlurmDeleteError(err error) reconcileEnvOpt {
+	return func(c *reconcileEnvConfig) {
+		c.slurmDeleteJobError = err
+	}
+}
+
 func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEnv {
 	t.Helper()
 	var cfg reconcileEnvConfig
@@ -341,6 +348,7 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 	mockSlurm := &utils.SlurmClient{
 		UpdateError:    cfg.slurmUpdateError,
 		MutateOnUpdate: cfg.slurmMutateOnUpdate,
+		DeleteJobError: cfg.slurmDeleteJobError,
 	}
 	if len(cfg.pendingJobs) > 0 {
 		mockSlurm.SetPendingJobs(cfg.partition, cfg.pendingJobs)
@@ -503,18 +511,11 @@ func (e *reconcileTestEnv) verifySlurmCancellation(wantCommentSubstr string) {
 		if len(updatedJobs) != 1 {
 			e.t.Fatalf("Expected 1 job update for comment, got %d", len(updatedJobs))
 		}
-		update := updatedJobs[0]
-		if update.JobID != reconJobID {
-			e.t.Errorf("Expected update for job %d, got %d", reconJobID, update.JobID)
+		if updatedJobs[0].JobID != reconJobID {
+			e.t.Errorf("Expected update for job %d, got %d", reconJobID, updatedJobs[0].JobID)
 		}
-		reqMsg, ok := update.Req.(slurmapi.V0044JobDescMsg)
-		if !ok {
-			e.t.Fatalf("Expected update request to be V0044JobDescMsg, got %T", update.Req)
-		}
-		if reqMsg.Comment == nil {
-			e.t.Errorf("Expected comment to be set")
-		} else if !strings.Contains(*reqMsg.Comment, wantCommentSubstr) {
-			e.t.Errorf("Expected comment to contain %q, got %q", wantCommentSubstr, *reqMsg.Comment)
+		if comment := e.firstUpdatedComment(); !strings.Contains(comment, wantCommentSubstr) {
+			e.t.Errorf("Expected comment to contain %q, got %q", wantCommentSubstr, comment)
 		}
 	}
 
@@ -522,6 +523,20 @@ func (e *reconcileTestEnv) verifySlurmCancellation(wantCommentSubstr string) {
 	if len(deletedJobs) != 1 || deletedJobs[0] != reconJobID {
 		e.t.Errorf("Expected job %d to be deleted, got %v", reconJobID, deletedJobs)
 	}
+}
+
+// firstUpdatedComment returns the comment set by the first Slurm job update.
+func (e *reconcileTestEnv) firstUpdatedComment() string {
+	e.t.Helper()
+	updates := e.mockSlurm.GetUpdatedJobs()
+	if len(updates) == 0 {
+		e.t.Fatalf("Expected a Slurm job update, got none")
+	}
+	reqMsg, ok := updates[0].Req.(slurmapi.V0044JobDescMsg)
+	if !ok || reqMsg.Comment == nil {
+		e.t.Fatalf("Expected the first Slurm job update to set a comment, got %+v", updates[0].Req)
+	}
+	return *reqMsg.Comment
 }
 
 func (e *reconcileTestEnv) verifySlurmNodesDeleted(wantNodes ...string) {

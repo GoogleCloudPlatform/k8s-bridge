@@ -1091,6 +1091,7 @@ func TestReconcile_JobSetCompleted(t *testing.T) {
 	job := newReconTestJob().
 		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
 		withHold(true).
+		withTranslatedJobMarkers().
 		build()
 
 	env := newReconcileTestEnv(t,
@@ -1103,7 +1104,11 @@ func TestReconcile_JobSetCompleted(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifySlurmCancellation(ReasonJobSetCompleted)
+	// The Cancelled status replaces the Unheld status.
+	env.verifySlurmCancellation(cancelledStatus(ReasonJobSetCompleted))
+	if got := env.firstUpdatedComment(); strings.Contains(got, UnheldCommentPrefix) {
+		t.Errorf("Comment = %q, want the %q status replaced", got, UnheldCommentPrefix)
+	}
 	env.verifyJobSetNotFound()
 }
 
@@ -1127,7 +1132,7 @@ func TestReconcile_JobSetFailed(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifySlurmCancellation(ReasonJobSetFailed)
+	env.verifySlurmCancellation(cancelledStatus(ReasonJobSetFailed))
 	env.verifyJobSetNotFound()
 }
 
@@ -1286,7 +1291,7 @@ func TestCancelJobWithComment_PartConfigUnavailable422_DoesNotLogError(t *testin
 
 			env.verifySlurmCancellation(ReasonJobSetCompleted)
 
-			hasErrLog := strings.Contains(buf.String(), "Failed to set failure comment on Slurm job")
+			hasErrLog := strings.Contains(buf.String(), "Failed to set cancellation comment on Slurm job")
 			if hasErrLog != tc.wantErrorLog {
 				t.Errorf("Error log presence = %v, want %v (logs: %s)", hasErrLog, tc.wantErrorLog, buf.String())
 			}
@@ -1516,6 +1521,51 @@ func TestReconcile_ReleaseHold_IdempotentCommentAndConstraints(t *testing.T) {
 	}
 	if *reqMsg.Constraints != existingConstraints {
 		t.Errorf("Constraints = %q, want %q", *reqMsg.Constraints, existingConstraints)
+	}
+}
+
+// TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus checks that the Unheld status replaces a
+// Cancelled status left by an earlier failed cancellation.
+func TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus(t *testing.T) {
+	job := newReconTestJob().
+		withNodes(2).
+		withAutoHold().
+		withComment("user-comment, " + CancelledCommentPrefix + " Translation failed: missing GRES mapping, " + AutoHoldMarker).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	want := fmt.Sprintf("user-comment, %s Kubernetes resource slurm-job-%s created successfully", UnheldCommentPrefix, reconJobIDStr)
+	if got := env.firstUpdatedComment(); got != want {
+		t.Errorf("Comment = %q, want %q", got, want)
+	}
+}
+
+// TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit checks that the unhold comment fits
+// Slurm's limit.
+func TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit(t *testing.T) {
+	userComment := strings.Repeat("u", maxSlurmCommentLength-len(commentSeparator+AutoHoldMarker))
+	job := newReconTestJob().
+		withNodes(2).
+		withAutoHold().
+		withComment(userComment + commentSeparator + AutoHoldMarker).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	got := env.firstUpdatedComment()
+	if len(got) > maxSlurmCommentLength {
+		t.Errorf("len(Comment) = %d, want <= %d", len(got), maxSlurmCommentLength)
+	}
+	wantStatus := fmt.Sprintf("%s Kubernetes resource slurm-job-%s created successfully", UnheldCommentPrefix, reconJobIDStr)
+	if !strings.HasPrefix(got, "uuu") || !strings.HasSuffix(got, truncatedCommentSuffix+commentSeparator+wantStatus) {
+		t.Errorf("Comment = %q, want the truncated user comment followed by %q", got, wantStatus)
 	}
 }
 

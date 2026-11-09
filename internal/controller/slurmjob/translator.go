@@ -384,6 +384,11 @@ func isExplicitUserOrAdminHold(stateReason string) bool {
 	return stateReason == ReasonJobHeldUser || stateReason == ReasonJobHeldAdmin
 }
 
+// hasAutoHoldMarker reports whether comment has the AutoHoldMarker added by hack/job_submit.lua.
+func hasAutoHoldMarker(comment string) bool {
+	return strings.Contains(comment, AutoHoldMarker)
+}
+
 func isJobExplicitlyHeld(job *slurmclienttypes.V0044JobInfo) bool {
 	if job == nil {
 		return false
@@ -399,7 +404,7 @@ func isJobExplicitlyHeld(job *slurmclienttypes.V0044JobInfo) bool {
 		return true
 	}
 	if stateReason == ReasonJobHeldUser {
-		return !strings.Contains(ptr.Deref(job.Comment, ""), AutoHoldMarker)
+		return !hasAutoHoldMarker(ptr.Deref(job.Comment, ""))
 	}
 	return false
 }
