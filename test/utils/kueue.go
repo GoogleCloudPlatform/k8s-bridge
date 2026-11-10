@@ -30,10 +30,12 @@ type Workload struct {
 	Spec              WorkloadSpec `json:"spec"`
 }
 
+// WorkloadSpec is the subset of a Kueue Workload spec read by the e2e tests.
 type WorkloadSpec struct {
 	PodSets []WorkloadPodSet `json:"podSets"`
 }
 
+// WorkloadPodSet is the subset of a Kueue Workload PodSet read by the e2e tests.
 type WorkloadPodSet struct {
 	TopologyRequest *WorkloadTopologyRequest `json:"topologyRequest,omitempty"`
 }

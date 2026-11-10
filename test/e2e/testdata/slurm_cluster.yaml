@@ -42,7 +42,7 @@ data:
   gres.conf: |
     AutoDetect=nvidia
 ---
-# alpha_step_rank (Slurm 26.05+) makes SLURM_PROCID follow the slurmd pod's JobSet job index.
+# alpha_step_rank (Slurm 26.05+) sorts nodes by name, so SLURM_PROCID follows the JobSet job index.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -50,7 +50,7 @@ metadata:
   namespace: slurm
 data:
   topology.yaml: |
-    - topology: flat
+    - topology: k8s-bridge
       cluster_default: true
       flat:
         alpha_step_rank: true

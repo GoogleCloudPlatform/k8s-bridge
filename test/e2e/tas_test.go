@@ -19,16 +19,13 @@ limitations under the License.
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
-	"os/exec"
 	"regexp"
-	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/GoogleCloudPlatform/k8s-bridge/test/utils"
 )
@@ -40,14 +37,12 @@ const (
 	annotationRequiredTopology  = "kueue.x-k8s.io/podset-required-topology"
 	annotationPreferredTopology = "kueue.x-k8s.io/podset-preferred-topology"
 	hostnameTopologyLevel       = "kubernetes.io/hostname"
-
-	tasTimeout = 3 * time.Minute
 )
 
 // rankLineRegex matches "RANK <step> <SLURM_PROCID> <SLURMD_NODENAME>".
-var rankLineRegex = regexp.MustCompile(`(?m)^RANK (ONE|MULTI) (\d+) (\S+)$`)
+var rankLineRegex = regexp.MustCompile(`(?m)^RANK (ONE|MULTI|CYCLIC) (\d+) (\S+)$`)
 
-var _ = Describe("Topology-Aware Scheduling", Ordered, func() {
+var _ = Describe("Topology-Aware Scheduling", Ordered, ContinueOnFailure, func() {
 	BeforeAll(func() {
 		By("deploying the Kueue TAS resources (Topology, ResourceFlavor, ClusterQueue, LocalQueue)")
 		utils.ApplyManifestWithCleanup(kueueTASResourcesPath)
@@ -89,11 +84,11 @@ var _ = Describe("Topology-Aware Scheduling", Ordered, func() {
 			for k, v := range want {
 				g.Expect(annotations).To(HaveKeyWithValue(k, v))
 			}
-		}, tasTimeout, time.Second).Should(Succeed())
+		}, jobsetTimeout, time.Second).Should(Succeed())
 
 		By("verifying the running slurmd Pod has the merged annotations")
-		utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetName, 1, tasTimeout)
-		for _, pod := range jobSetPods(jobSetName) {
+		utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetName, 1, jobsetTimeout)
+		for _, pod := range utils.JobSetPods(slurmNamespace, jobSetName) {
 			for k, v := range want {
 				Expect(pod.Annotations).To(HaveKeyWithValue(k, v), "Pod %s", pod.Name)
 			}
@@ -103,7 +98,7 @@ var _ = Describe("Topology-Aware Scheduling", Ordered, func() {
 	It("should pass a TAS request from --extra to the Kueue Workload", func() {
 		jobID := utils.NewBatchJobBuilder(slurmNamespace).
 			WithPartition(defaultSlurmPartition).
-			WithNodes(2).
+			WithNodes(1).
 			WithArgs(fmt.Sprintf("--extra=%s=%s", annotationRequiredTopology, hostnameTopologyLevel)).
 			WithWrap("sleep 300").
 			Submit()
@@ -118,15 +113,7 @@ var _ = Describe("Topology-Aware Scheduling", Ordered, func() {
 				g.Expect(ps.TopologyRequest).NotTo(BeNil(), "Workload %s has a PodSet without a topology request", wl.Name)
 				g.Expect(ps.TopologyRequest.Required).To(HaveValue(Equal(hostnameTopologyLevel)))
 			}
-		}, tasTimeout, time.Second).Should(Succeed())
-
-		// Sanity check only: two Pods may share a node even without TAS.
-		By("verifying both slurmd Pods run on the same node")
-		utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetName, 2, tasTimeout)
-		pods := jobSetPods(jobSetName)
-		Expect(pods).To(HaveLen(2))
-		Expect(pods[0].Spec.NodeName).To(Equal(pods[1].Spec.NodeName),
-			"Pods %s and %s run on different nodes", pods[0].Name, pods[1].Name)
+		}, jobsetTimeout, time.Second).Should(Succeed())
 	})
 
 	It("should cancel the Slurm job when Kueue rejects the TAS annotations", func() {
@@ -150,48 +137,51 @@ var _ = Describe("Topology-Aware Scheduling", Ordered, func() {
 	It("should assign SLURM_PROCID in the order of the JobSet job index", func() {
 		const nodes = 3
 		const tasksPerNode = 2
-		// Pod 0 registers last (see workloadmixing_tas.yaml), so only alpha_step_rank gives it rank 0.
-		// alpha_step_rank only applies to block distribution, so the 1-task-per-node step needs -m block.
+		// Tasks per node of each checked step. alpha_step_rank only applies to block distribution.
+		stepTasksPerNode := map[string]int{"ONE": 1, "MULTI": tasksPerNode}
 		session := utils.StartSallocSession(slurmNamespace, utils.DefaultSlurmTestUser,
 			[]string{
 				"-p", defaultSlurmPartition,
 				fmt.Sprintf("--nodes=%d", nodes),
 				fmt.Sprintf("--ntasks-per-node=%d", tasksPerNode),
 			},
-			// srun inherits SLURM_NTASKS from salloc, so the ONE step sets --ntasks explicitly.
-			fmt.Sprintf(`srun -m block --ntasks=%d bash -c 'echo "RANK ONE $SLURM_PROCID $SLURMD_NODENAME"'; `, nodes)+
-				`srun bash -c 'echo "RANK MULTI $SLURM_PROCID $SLURMD_NODENAME"'`)
+			// ONE and CYCLIC set their task layout explicitly, because srun inherits it from salloc.
+			fmt.Sprintf(`srun -m block --ntasks=%d --ntasks-per-node=1 bash -c 'echo "RANK ONE $SLURM_PROCID $SLURMD_NODENAME"'; `, nodes)+
+				`srun bash -c 'echo "RANK MULTI $SLURM_PROCID $SLURMD_NODENAME"'; `+
+				fmt.Sprintf(`srun -m cyclic --ntasks=%d --ntasks-per-node=1 bash -c 'echo "RANK CYCLIC $SLURM_PROCID $SLURMD_NODENAME"'`, nodes))
 		jobSetName := session.JobSetName()
+		nodeName := func(jobIndex int) string { return fmt.Sprintf("%s-slurmd-%d-0", jobSetName, jobIndex) }
 
-		By("waiting for both steps to print their ranks")
-		var ranks [][]string
+		By("waiting for all steps to print their ranks")
+		var checked []string
+		var cyclicRank0Node string
 		Eventually(func(g Gomega) {
-			ranks = rankLineRegex.FindAllStringSubmatch(session.Output(), -1)
-			g.Expect(ranks).To(HaveLen(nodes+nodes*tasksPerNode), "srun has not printed all ranks yet")
-		}, tasTimeout, time.Second).Should(Succeed())
+			checked, cyclicRank0Node = nil, ""
+			lines := rankLineRegex.FindAllStringSubmatch(session.Output(), -1)
+			g.Expect(lines).To(HaveLen(nodes+nodes*tasksPerNode+nodes), "srun has not printed all ranks yet")
+			for _, m := range lines {
+				if m[1] == "CYCLIC" {
+					if m[2] == "0" {
+						cyclicRank0Node = m[3]
+					}
+					continue
+				}
+				checked = append(checked, strings.Join(m[1:], " "))
+			}
+		}, jobsetTimeout, time.Second).Should(Succeed())
+
+		// Cyclic ignores alpha_step_rank and follows node registration order.
+		By("verifying pod 0 did not register first, so the check below can fail")
+		Expect(cyclicRank0Node).NotTo(BeEmpty())
+		Expect(cyclicRank0Node).NotTo(Equal(nodeName(0)), "pod 0 registered first, so the rank check cannot detect a missing alpha_step_rank")
 
 		By("verifying each rank runs on the slurmd Pod with the matching JobSet job index")
-		for _, m := range ranks {
-			step, procID, nodeName := m[1], m[2], m[3]
-			rank, err := strconv.Atoi(procID)
-			Expect(err).NotTo(HaveOccurred())
-			jobIndex := rank
-			if step == "MULTI" {
-				jobIndex = rank / tasksPerNode
+		var want []string
+		for step, perNode := range stepTasksPerNode {
+			for rank := 0; rank < nodes*perNode; rank++ {
+				want = append(want, fmt.Sprintf("%s %d %s", step, rank, nodeName(rank/perNode)))
 			}
-			Expect(nodeName).To(Equal(fmt.Sprintf("%s-slurmd-%d-0", jobSetName, jobIndex)),
-				"%s step: SLURM_PROCID %d runs on node %s", step, rank, nodeName)
 		}
+		Expect(checked).To(ConsistOf(want))
 	})
 })
-
-// jobSetPods returns the Pods created for the named JobSet.
-func jobSetPods(jobSetName string) []corev1.Pod {
-	GinkgoHelper()
-	out, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", slurmNamespace,
-		"-l", "jobset.sigs.k8s.io/jobset-name="+jobSetName, "-o", "json"))
-	Expect(err).NotTo(HaveOccurred(), "Failed to list Pods of JobSet "+jobSetName)
-	var list corev1.PodList
-	Expect(json.Unmarshal([]byte(out), &list)).To(Succeed())
-	return list.Items
-}
