@@ -1,0 +1,88 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copy of workloadmixing_template.yaml for the TAS e2e tests.
+apiVersion: k8s-bridge.x-k8s.io/v1alpha1
+kind: WorkloadMixing
+metadata:
+  name: workloadmixing-tas
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+  partitionsMapping:
+    - partition: workloadmixing-partition
+      localQueue: tas-local-queue
+      dynamicNodeFeature: dynamic_kpartition
+  podTemplate:
+    metadata:
+      labels:
+        custom-label: "true"
+      annotations:
+        example.com/default-only: "from-template"
+        example.com/overridden: "from-template"
+    spec:
+      initContainers:
+        # Pod 0 registers last, so without alpha_step_rank it never gets SLURM_PROCID 0.
+        - name: delay-first-pod
+          # LINT.IfChange(curl_image)
+          image: curlimages/curl:8.16.0
+          # LINT.ThenChange(test/utils/utils.go:curl_image)
+          command: ["sh", "-c", "if [ \"$JOB_INDEX\" = 0 ]; then sleep 10; fi"]
+          env:
+            - name: JOB_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+      containers:
+        - name: slurmd
+          # LINT.IfChange(slurm_version_pair)
+          image: ghcr.io/slinkyproject/slurmd:26.05-ubuntu24.04
+          # LINT.ThenChange(test/utils/slurm.go:slurm_version_pair)
+          securityContext:
+            privileged: true
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  # LINT.IfChange(slurm_test_user)
+                  - id -u foo >/dev/null 2>&1 || (groupadd -g 2000 foo && useradd -u 2000 -g 2000 -d /tmp -s /bin/bash foo)
+                  # LINT.ThenChange(test/utils/login_node.go:slurm_test_user)
+        - name: sidecar
+          # LINT.IfChange(curl_image)
+          image: curlimages/curl:8.16.0
+          # LINT.ThenChange(test/utils/utils.go:curl_image)
+          # `sleep` as PID 1 ignores SIGTERM (the kernel drops default-action signals to PID 1),
+          # which made every pod wait out the full 30s termination grace period. Trap it instead.
+          command: ["sh", "-c", "trap 'exit 0' TERM; sleep 3600 & wait"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault

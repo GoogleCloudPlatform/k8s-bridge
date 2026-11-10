@@ -42,6 +42,19 @@ data:
   gres.conf: |
     AutoDetect=nvidia
 ---
+# alpha_step_rank (Slurm 26.05+) makes SLURM_PROCID follow the slurmd pod's JobSet job index.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-topology-yaml
+  namespace: slurm
+data:
+  topology.yaml: |
+    - topology: flat
+      cluster_default: true
+      flat:
+        alpha_step_rank: true
+---
 apiVersion: slinky.slurm.net/v1beta1
 kind: Controller
 metadata:
@@ -64,6 +77,7 @@ spec:
     - name: slurm-job-submit-lua
     - name: slurm-cli-filter-lua
     - name: slurm-gres-conf
+    - name: slurm-topology-yaml
   clusterName: slurm
   persistence:
     enabled: false

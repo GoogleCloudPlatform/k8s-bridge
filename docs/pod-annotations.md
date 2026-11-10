@@ -24,8 +24,6 @@ sbatch -p a4x -N 16 --gpus-per-node=4 \
   train.sh
 ```
 
-> **Note:** Do not enable `SchedulerParameters=extra_constraints` in `slurm.conf` (it is disabled by default). When it is enabled, `slurmctld` treats `--extra` as a node filter and the job cannot be scheduled on dynamic nodes.
-
 ## Format
 
 `--extra` is a comma-separated list of `key=value` entries, where each key is a full Kubernetes annotation key (`[<prefix>/]<name>`).
@@ -49,3 +47,33 @@ Annotations in `spec.podTemplate.metadata.annotations` act as defaults. `--extra
 ## Admission errors
 
 k8s-bridge does not check Kueue TAS rules itself. Kueue's `JobSet` validating webhook checks them when k8s-bridge creates the `JobSet`. If the webhook or the API server rejects the `JobSet` (HTTP 422, or HTTP 400 or 403 from a validating webhook), k8s-bridge cancels the Slurm job and adds `Cancelled by k8s-bridge: JobSet admission rejected: <reason>` to its comment. Transient errors are retried.
+
+## Topology-Aware Scheduling
+
+k8s-bridge only passes the TAS annotations to the `slurmd` Pods. Kueue places the Pods. To set up the `Topology`, the TAS `ResourceFlavor`, and the `ClusterQueue`, and for the meaning of each annotation, see the Kueue [Topology-Aware Scheduling](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/) documentation.
+
+### Slurm configuration
+
+Use a flat topology with `alpha_step_rank: true` (Slurm 26.05 or later). Ship `topology.yaml` with a ConfigMap listed in `Controller.spec.configFileRefs`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurm-topology-yaml
+data:
+  topology.yaml: |
+    - topology: flat
+      cluster_default: true
+      flat:
+        alpha_step_rank: true
+```
+
+- If the cluster already uses a tree or block topology for other partitions, add the flat topology next to it and set `Topology=flat` on the k8s-bridge partitions. Dynamic k8s-bridge nodes are not part of any switch or block.
+- Do not enable `SchedulerParameters=extra_constraints` in `slurm.conf` (it is disabled by default). When it is enabled, `slurmctld` treats `--extra` as a node filter and the job cannot be scheduled on dynamic nodes.
+
+### Rank order
+
+Kueue places the Pods of a job in the order of their `JobSet` job index, so neighboring indexes are close in the topology. With `alpha_step_rank`, Slurm assigns `SLURM_PROCID` in the same order. Without it, ranks follow the order in which the dynamic nodes registered. GPU collective libraries build their communication rings from the rank order, and TPU jobs need `SLURM_PROCID` to match `TPU_WORKER_ID`.
+
+`alpha_step_rank` applies only to the block task distribution. Steps with more tasks than nodes use block by default. Steps with one task per node use cyclic by default, so run them with `srun -m block` (or set `SLURM_DISTRIBUTION=block`).

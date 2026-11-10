@@ -51,7 +51,7 @@ See the `config/samples/` directory for full examples of configuring the `Worklo
 - [Quickstart Guide](docs/quickstart.md): Step-by-step instructions to deploy k8s-bridge and a sample workload mixing cluster.
 - [Priorities and Preemption](docs/priorities-and-preemption.md): Configure partition-based priorities and Kueue preemption for Slurm workloads.
 - [GPU Workloads](docs/gpu-workloads.md): Configure GPU-enabled Slurm partitions and run GPU jobs on Kubernetes.
-- [Pod Annotations](docs/pod-annotations.md): Pass Kubernetes Pod annotations, such as Kueue Topology-Aware Scheduling requests, with Slurm's `--extra` option.
+- [Pod Annotations](docs/pod-annotations.md): Pass Kubernetes Pod annotations, such as Kueue Topology-Aware Scheduling requests, with Slurm's `--extra` option, and configure Slurm for Topology-Aware Scheduling.
 - [GPU DWS Workloads](docs/gke/gpu-dws-workloads.md): Configure Dynamic Workload Scheduler (DWS) on GKE for GPU workloads.
 - [CCC](docs/gke/ccc.md): Configure Custom Compute Classes (CCC) on GKE.
 
