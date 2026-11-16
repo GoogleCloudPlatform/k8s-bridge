@@ -53,6 +53,7 @@ const (
 	//   test/e2e/testdata/slurm_login.yaml:slurm_version_pair,
 	//   test/e2e/testdata/slurm_static_nodeset.yaml:slurm_version_pair,
 	//   test/e2e/testdata/workloadmixing_template.yaml:slurm_version_pair,
+	//   test/e2e/testdata/workloadmixing_tas.yaml:slurm_version_pair,
 	//   test/e2e/testdata/workloadmixing_gpu.yaml:slurm_version_pair
 	// )
 )

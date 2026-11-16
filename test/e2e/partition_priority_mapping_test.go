@@ -17,7 +17,6 @@
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"time"
@@ -143,10 +142,9 @@ var _ = Describe("Partition Priority Mapping", func() {
 
 		var workloadName string
 		Eventually(func(g Gomega) {
-			name, err := workloadOwnedBy(originalUID)
+			wl, err := utils.WorkloadForJobSet(jobSetName, slurmNamespace)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(name).NotTo(BeEmpty(), "No Kueue Workload owned by JobSet %s yet", jobSetName)
-			workloadName = name
+			workloadName = wl.Name
 		}).Should(Succeed())
 
 		// We patch the Kueue Workload directly to active: false.
@@ -273,31 +271,3 @@ var _ = Describe("Partition Priority Mapping", func() {
 		},
 	)
 })
-
-func workloadOwnedBy(ownerUID string) (string, error) {
-	out, err := utils.Run(exec.Command("kubectl", "get", "workload", "-n", slurmNamespace, "-o", "json"))
-	if err != nil {
-		return "", err
-	}
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Name            string `json:"name"`
-				OwnerReferences []struct {
-					UID string `json:"uid"`
-				} `json:"ownerReferences"`
-			} `json:"metadata"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal([]byte(out), &list); err != nil {
-		return "", fmt.Errorf("failed to parse Workload list: %w", err)
-	}
-	for _, wl := range list.Items {
-		for _, ref := range wl.Metadata.OwnerReferences {
-			if ref.UID == ownerUID {
-				return wl.Metadata.Name, nil
-			}
-		}
-	}
-	return "", nil
-}
