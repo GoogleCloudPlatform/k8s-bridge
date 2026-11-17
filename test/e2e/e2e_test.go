@@ -319,6 +319,115 @@ var _ = Describe("Manager", func() {
 				WithNodeList(nodeNameA).
 				Verify()
 		})
+
+		It("should defer new Slurm job admission while WorkloadMixing is unavailable "+
+			"and admit once available", func() {
+			const (
+				configPath    = "test/e2e/testdata/workloadmixing_template.yaml"
+				wmName        = "workloadmixing-template"
+				holdFinalizer = "e2e.k8s-bridge.io/availability-gate-hold"
+			)
+
+			getAvailabilitySummary := func() (string, error) {
+				statusCmd := exec.Command("kubectl", "get", "workloadmixing", wmName, "-n", slurmNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}:"+
+						"{.status.conditions[?(@.type=='Available')].reason}:"+
+						"{.status.conditions[?(@.type=='Available')].observedGeneration}")
+				return utils.Run(statusCmd)
+			}
+
+			clearFinalizers := func() error {
+				patchCmd := exec.Command("kubectl", "patch", "workloadmixing", wmName,
+					"-n", slurmNamespace,
+					"--type=merge",
+					"-p", `{"metadata":{"finalizers":null}}`,
+				)
+				_, patchErr := utils.Run(patchCmd)
+				return patchErr
+			}
+
+			By("applying the WorkloadMixing template CR and waiting for Available=True")
+			utils.ApplyManifestWithCleanup(configPath)
+			DeferCleanup(func() {
+				_ = clearFinalizers()
+			})
+			Eventually(func(g Gomega) {
+				out, runErr := getAvailabilitySummary()
+				g.Expect(runErr).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("True:Reconciled:1"))
+			}, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("holding WorkloadMixing in terminating state so IsAvailable() is false while Slurm client stays active")
+			addFinalizerCmd := exec.Command("kubectl", "patch", "workloadmixing", wmName,
+				"-n", slurmNamespace,
+				"--type=merge",
+				"-p", fmt.Sprintf(`{"metadata":{"finalizers":[%q]}}`, holdFinalizer),
+			)
+			_, err := utils.Run(addFinalizerCmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			deleteNoWaitCmd := exec.Command("kubectl", "delete", "workloadmixing", wmName,
+				"-n", slurmNamespace, "--wait=false")
+			_, err = utils.Run(deleteNoWaitCmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func(g Gomega) {
+				tsCmd := exec.Command("kubectl", "get", "workloadmixing", wmName, "-n", slurmNamespace,
+					"-o", "jsonpath={.metadata.deletionTimestamp}")
+				tsOut, runErr := utils.Run(tsCmd)
+				g.Expect(runErr).NotTo(HaveOccurred())
+				g.Expect(tsOut).NotTo(BeEmpty())
+			}, 30*time.Second, time.Second).Should(Succeed())
+
+			By("submitting a batch job while WorkloadMixing is unavailable")
+			jobID := utils.NewBatchJobBuilder(slurmNamespace).
+				WithPartition(defaultSlurmPartition).
+				WithCpusPerTask(1).
+				WithWrap("hostname; echo 'E2E_AVAILABILITY_GATE_SUCCESS'").
+				Submit()
+			jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+			nodeName := fmt.Sprintf("%s-slurmd-0-0", jobSetName)
+
+			By("verifying across multiple poller intervals that no JobSet is created and the job stays held")
+			Consistently(func(g Gomega) {
+				getJSCmd := exec.Command("kubectl", "get", "jobset", jobSetName,
+					"-n", slurmNamespace, "--ignore-not-found", "-o", "name")
+				jsOut, runErr := utils.Run(getJSCmd)
+				g.Expect(runErr).NotTo(HaveOccurred())
+				g.Expect(jsOut).To(BeEmpty())
+
+				jobState, queryErr := utils.QuerySlurmJobState(slurmNamespace, jobID)
+				g.Expect(queryErr).NotTo(HaveOccurred())
+				g.Expect(jobState.JobState).To(Equal("PENDING"))
+				g.Expect(jobState.Reason).To(Equal("JobHeldUser"))
+			}, 3*utils.E2EPollInterval, time.Second).Should(Succeed())
+
+			By("completing deletion and re-applying WorkloadMixing so it becomes Available=True")
+			Expect(clearFinalizers()).To(Succeed())
+			Eventually(func(g Gomega) {
+				getWMCmd := exec.Command("kubectl", "get", "workloadmixing", wmName,
+					"-n", slurmNamespace, "--ignore-not-found", "-o", "name")
+				wmOut, runErr := utils.Run(getWMCmd)
+				g.Expect(runErr).NotTo(HaveOccurred())
+				g.Expect(wmOut).To(BeEmpty())
+			}, 30*time.Second, time.Second).Should(Succeed())
+
+			reapplyCmd := exec.Command("kubectl", "apply", "--server-side", "--force-conflicts", "-f", configPath)
+			_, err = utils.Run(reapplyCmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func(g Gomega) {
+				out, runErr := getAvailabilitySummary()
+				g.Expect(runErr).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("True:Reconciled:1"))
+			}, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the deferred job is admitted, completes on a dynamic node, and tears down cleanly")
+			utils.WaitForWorkerPodsRunning(slurmNamespace, jobSetName, 1, 3*time.Minute)
+			utils.WaitForSlurmJobCompletion(slurmNamespace, jobID, 3*time.Minute)
+			utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
+			utils.VerifySlurmNodeNotFound(slurmNamespace, nodeName, 2*time.Minute)
+		})
 	})
 
 	Context("Slurm Worker Connectivity and Job Execution", func() {
