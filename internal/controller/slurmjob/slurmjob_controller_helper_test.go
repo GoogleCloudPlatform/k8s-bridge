@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,13 +54,15 @@ import (
 )
 
 const (
-	reconWmName          = "test-wm"
-	reconNamespace       = "test-ns"
-	reconControllerName  = "test-controller"
-	reconPartitionName   = "test-partition"
-	reconJobID           = 12345
-	reconJobIDStr        = "12345"
-	reconSlurmAuthSecret = "slurm-auth-slurm"
+	reconWmName                  = "test-wm"
+	reconNamespace               = "test-ns"
+	reconControllerName          = "test-controller"
+	reconPartitionName           = "test-partition"
+	reconJobID                   = 12345
+	reconJobIDStr                = "12345"
+	reconSlurmAuthSecret         = "slurm-auth-slurm"
+	testReasonReconciled         = "Reconciled"
+	testReasonLocalQueueNotFound = "LocalQueueNotFound"
 )
 
 func newPartConfigUnavailable422Error() error {
@@ -105,6 +108,16 @@ func setupReconcileTest(t *testing.T) (*runtime.Scheme, *k8sbridgev1alpha1.Workl
 			},
 			PartitionsMapping: []k8sbridgev1alpha1.PartitionMapping{
 				{Partition: reconPartitionName, LocalQueue: "some-queue"},
+			},
+		},
+		Status: k8sbridgev1alpha1.WorkloadMixingStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 0,
+					Reason:             testReasonReconciled,
+				},
 			},
 		},
 	}
@@ -247,6 +260,7 @@ type reconcileTestEnv struct {
 	fakeClient client.Client
 	mockSlurm  *utils.SlurmClient
 	clientMap  *clientmap.ClientMap
+	recorder   *record.FakeRecorder
 	reconciler *SlurmJobReconciler
 	jobSetKey  types.NamespacedName
 }
@@ -257,6 +271,7 @@ type reconcileEnvConfig struct {
 	withoutController      bool
 	withoutSlurmClient     bool
 	emptyControllerRefName bool
+	wmModifiers            []func(*k8sbridgev1alpha1.WorkloadMixing)
 	extraObjects           []client.Object
 	interceptors           *interceptor.Funcs
 	pendingJobs            []slurmclienttypes.V0044JobInfo
@@ -264,6 +279,14 @@ type reconcileEnvConfig struct {
 	slurmUpdateError       error
 	slurmMutateOnUpdate    bool
 	slurmDeleteJobError    error
+}
+
+func withWorkloadMixingModifier(fn func(*k8sbridgev1alpha1.WorkloadMixing)) reconcileEnvOpt {
+	return func(c *reconcileEnvConfig) {
+		if fn != nil {
+			c.wmModifiers = append(c.wmModifiers, fn)
+		}
+	}
 }
 
 func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
@@ -331,6 +354,9 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 	if cfg.emptyControllerRefName {
 		wm.Spec.ControllerRef.Name = ""
 	}
+	for _, mod := range cfg.wmModifiers {
+		mod(wm)
+	}
 
 	var initObjs []client.Object
 	initObjs = append(initObjs, wm)
@@ -363,10 +389,12 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 		cMap.Add(context.Background(), types.NamespacedName{Namespace: reconNamespace, Name: controllerName}, mockSlurm)
 	}
 
+	recorder := record.NewFakeRecorder(100)
 	reconciler := &SlurmJobReconciler{
 		Client:    fakeClient,
 		APIReader: baseClient,
 		Scheme:    scheme,
+		Recorder:  recorder,
 		ClientMap: cMap,
 	}
 
@@ -379,6 +407,7 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 		fakeClient: fakeClient,
 		mockSlurm:  mockSlurm,
 		clientMap:  cMap,
+		recorder:   recorder,
 		reconciler: reconciler,
 		jobSetKey:  types.NamespacedName{Namespace: reconNamespace, Name: "slurm-job-" + reconJobIDStr},
 	}
@@ -556,6 +585,18 @@ func (e *reconcileTestEnv) verifyNoSlurmUpdates() {
 	}
 	if len(e.mockSlurm.GetDeletedNodes()) != 0 {
 		e.t.Errorf("Expected no node deletions, got %v", e.mockSlurm.GetDeletedNodes())
+	}
+}
+
+func (e *reconcileTestEnv) verifyNoEvents() {
+	e.t.Helper()
+	if e.recorder == nil {
+		return
+	}
+	select {
+	case ev := <-e.recorder.Events:
+		e.t.Errorf("Expected no Kubernetes events, got %q", ev)
+	default:
 	}
 }
 

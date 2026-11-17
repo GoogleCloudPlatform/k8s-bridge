@@ -96,6 +96,16 @@ func newTestWorkloadMixing(name, controller, partition, queue string) *k8sbridge
 			},
 			PartitionsMapping: pm,
 		},
+		Status: k8sbridgev1alpha1.WorkloadMixingStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 0,
+					Reason:             testReasonReconciled,
+				},
+			},
+		},
 	}
 }
 
@@ -1420,13 +1430,15 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		job        *slurmclienttypes.V0044JobInfo
-		existingJS *jobsetv1alpha2.JobSet
-		want       bool
+		name        string
+		wmAvailable bool
+		job         *slurmclienttypes.V0044JobInfo
+		existingJS  *jobsetv1alpha2.JobSet
+		want        bool
 	}{
 		{
-			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			name:        "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(false).
 				withStateReason("Resources").
@@ -1435,7 +1447,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
+			name:        "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(false).
 				withStateReason("Resources").
@@ -1444,7 +1457,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Skips when PENDING job has no JobSet and is explicitly held by user",
+			name:        "Skips when PENDING job has no JobSet and is explicitly held by user",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1454,7 +1468,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Skips when PENDING job has no JobSet and is explicitly held by admin",
+			name:        "Skips when PENDING job has no JobSet and is explicitly held by admin",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldAdmin).
@@ -1464,7 +1479,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
+			name:        "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withPartition(testPartitionName + ",other-partition").
 				withHold(true).
@@ -1474,7 +1490,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       true,
 		},
 		{
-			name: "Emits when PENDING job has no JobSet and is auto-held",
+			name:        "Emits when PENDING job has no JobSet and is auto-held",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1484,7 +1501,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       true,
 		},
 		{
-			name: "Skips when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusNoAction)",
+			name:        "Skips when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusNoAction)",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1493,7 +1511,51 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
+			name:        "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
+			wmAvailable: true,
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
+			want:       true,
+		},
+		{
+			name:        "Skips new auto-held single-partition job when WorkloadMixing is unavailable",
+			wmAvailable: false,
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name:        "Skips new multi-partition job when WorkloadMixing is unavailable",
+			wmAvailable: false,
+			job: newPendingJobBuilder().
+				withPartition(testPartitionName + ",other-partition").
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name:        "Skips unowned already-translated job when WorkloadMixing is unavailable",
+			wmAvailable: false,
+			job: newPendingJobBuilder().
+				withHold(false).
+				withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)).
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name:        "Emits StatusShouldUnhold for owned JobSet even when WorkloadMixing is unavailable",
+			wmAvailable: false,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1506,7 +1568,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldEmitAdmissionEvent(tc.job, tc.existingJS); got != tc.want {
+			if got := shouldEmitAdmissionEvent(tc.wmAvailable, tc.job, tc.existingJS); got != tc.want {
 				t.Errorf("shouldEmitAdmissionEvent() = %v, want %v", got, tc.want)
 			}
 		})
@@ -1612,4 +1674,392 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPoll_WorkloadMixingAvailabilityGate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	now := metav1.Now()
+	newHeldPendingJobOn := func(id int32, partition string) slurmclienttypes.V0044JobInfo {
+		return *newEmptyTestJob().
+			withJobID(id).
+			withPartition(partition).
+			withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+			withHold(true).
+			withStateReason(ReasonJobHeldUser).
+			withComment(AutoHoldMarker).
+			build()
+	}
+	newHeldPendingJob := func(id int32) slurmclienttypes.V0044JobInfo {
+		return newHeldPendingJobOn(id, testPartitionName)
+	}
+
+	unavailableCases := []struct {
+		name     string
+		modifyWM func(wm *k8sbridgev1alpha1.WorkloadMixing)
+	}{
+		{
+			name: "Unreconciled WorkloadMixing with empty Conditions",
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Status.Conditions = nil
+			},
+		},
+		{
+			name: "WorkloadMixing with Available=False",
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 2
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: 2,
+						Reason:             testReasonLocalQueueNotFound,
+					},
+				}
+			},
+		},
+		{
+			name: "WorkloadMixing with Available=Unknown",
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 1
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionUnknown,
+						ObservedGeneration: 1,
+						Reason:             "Reconciling",
+					},
+				}
+			},
+		},
+		{
+			name: "WorkloadMixing with stale ObservedGeneration < Generation",
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 3
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 2,
+						Reason:             testReasonReconciled,
+					},
+				}
+			},
+		},
+		{
+			name: "Terminating WorkloadMixing with DeletionTimestamp set",
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 1
+				wm.DeletionTimestamp = &now
+				wm.Finalizers = []string{"test.k8s-bridge.io/keep"}
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 1,
+						Reason:             testReasonReconciled,
+					},
+				}
+			},
+		},
+	}
+
+	for _, tc := range unavailableCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+			wm.UID = testWMUID
+			tc.modifyWM(wm)
+
+			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm).Build()
+			cMap := clientmap.NewClientMap()
+			mockSlurm := &utils.SlurmClient{}
+			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{newHeldPendingJob(401)})
+			cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+
+			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
+			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+			poller := &SlurmPoller{
+				Client:          fakeK8sClient,
+				ClientMap:       cMap,
+				AdmissionEvents: admissionChan,
+				TeardownEvents:  teardownChan,
+			}
+
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll failed: %v", err)
+			}
+			if got := len(admissionChan); got != 0 {
+				t.Fatalf("Poll() emitted %d admission events while WM unavailable, want 0", got)
+			}
+		})
+	}
+
+	t.Run("Unavailable WM-2 does not block new job admission on healthy WM-1 sharing the same Controller",
+		func(t *testing.T) {
+			ctx := t.Context()
+			wm1 := newTestWorkloadMixing("wm-healthy", testControllerName, "part-healthy", testQueueName)
+			wm1.UID = "uid-wm-1"
+
+			wm2 := newTestWorkloadMixing("wm-unavailable", testControllerName, "part-unavailable", testQueueName)
+			wm2.UID = "uid-wm-2"
+			wm2.Generation = 1
+			wm2.Status.Conditions = []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 1,
+					Reason:             testReasonLocalQueueNotFound,
+				},
+			}
+
+			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm1, wm2).Build()
+			cMap := clientmap.NewClientMap()
+			mockSlurm := &utils.SlurmClient{}
+			mockSlurm.SetPendingJobs("part-healthy", []slurmclienttypes.V0044JobInfo{
+				newHeldPendingJobOn(510, "part-healthy"),
+				newHeldPendingJobOn(520, "part-unavailable"),
+			})
+			cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+
+			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
+			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+			poller := &SlurmPoller{
+				Client:          fakeK8sClient,
+				ClientMap:       cMap,
+				AdmissionEvents: admissionChan,
+				TeardownEvents:  teardownChan,
+			}
+
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll failed: %v", err)
+			}
+			if got := len(admissionChan); got != 1 {
+				t.Fatalf("Expected 1 admission event (only healthy WM-1 job 510), got %d", got)
+			}
+			ev := <-admissionChan
+			if ev.JobID != "510" || ev.WorkloadMixing.Name != wm1.Name {
+				t.Fatalf("Admission event = (%q, %s), want (\"510\", %s)",
+					ev.JobID, ev.WorkloadMixing.Name, wm1.Name)
+			}
+		})
+
+	t.Run("Unavailable conflicting WM-2 does not emit StatusJobSetMissing for job owned by healthy WM-1",
+		func(t *testing.T) {
+			ctx := t.Context()
+			wm1 := newTestWorkloadMixing("wm-healthy", testControllerName, testPartitionName, testQueueName)
+			wm1.UID = "uid-wm-1"
+
+			wm2 := newTestWorkloadMixing("wm-conflict", testControllerName, testPartitionName, testQueueName)
+			wm2.UID = "uid-wm-2"
+			wm2.Generation = 1
+			wm2.Status.Conditions = []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 1,
+					Reason:             "PartitionConflict",
+				},
+			}
+
+			ownedJS := newTestJobSet("slurm-job-500").
+				withNamespace(testNamespace).
+				withSuspend(false).
+				withLabels(map[string]string{
+					LabelSlurmJobID:     "500",
+					LabelSlurmPartition: testPartitionName,
+				}).
+				withOwnerReference(metav1.OwnerReference{
+					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+					Kind:       KindWorkloadMixing,
+					Name:       wm1.Name,
+					UID:        wm1.UID,
+				}).
+				build()
+
+			translatedJob := *newEmptyTestJob().
+				withJobID(500).
+				withPartition(testPartitionName).
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(false).
+				withFeatures("k8s-id-500").
+				build()
+
+			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm1, wm2, ownedJS).Build()
+			cMap := clientmap.NewClientMap()
+			mockSlurm := &utils.SlurmClient{}
+			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{translatedJob})
+			cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+
+			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
+			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+			poller := &SlurmPoller{
+				Client:          fakeK8sClient,
+				ClientMap:       cMap,
+				AdmissionEvents: admissionChan,
+				TeardownEvents:  teardownChan,
+			}
+
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll failed: %v", err)
+			}
+			if got := len(admissionChan); got != 0 {
+				t.Fatalf("Expected 0 admission events (neither WM-1 nor unavailable WM-2 should emit), got %d", got)
+			}
+		})
+
+	t.Run("Preserves in-flight unhold, terminal teardown, and orphan cleanup while unavailable, then admits on recovery",
+		func(t *testing.T) {
+			ctx := t.Context()
+			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+			wm.UID = testWMUID
+			wm.Generation = 2
+			wm.Status.Conditions = []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 2,
+					Reason:             testReasonLocalQueueNotFound,
+				},
+			}
+
+			ownerRef := metav1.OwnerReference{
+				APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
+				Kind:       KindWorkloadMixing,
+				Name:       wm.Name,
+				UID:        wm.UID,
+			}
+			unholdJS := newTestJobSet("slurm-job-602").
+				withNamespace(testNamespace).
+				withSuspend(false).
+				withLabels(map[string]string{
+					LabelSlurmJobID:     "602",
+					LabelSlurmPartition: testPartitionName,
+				}).
+				withOwnerReference(ownerRef).
+				build()
+			teardownJS := newTestJobSet("slurm-job-603").
+				withNamespace(testNamespace).
+				withFinalizers(FinalizerJobSet).
+				withLabels(map[string]string{
+					LabelSlurmJobID:     "603",
+					LabelSlurmPartition: testPartitionName,
+				}).
+				withOwnerReference(ownerRef).
+				build()
+			orphanJS := newTestJobSet("slurm-job-604").
+				withNamespace(testNamespace).
+				withFinalizers(FinalizerJobSet).
+				withLabels(map[string]string{
+					LabelSlurmJobID:     "604",
+					LabelSlurmPartition: testPartitionName,
+				}).
+				withOwnerReference(ownerRef).
+				build()
+
+			newJob := newHeldPendingJob(601)
+			unholdJob := newHeldPendingJob(602)
+			completedJob := *newEmptyTestJob().
+				withJobID(603).
+				withPartition(testPartitionName).
+				withJobState(slurmapi.V0044JobInfoJobStateCOMPLETED).
+				build()
+
+			fakeK8sClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(wm, unholdJS, teardownJS, orphanJS).
+				Build()
+			cMap := clientmap.NewClientMap()
+			mockSlurm := &utils.SlurmClient{}
+			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{newJob, unholdJob, completedJob})
+			cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+
+			simNow := time.Now()
+			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
+			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+			poller := &SlurmPoller{
+				Client:            fakeK8sClient,
+				ClientMap:         cMap,
+				AdmissionEvents:   admissionChan,
+				TeardownEvents:    teardownChan,
+				OrphanGracePeriod: time.Minute,
+				nowFn:             func() time.Time { return simNow },
+			}
+
+			// Cycle 1 (Available=False): blocks new job 601, emits unhold for 602, teardown for 603, tracks 604 missing.
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll cycle 1 failed: %v", err)
+			}
+			if got := len(admissionChan); got != 1 {
+				t.Fatalf("Cycle 1 admission events = %d, want 1 (only owned job 602)", got)
+			}
+			if ev := <-admissionChan; ev.JobID != "602" {
+				t.Fatalf("Cycle 1 admission event JobID = %q, want \"602\"", ev.JobID)
+			}
+			if got := len(teardownChan); got != 1 {
+				t.Fatalf("Cycle 1 teardown events = %d, want 1 (owned completed job 603)", got)
+			}
+			if tdEv := <-teardownChan; tdEv.JobID != "603" || tdEv.Reason != metrics.ReasonJobCompleted {
+				t.Fatalf("Cycle 1 teardown event = (%q, %q), want (\"603\", %q)",
+					tdEv.JobID, tdEv.Reason, metrics.ReasonJobCompleted)
+			}
+
+			// Cycle 2 (still Available=False, past OrphanGracePeriod): dispatches orphan teardown for 604, still blocks 601.
+			if err := fakeK8sClient.Delete(ctx, unholdJS); err != nil {
+				t.Fatalf("Failed to delete unholdJS: %v", err)
+			}
+			teardownJS.Finalizers = nil
+			if err := fakeK8sClient.Update(ctx, teardownJS); err != nil {
+				t.Fatalf("Failed to clear teardownJS finalizers: %v", err)
+			}
+			if err := fakeK8sClient.Delete(ctx, teardownJS); err != nil {
+				t.Fatalf("Failed to delete teardownJS: %v", err)
+			}
+			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{newJob})
+			simNow = simNow.Add(70 * time.Second)
+
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll cycle 2 failed: %v", err)
+			}
+			if got := len(admissionChan); got != 0 {
+				t.Fatalf("Cycle 2 admission events = %d, want 0 while WM unavailable", got)
+			}
+			if got := len(teardownChan); got != 1 {
+				t.Fatalf("Cycle 2 teardown events = %d, want 1 (orphaned job 604)", got)
+			}
+			if orphanEv := <-teardownChan; orphanEv.JobID != "604" || orphanEv.Reason != metrics.ReasonJobOrphaned {
+				t.Fatalf("Cycle 2 teardown event = (%q, %q), want (\"604\", %q)",
+					orphanEv.JobID, orphanEv.Reason, metrics.ReasonJobOrphaned)
+			}
+
+			// Cycle 3 (Available=True): admits previously deferred new job 601.
+			var latestWM k8sbridgev1alpha1.WorkloadMixing
+			if err := fakeK8sClient.Get(ctx, client.ObjectKeyFromObject(wm), &latestWM); err != nil {
+				t.Fatalf("Failed to get WorkloadMixing: %v", err)
+			}
+			latestWM.Status.Conditions = []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: latestWM.Generation,
+					Reason:             testReasonReconciled,
+				},
+			}
+			if err := fakeK8sClient.Update(ctx, &latestWM); err != nil {
+				t.Fatalf("Failed to update WorkloadMixing: %v", err)
+			}
+
+			if err := poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll cycle 3 failed: %v", err)
+			}
+			if got := len(admissionChan); got != 1 {
+				t.Fatalf("Cycle 3 admission events = %d, want 1 (deferred job 601)", got)
+			}
+			if recoveredEv := <-admissionChan; recoveredEv.JobID != "601" {
+				t.Fatalf("Cycle 3 admission event JobID = %q, want \"601\"", recoveredEv.JobID)
+			}
+		})
 }

@@ -2924,3 +2924,364 @@ func TestJobSetWatchPredicate(t *testing.T) {
 		}
 	})
 }
+
+func TestReconcile_NewJob_DeferredWhenWorkloadMixingUnavailable(t *testing.T) {
+	now := metav1.Now()
+
+	tests := []struct {
+		name      string
+		partition string
+		modifyWM  func(wm *k8sbridgev1alpha1.WorkloadMixing)
+	}{
+		{
+			name:      "Unreconciled WorkloadMixing with empty Conditions",
+			partition: reconPartitionName,
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Status.Conditions = nil
+			},
+		},
+		{
+			name:      "WorkloadMixing with Available=False",
+			partition: reconPartitionName,
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 2
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: 2,
+						Reason:             testReasonLocalQueueNotFound,
+					},
+				}
+			},
+		},
+		{
+			name:      "WorkloadMixing with Available=Unknown",
+			partition: reconPartitionName,
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 1
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionUnknown,
+						ObservedGeneration: 1,
+						Reason:             "Reconciling",
+					},
+				}
+			},
+		},
+		{
+			name:      "WorkloadMixing with stale ObservedGeneration < Generation",
+			partition: reconPartitionName,
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 3
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 2,
+						Reason:             testReasonReconciled,
+					},
+				}
+			},
+		},
+		{
+			name:      "Terminating WorkloadMixing with DeletionTimestamp set",
+			partition: reconPartitionName,
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 1
+				wm.DeletionTimestamp = &now
+				wm.Finalizers = []string{"test.k8s-bridge.io/keep"}
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 1,
+						Reason:             testReasonReconciled,
+					},
+				}
+			},
+		},
+		{
+			name:      "Multi-partition job is deferred instead of cancelled when WorkloadMixing is unavailable",
+			partition: reconPartitionName + ",other-partition",
+			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 1
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: 1,
+						Reason:             "PartitionConflict",
+					},
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := newReconTestJob().
+				withPartition(tc.partition).
+				withNodes(1).
+				withAutoHold().
+				build()
+
+			env := newReconcileTestEnv(t,
+				withWorkloadMixingModifier(tc.modifyWM),
+				withPendingSlurmJobs(job),
+			)
+			beforeDiscovered := testutil.ToFloat64(
+				metrics.JobsDiscovered.WithLabelValues(reconWmName, tc.partition),
+			)
+			beforeCreatedSync := testutil.ToFloat64(
+				metrics.JobsSync.WithLabelValues(
+					metrics.StatusSuccess, metrics.ReasonJobSetCreated, reconWmName, tc.partition,
+				),
+			)
+			beforeTranslationErrSync := testutil.ToFloat64(
+				metrics.JobsSync.WithLabelValues(
+					metrics.StatusError, metrics.ReasonTranslationError, reconWmName, tc.partition,
+				),
+			)
+
+			res, err := env.reconcile()
+			if err != nil {
+				t.Fatalf("Expected no error when deferring new job, got %v", err)
+			}
+			if res != (ctrl.Result{}) {
+				t.Errorf("Expected empty ctrl.Result{} (no RequeueAfter), got %v", res)
+			}
+
+			env.verifyJobSetNotFound()
+			env.verifyNoSlurmUpdates()
+			env.verifyNoEvents()
+
+			afterDiscovered := testutil.ToFloat64(
+				metrics.JobsDiscovered.WithLabelValues(reconWmName, tc.partition),
+			)
+			if afterDiscovered != beforeDiscovered {
+				t.Errorf("Expected JobsDiscovered metric unchanged (%f), got %f",
+					beforeDiscovered, afterDiscovered)
+			}
+			afterCreatedSync := testutil.ToFloat64(
+				metrics.JobsSync.WithLabelValues(
+					metrics.StatusSuccess, metrics.ReasonJobSetCreated, reconWmName, tc.partition,
+				),
+			)
+			if afterCreatedSync != beforeCreatedSync {
+				t.Errorf("Expected JobsSync(created) unchanged (%f), got %f",
+					beforeCreatedSync, afterCreatedSync)
+			}
+			afterTranslationErrSync := testutil.ToFloat64(
+				metrics.JobsSync.WithLabelValues(
+					metrics.StatusError, metrics.ReasonTranslationError, reconWmName, tc.partition,
+				),
+			)
+			if afterTranslationErrSync != beforeTranslationErrSync {
+				t.Errorf("Expected JobsSync(translation_error) unchanged (%f), got %f",
+					beforeTranslationErrSync, afterTranslationErrSync)
+			}
+		})
+	}
+
+	t.Run("Admits deferred job once WorkloadMixing transitions to Available=True", func(t *testing.T) {
+		job := newReconTestJob().
+			withNodes(1).
+			withAutoHold().
+			build()
+
+		env := newReconcileTestEnv(t,
+			withWorkloadMixingModifier(func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+				wm.Generation = 2
+				wm.Status.Conditions = []metav1.Condition{
+					{
+						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: 2,
+						Reason:             testReasonLocalQueueNotFound,
+					},
+				}
+			}),
+			withPendingSlurmJobs(job),
+		)
+		beforeDiscovered := env.jobsDiscoveredCount()
+		beforeCreatedSync := env.jobsSyncCount(metrics.StatusSuccess, metrics.ReasonJobSetCreated)
+
+		// 1. Reconcile while Available=False -> deferred with zero side effects.
+		res, err := env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("First reconcile = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifyJobSetNotFound()
+		env.verifyNoSlurmUpdates()
+		env.verifyNoEvents()
+		if got := env.jobsDiscoveredCount(); got != beforeDiscovered {
+			t.Fatalf("JobsDiscovered changed while unavailable: got %f, want %f", got, beforeDiscovered)
+		}
+
+		// 2. Transition WorkloadMixing to Available=True for current Generation.
+		wmKey := types.NamespacedName{Namespace: reconNamespace, Name: reconWmName}
+		var latestWM k8sbridgev1alpha1.WorkloadMixing
+		if err := env.baseClient.Get(t.Context(), wmKey, &latestWM); err != nil {
+			t.Fatalf("Failed to get WorkloadMixing: %v", err)
+		}
+		latestWM.Status.Conditions = []metav1.Condition{
+			{
+				Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: latestWM.Generation,
+				Reason:             testReasonReconciled,
+			},
+		}
+		if err := env.baseClient.Update(t.Context(), &latestWM); err != nil {
+			t.Fatalf("Failed to update WorkloadMixing status: %v", err)
+		}
+
+		// 3. Reconcile once Available=True -> JobSet created, Slurm hold released, metrics incremented once.
+		res, err = env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("Recovery reconcile = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+		env.verifySlurmUnhold()
+		if got := env.jobsDiscoveredCount(); got != beforeDiscovered+1 {
+			t.Errorf("JobsDiscovered = %f, want %f", got, beforeDiscovered+1)
+		}
+		if got := env.jobsSyncCount(metrics.StatusSuccess, metrics.ReasonJobSetCreated); got != beforeCreatedSync+1 {
+			t.Errorf("JobsSync(created) = %f, want %f", got, beforeCreatedSync+1)
+		}
+	})
+}
+
+func TestReconcile_ActiveJob_ProceedsWhenWorkloadMixingUnavailable(t *testing.T) {
+	markUnavailable := withWorkloadMixingModifier(func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+		wm.Generation = 2
+		wm.Status.Conditions = []metav1.Condition{
+			{
+				Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: 2,
+				Reason:             testReasonLocalQueueNotFound,
+			},
+		}
+	})
+
+	t.Run("StatusShouldUnhold unholds Slurm job when WorkloadMixing is unavailable", func(t *testing.T) {
+		job := newReconTestJob().withAutoHold().build()
+		existingJS := newReconTestJobSet().withSuspend(false).build()
+
+		env := newReconcileTestEnv(t,
+			markUnavailable,
+			withExtraObjects(existingJS),
+			withPendingSlurmJobs(job),
+		)
+
+		res, err := env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifySlurmUnhold()
+	})
+
+	t.Run("StatusJobSetCompleted cleans up JobSet and cancels Slurm job when WorkloadMixing is unavailable",
+		func(t *testing.T) {
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build()
+			existingJS := newReconTestJobSet().
+				withSlurmdReplicas(1).
+				withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
+				build()
+
+			env := newReconcileTestEnv(t,
+				markUnavailable,
+				withExtraObjects(existingJS),
+				withPendingSlurmJobs(job),
+			)
+
+			res, err := env.reconcile()
+			if err != nil || res != (ctrl.Result{}) {
+				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
+			}
+			env.verifySlurmCancellation(ReasonJobSetCompleted)
+			env.verifySlurmNodesDeleted("slurm-job-" + reconJobIDStr + "-slurmd-0-0")
+			env.verifyJobSetNotFound()
+		})
+
+	t.Run("StatusJobSetFailed cleans up JobSet and cancels Slurm job when WorkloadMixing is unavailable",
+		func(t *testing.T) {
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build()
+			existingJS := newReconTestJobSet().
+				withSlurmdReplicas(1).
+				withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+				build()
+
+			env := newReconcileTestEnv(t,
+				markUnavailable,
+				withExtraObjects(existingJS),
+				withPendingSlurmJobs(job),
+			)
+
+			res, err := env.reconcile()
+			if err != nil || res != (ctrl.Result{}) {
+				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
+			}
+			env.verifySlurmCancellation(ReasonJobSetFailed)
+			env.verifySlurmNodesDeleted("slurm-job-" + reconJobIDStr + "-slurmd-0-0")
+			env.verifyJobSetNotFound()
+		})
+
+	t.Run("StatusJobSetMissing cancels active translated Slurm job when WorkloadMixing is unavailable",
+		func(t *testing.T) {
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build()
+
+			env := newReconcileTestEnv(t,
+				markUnavailable,
+				withPendingSlurmJobs(job),
+			)
+
+			res, err := env.reconcile()
+			if err != nil || res != (ctrl.Result{}) {
+				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
+			}
+			env.verifySlurmCancellation(ReasonJobSetMissing)
+		})
+
+	t.Run("StatusJobSetDeleting cancels active Slurm job, deletes nodes, and removes finalizer when unavailable",
+		func(t *testing.T) {
+			job := newReconTestJob().
+				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+				withHold(false).
+				withTranslatedJobMarkers().
+				build()
+			existingJS := newReconTestJobSet().
+				withSlurmdReplicas(1).
+				withDeletionTimestamp().
+				build()
+
+			env := newReconcileTestEnv(t,
+				markUnavailable,
+				withExtraObjects(existingJS),
+				withPendingSlurmJobs(job),
+			)
+
+			res, err := env.reconcile()
+			if err != nil || res != (ctrl.Result{}) {
+				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
+			}
+			env.verifySlurmCancellation(ReasonJobSetMissing)
+			env.verifySlurmNodesDeleted("slurm-job-" + reconJobIDStr + "-slurmd-0-0")
+			env.verifyJobSetNotFound()
+		})
+}

@@ -747,6 +747,12 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 		return ctrl.Result{}, nil
 	}
 
+	if !wm.IsAvailable() {
+		logger.V(1).Info("WorkloadMixing is not available, deferring new Slurm job admission",
+			"partition", partition)
+		return ctrl.Result{}, nil
+	}
+
 	done, err := r.newJobCheckMultiPartition(ctx, wm, slurmClient, jobInfo, partition)
 	if done || err != nil {
 		return ctrl.Result{}, err
