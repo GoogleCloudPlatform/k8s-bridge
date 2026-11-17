@@ -27,18 +27,6 @@ import (
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 )
 
-const (
-	// ConditionTypeAvailable is the status condition type tracking whether a WorkloadMixing resource is ready to admit jobs.
-	ConditionTypeAvailable = "Available"
-
-	// ReasonReconciled indicates all cross-resource validation rules succeeded.
-	ReasonReconciled = "Reconciled"
-	// ReasonSlurmControllerNotFound indicates the referenced Slinky Slurm Controller CR does not exist or is terminating.
-	ReasonSlurmControllerNotFound = "ControllerNotFound"
-	// ReasonSlurmRestAPINotFound indicates no non-terminating Slinky Slurm RestApi CR references the Slurm Controller.
-	ReasonSlurmRestAPINotFound = "RestApiNotFound"
-)
-
 // ValidationRule encapsulates a validation check evaluated against a WorkloadMixing resource.
 type ValidationRule interface {
 	Validate(ctx context.Context, reader client.Reader, wm *k8sbridgev1alpha1.WorkloadMixing) (*ValidationFailure, error)

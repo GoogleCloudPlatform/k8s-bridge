@@ -342,7 +342,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
-					Expect(reconciled.Status.Conditions[0].Type).To(Equal(rules.ConditionTypeAvailable))
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
 					Expect(reconciled.Status.Conditions[0].Reason).To(Equal(rules.ReasonSlurmControllerNotFound))
 					Expect(reconciled.Status.Conditions[0].Message).To(Equal(
@@ -406,7 +406,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
-					Expect(reconciled.Status.Conditions[0].Type).To(Equal(rules.ConditionTypeAvailable))
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
 					Expect(reconciled.Status.Conditions[0].Reason).To(Equal(rules.ReasonSlurmRestAPINotFound))
 					Expect(testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(resourceNamespace, resourceName))).To(Equal(0.0))
@@ -428,7 +428,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
-					Expect(reconciled.Status.Conditions[0].Type).To(Equal(rules.ConditionTypeAvailable))
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
 					Expect(reconciled.Status.Conditions[0].Reason).To(Equal("FirstRuleFailed"))
 					Expect(reconciled.Status.Conditions[0].Message).To(Equal("first failure; second failure"))
@@ -527,7 +527,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
-					Expect(reconciled.Status.Conditions[0].Type).To(Equal(rules.ConditionTypeAvailable))
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionTrue))
 					Expect(reconciled.Spec.PartitionsMapping).To(HaveLen(3))
 					Expect(reconciled.Spec.PartitionsMapping[0].WorkloadPriorityClass).To(Equal("prod-high"))

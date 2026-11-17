@@ -137,6 +137,9 @@ func (r *WorkloadMixingReconciler) updateActiveWorkloadMixingsMetrics(ctx contex
 	metrics.SetActiveWorkloadMixings(count)
 }
 
+// ReasonReconciled indicates all WorkloadMixing validation rules succeeded.
+const ReasonReconciled = "Reconciled"
+
 func (r *WorkloadMixingReconciler) evaluateAvailability(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) (metav1.Condition, error) {
 	var firstReason string
 	var messages []string
@@ -156,7 +159,7 @@ func (r *WorkloadMixingReconciler) evaluateAvailability(ctx context.Context, wm 
 
 	if len(messages) > 0 {
 		return metav1.Condition{
-			Type:               rules.ConditionTypeAvailable,
+			Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
 			Status:             metav1.ConditionFalse,
 			ObservedGeneration: wm.Generation,
 			Reason:             firstReason,
@@ -165,10 +168,10 @@ func (r *WorkloadMixingReconciler) evaluateAvailability(ctx context.Context, wm 
 	}
 
 	return metav1.Condition{
-		Type:               rules.ConditionTypeAvailable,
+		Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
 		Status:             metav1.ConditionTrue,
 		ObservedGeneration: wm.Generation,
-		Reason:             rules.ReasonReconciled,
+		Reason:             ReasonReconciled,
 		Message:            "WorkloadMixing successfully reconciled",
 	}, nil
 }

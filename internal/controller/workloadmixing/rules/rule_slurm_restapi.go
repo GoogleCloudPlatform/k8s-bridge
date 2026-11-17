@@ -30,6 +30,9 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/utils/refresolver"
 )
 
+// ReasonSlurmRestAPINotFound indicates no non-terminating Slinky Slurm RestApi CR references the Slurm Controller.
+const ReasonSlurmRestAPINotFound = "RestApiNotFound"
+
 // SlurmRestAPIRule validates that a non-terminating Slinky Slurm RestApi CR exists for the referenced Controller.
 type SlurmRestAPIRule struct{}
 

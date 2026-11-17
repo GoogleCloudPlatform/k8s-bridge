@@ -30,6 +30,9 @@ import (
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 )
 
+// ReasonSlurmControllerNotFound indicates the referenced Slinky Slurm Controller CR does not exist or is terminating.
+const ReasonSlurmControllerNotFound = "ControllerNotFound"
+
 // SlurmControllerRule validates that the referenced Slinky Slurm Controller CR exists and is not terminating.
 type SlurmControllerRule struct{}
 
