@@ -71,7 +71,7 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.Get(ctx, req.NamespacedName, workloadMixing); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			logger.V(1).Info("WorkloadMixing resource not found, cleaning up metrics")
-			r.cleanupWorkloadMixingMetrics(ctx, req.Name)
+			r.cleanupWorkloadMixingMetrics(ctx, req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -79,7 +79,7 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	if !workloadMixing.DeletionTimestamp.IsZero() {
 		logger.Info("WorkloadMixing is being deleted, cleaning up metrics")
-		r.cleanupWorkloadMixingMetrics(ctx, workloadMixing.Name)
+		r.cleanupWorkloadMixingMetrics(ctx, workloadMixing.Namespace, workloadMixing.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -96,8 +96,8 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
-func (r *WorkloadMixingReconciler) cleanupWorkloadMixingMetrics(ctx context.Context, name string) {
-	metrics.DeleteWorkloadMixingMetrics(name)
+func (r *WorkloadMixingReconciler) cleanupWorkloadMixingMetrics(ctx context.Context, namespace, name string) {
+	metrics.DeleteWorkloadMixingMetrics(namespace, name)
 	r.updateActiveWorkloadMixingsMetrics(ctx)
 }
 
@@ -200,6 +200,8 @@ func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context,
 			"status", condition.Status,
 			"reason", condition.Reason)
 	}
+
+	metrics.SetWorkloadMixingAvailable(workloadMixing.Namespace, workloadMixing.Name, condition.Status == metav1.ConditionTrue)
 
 	return nil
 }

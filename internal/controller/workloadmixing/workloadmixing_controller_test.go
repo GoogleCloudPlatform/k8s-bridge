@@ -210,6 +210,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
 					Expect(reconciled.Status.Conditions[0].Type).To(Equal("Available"))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionTrue))
+					Expect(testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(resourceNamespace, resourceName))).To(Equal(1.0))
 
 					fakeRec := rec.(*record.FakeRecorder)
 					Eventually(fakeRec.Events).Should(Receive(ContainSubstring("WorkloadMixing successfully reconciled")))
@@ -315,6 +316,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					Expect(reconciled.Status.Conditions[0].Type).To(Equal("Available"))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
 					Expect(reconciled.Status.Conditions[0].Reason).To(Equal("ControllerNotFound"))
+					Expect(testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(resourceNamespace, resourceName))).To(Equal(0.0))
 				},
 			}),
 			Entry("reconciliation when referenced Controller exists but RestApi is missing sets Available to False with Reason RestApiNotFound", testCase{
@@ -375,6 +377,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					Expect(reconciled.Status.Conditions[0].Type).To(Equal("Available"))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
 					Expect(reconciled.Status.Conditions[0].Reason).To(Equal("RestApiNotFound"))
+					Expect(testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(resourceNamespace, resourceName))).To(Equal(0.0))
 				},
 			}),
 			Entry("reconciliation with single, multiple distinct, and omitted workloadPriorityClass partition mappings setting status to Available", testCase{
@@ -526,11 +529,12 @@ var _ = Describe("WorkloadMixing Controller", func() {
 
 	Context("When tracking inventory metrics", func() {
 		const (
-			wmMetrics1 = "wm-metrics-1"
-			wmMetrics2 = "wm-metrics-2"
+			wmMetrics1     = "wm-metrics-1"
+			wmMetrics2     = "wm-metrics-2"
+			otherNamespace = "other-ns"
 		)
 
-		It("should update active workload mixings and tracked partitions gauges", func() {
+		It("should update active workload mixings, availability, and tracked partitions gauges", func() {
 			wm1 := &k8sbridgev1alpha1.WorkloadMixing{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      wmMetrics1,
@@ -543,6 +547,37 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					PartitionsMapping: []k8sbridgev1alpha1.PartitionMapping{
 						{Partition: "p1", LocalQueue: "q1"},
 						{Partition: "p2", LocalQueue: "q2"},
+					},
+				},
+			}
+			wm1OtherNs := &k8sbridgev1alpha1.WorkloadMixing{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wmMetrics1,
+					Namespace: otherNamespace,
+				},
+				Spec: k8sbridgev1alpha1.WorkloadMixingSpec{
+					ControllerRef: corev1.LocalObjectReference{
+						Name: testSlurmClusterName,
+					},
+					PartitionsMapping: []k8sbridgev1alpha1.PartitionMapping{
+						{Partition: "p1", LocalQueue: "q1"},
+					},
+				},
+			}
+			otherNsCtrl := &slinkyv1beta1.Controller{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testSlurmClusterName,
+					Namespace: otherNamespace,
+				},
+			}
+			otherNsRestAPI := &slinkyv1beta1.RestApi{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testSlurmClusterName + "-restapi",
+					Namespace: otherNamespace,
+				},
+				Spec: slinkyv1beta1.RestApiSpec{
+					ControllerRef: corev1.LocalObjectReference{
+						Name: testSlurmClusterName,
 					},
 				},
 			}
@@ -581,35 +616,46 @@ var _ = Describe("WorkloadMixing Controller", func() {
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(k8sClient.Scheme()).
 				WithStatusSubresource(&k8sbridgev1alpha1.WorkloadMixing{}).
-				WithObjects(wm1, wm2, js1).
+				WithObjects(wm1, wm1OtherNs, otherNsCtrl, otherNsRestAPI, wm2, js1).
 				Build()
 			r := &WorkloadMixingReconciler{Client: fakeClient, Scheme: k8sClient.Scheme()}
 
-			// Reconcile wm1
+			// Reconcile wm1 (Controller missing in default -> Available=False -> 0.0)
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: resourceNamespace, Name: wmMetrics1}})
 			Expect(err).NotTo(HaveOccurred())
 
+			Expect(testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(resourceNamespace, wmMetrics1))).To(Equal(0.0))
 			Expect(testutil.ToFloat64(metrics.TrackedPartitions.WithLabelValues(wmMetrics1))).To(Equal(2.0))
-			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(2.0))
+			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(3.0))
 			Expect(testutil.ToFloat64(metrics.ActiveJobs.WithLabelValues(wmMetrics1, "p1"))).To(Equal(1.0))
 			Expect(testutil.ToFloat64(metrics.ActiveJobs.WithLabelValues(wmMetrics1, "p2"))).To(Equal(0.0))
+
+			// Reconcile same-named wm1 in otherNamespace (Controller + RestApi present -> Available=True -> 1.0)
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: otherNamespace, Name: wmMetrics1}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(otherNamespace, wmMetrics1))).To(Equal(1.0))
 
 			// Reconcile wm2
 			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: resourceNamespace, Name: wmMetrics2}})
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(testutil.ToFloat64(metrics.TrackedPartitions.WithLabelValues(wmMetrics2))).To(Equal(1.0))
-			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(2.0))
+			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(3.0))
 
-			// Delete wm1
+			// Delete wm1 in resourceNamespace
 			Expect(fakeClient.Delete(ctx, wm1)).To(Succeed())
 
 			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: resourceNamespace, Name: wmMetrics1}})
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(1.0))
+			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(2.0))
+			Expect(metrics.WorkloadMixingAvailable.DeleteLabelValues(resourceNamespace, wmMetrics1)).To(BeFalse())
+			Expect(testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(otherNamespace, wmMetrics1))).To(Equal(1.0))
 			Expect(metrics.TrackedPartitions.DeleteLabelValues(wmMetrics1)).To(BeFalse())
 			Expect(testutil.ToFloat64(metrics.TrackedPartitions.WithLabelValues(wmMetrics2))).To(Equal(1.0))
+
+			// Clean up otherNamespace metric series
+			metrics.DeleteWorkloadMixingMetrics(otherNamespace, wmMetrics1)
 		})
 	})
 })
