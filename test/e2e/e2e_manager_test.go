@@ -97,29 +97,87 @@ var _ = Describe("Manager Standard Checks", func() {
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
 		It("should reconcile WorkloadMixing custom resource and report metrics", func() {
-			const samplePath = "config/samples/k8s-bridge_v1alpha1_workloadmixing.yaml"
+			const (
+				samplePath  = "config/samples/k8s-bridge_v1alpha1_workloadmixing.yaml"
+				invalidName = "workloadmixing-invalid"
+				missingCtrl = "non-existent-controller"
+			)
 
 			By("applying the WorkloadMixing sample CR")
 			utils.ApplyManifestWithCleanup(samplePath)
 
-			By("verifying the WorkloadMixing status condition becomes Available")
-			verifyCRReconciled := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "workloadmixing", "workloadmixing-sample", "-n", "slurm",
-					"-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}")
+			By("verifying the WorkloadMixing status condition becomes Available=True with Reason=Reconciled")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "workloadmixing", "workloadmixing-sample", "-n", slurmNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}:"+
+						"{.status.conditions[?(@.type=='Available')].reason}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "WorkloadMixing condition not Available")
-			}
-			Eventually(verifyCRReconciled, 2*time.Minute, time.Second).Should(Succeed())
+				g.Expect(output).To(Equal("True:Reconciled"))
+			}, 2*time.Minute, time.Second).Should(Succeed())
 
-			By("verifying built-in metrics for WorkloadMixing reconciliation are served")
-			verifyMetricsEndpoint("controller_runtime_reconcile_total{controller=\"workloadmixing\"")
+			By("applying an invalid WorkloadMixing CR referencing a missing Controller")
+			invalidYAML := `apiVersion: k8s-bridge.x-k8s.io/v1alpha1
+kind: WorkloadMixing
+metadata:
+  name: ` + invalidName + `
+  namespace: ` + slurmNamespace + `
+spec:
+  controllerRef:
+    name: ` + missingCtrl + `
+  partitionsMapping:
+    - partition: invalid-partition
+      localQueue: test-local-queue
+`
+			applyCmd := exec.Command("sh", "-c", "cat <<'EOF' | kubectl apply -f -\n"+invalidYAML+"EOF\n")
+			_, err := utils.Run(applyCmd)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				delCmd := exec.Command("kubectl", "delete", "workloadmixing", invalidName,
+					"-n", slurmNamespace, "--ignore-not-found")
+				_, _ = utils.Run(delCmd)
+			})
 
-			By("verifying custom k8s_bridge metrics are served on the metrics endpoint")
+			By("verifying invalid WorkloadMixing reports Available=False with aggregated rule messages")
+			Eventually(func(g Gomega) {
+				statusCmd := exec.Command("kubectl", "get", "workloadmixing", invalidName, "-n", slurmNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Available')].status}:"+
+						"{.status.conditions[?(@.type=='Available')].reason}")
+				statusOut, runErr := utils.Run(statusCmd)
+				g.Expect(runErr).NotTo(HaveOccurred())
+				g.Expect(statusOut).To(Equal("False:ControllerNotFound"))
+
+				msgCmd := exec.Command("kubectl", "get", "workloadmixing", invalidName, "-n", slurmNamespace,
+					"-o", "jsonpath={.status.conditions[?(@.type=='Available')].message}")
+				msgOut, runErr := utils.Run(msgCmd)
+				g.Expect(runErr).NotTo(HaveOccurred())
+				g.Expect(msgOut).To(ContainSubstring(`Referenced Controller "` + missingCtrl + `" not found`))
+				g.Expect(msgOut).To(ContainSubstring(`No RestApi found for Controller "` + missingCtrl + `"`))
+			}, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying built-in and custom WorkloadMixing metrics (including availability 1 and 0)")
 			verifyMetricsEndpoint(
-				"k8s_bridge_active_workload_mixings",
+				`controller_runtime_reconcile_total{controller="workloadmixing"`,
+				"k8s_bridge_active_workload_mixings 2",
+				`k8s_bridge_workload_mixing_available{namespace="slurm",workload_mixing="workloadmixing-sample"} 1`,
+				`k8s_bridge_workload_mixing_available{namespace="slurm",workload_mixing="workloadmixing-invalid"} 0`,
 				"k8s_bridge_tracked_partitions",
 				"k8s_bridge_events_queue_depth",
+			)
+
+			By("deleting the invalid WorkloadMixing CR and verifying its availability metric is cleaned up")
+			delCmd := exec.Command("kubectl", "delete", "workloadmixing", invalidName, "-n", slurmNamespace, "--wait=true")
+			_, err = utils.Run(delCmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			verifyMetricsEndpointState(
+				[]string{
+					"k8s_bridge_active_workload_mixings 1",
+					`k8s_bridge_workload_mixing_available{namespace="slurm",workload_mixing="workloadmixing-sample"} 1`,
+				},
+				[]string{
+					`workload_mixing="workloadmixing-invalid"`,
+				},
 			)
 		})
 
