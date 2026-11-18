@@ -60,7 +60,7 @@ func (SlurmControllerRule) Validate(ctx context.Context, reader client.Reader, w
 		logger.V(1).Info("Referenced Controller is terminating", "slurmController", controllerKey)
 		return &ValidationFailure{
 			Reason:  ReasonSlurmControllerNotFound,
-			Message: fmt.Sprintf("Referenced Controller %q not found", wm.Spec.ControllerRef.Name),
+			Message: fmt.Sprintf("Referenced Controller %q is being deleted", wm.Spec.ControllerRef.Name),
 		}, nil
 	}
 

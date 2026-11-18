@@ -35,12 +35,12 @@ import (
 )
 
 const (
-	labelNamespace      = "namespace"
-	labelController     = "controller"
-	labelWorkloadMixing = "workload_mixing"
-	labelPartition      = "partition"
-	labelStatus         = "status"
-	labelReason         = "reason"
+	labelWorkloadMixingNamespace = "workload_mixing_namespace"
+	labelController              = "controller"
+	labelWorkloadMixing          = "workload_mixing"
+	labelPartition               = "partition"
+	labelStatus                  = "status"
+	labelReason                  = "reason"
 )
 
 func TestMetricsRegistration(t *testing.T) {
@@ -323,9 +323,13 @@ func TestMetricsHTTPExposition(t *testing.T) {
 	assertGaugeValue(t, metricFamilies["k8s_bridge_events_queue_depth"], 16.0, nil)
 	assertGaugeValue(t, metricFamilies["k8s_bridge_slurm_client_status"], 1.0, map[string]string{labelController: controller})
 	assertGaugeValue(t, metricFamilies["k8s_bridge_workload_mixing_available"], 1.0, map[string]string{
-		labelNamespace:      ns,
-		labelWorkloadMixing: wm,
+		labelWorkloadMixingNamespace: ns,
+		labelWorkloadMixing:          wm,
 	})
+	expectedAvailLine := `k8s_bridge_workload_mixing_available{workload_mixing="wm-http-test",workload_mixing_namespace="http-test-ns"} 1`
+	if !strings.Contains(bodyStr, expectedAvailLine) {
+		t.Errorf("expected exposition output to contain %q, got:\n%s", expectedAvailLine, bodyStr)
+	}
 	assertGaugeValue(t, metricFamilies["k8s_bridge_tracked_partitions"], 2.0, map[string]string{labelWorkloadMixing: wm})
 	assertCounterValue(t, metricFamilies["k8s_bridge_jobs_discovered_total"], 1.0, map[string]string{
 		labelWorkloadMixing: wm,

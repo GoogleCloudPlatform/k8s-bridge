@@ -155,12 +155,17 @@ spec:
 				g.Expect(msgOut).To(ContainSubstring(`No RestApi found for Controller "` + missingCtrl + `"`))
 			}, 2*time.Minute, time.Second).Should(Succeed())
 
+			sampleAvailMetric := `k8s_bridge_workload_mixing_available{` +
+				`workload_mixing="workloadmixing-sample",workload_mixing_namespace="slurm"} 1`
+			invalidAvailMetric := `k8s_bridge_workload_mixing_available{` +
+				`workload_mixing="workloadmixing-invalid",workload_mixing_namespace="slurm"} 0`
+
 			By("verifying built-in and custom WorkloadMixing metrics (including availability 1 and 0)")
 			verifyMetricsEndpoint(
 				`controller_runtime_reconcile_total{controller="workloadmixing"`,
 				"k8s_bridge_active_workload_mixings 2",
-				`k8s_bridge_workload_mixing_available{namespace="slurm",workload_mixing="workloadmixing-sample"} 1`,
-				`k8s_bridge_workload_mixing_available{namespace="slurm",workload_mixing="workloadmixing-invalid"} 0`,
+				sampleAvailMetric,
+				invalidAvailMetric,
 				"k8s_bridge_tracked_partitions",
 				"k8s_bridge_events_queue_depth",
 			)
@@ -173,7 +178,7 @@ spec:
 			verifyMetricsEndpointState(
 				[]string{
 					"k8s_bridge_active_workload_mixings 1",
-					`k8s_bridge_workload_mixing_available{namespace="slurm",workload_mixing="workloadmixing-sample"} 1`,
+					sampleAvailMetric,
 				},
 				[]string{
 					`workload_mixing="workloadmixing-invalid"`,

@@ -79,17 +79,12 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	r.updateWorkloadMixingMetrics(ctx, workloadMixing)
-
-	original := workloadMixing.DeepCopy()
-
 	logger.V(1).Info("Reconciling WorkloadMixing", "controllerRef", workloadMixing.Spec.ControllerRef.Name)
 
-	if err := r.updateAvailabilityStatus(ctx, workloadMixing, original); err != nil {
-		return ctrl.Result{}, err
-	}
+	err := r.updateAvailabilityStatus(ctx, workloadMixing)
+	r.updateWorkloadMixingMetrics(ctx, workloadMixing)
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, err
 }
 
 func (r *WorkloadMixingReconciler) getRules() []rules.ValidationRule {
@@ -105,6 +100,7 @@ func (r *WorkloadMixingReconciler) cleanupWorkloadMixingMetrics(ctx context.Cont
 }
 
 func (r *WorkloadMixingReconciler) updateWorkloadMixingMetrics(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) {
+	metrics.SetWorkloadMixingAvailable(wm.Namespace, wm.Name, wm.IsAvailable())
 	metrics.SetTrackedPartitions(wm.Name, len(wm.Spec.PartitionsMapping))
 	r.updateActiveWorkloadMixingsMetrics(ctx)
 	r.updateActiveJobsMetrics(ctx, wm)
@@ -176,7 +172,7 @@ func (r *WorkloadMixingReconciler) evaluateAvailability(ctx context.Context, wm 
 	}, nil
 }
 
-func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context, workloadMixing *k8sbridgev1alpha1.WorkloadMixing, original *k8sbridgev1alpha1.WorkloadMixing) error {
+func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context, workloadMixing *k8sbridgev1alpha1.WorkloadMixing) error {
 	logger := log.FromContext(ctx)
 
 	condition, err := r.evaluateAvailability(ctx, workloadMixing)
@@ -184,14 +180,16 @@ func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context,
 		return err
 	}
 
-	changed := meta.SetStatusCondition(&workloadMixing.Status.Conditions, condition)
+	updated := workloadMixing.DeepCopy()
+	changed := meta.SetStatusCondition(&updated.Status.Conditions, condition)
 	if changed {
-		if err := r.Status().Patch(ctx, workloadMixing, client.MergeFrom(original)); err != nil {
+		if err := r.Status().Patch(ctx, updated, client.MergeFrom(workloadMixing)); err != nil {
 			if r.Recorder != nil {
 				r.Recorder.Event(workloadMixing, corev1.EventTypeWarning, "StatusUpdateFailed", "Failed to update WorkloadMixing status")
 			}
 			return err
 		}
+		*workloadMixing = *updated
 		logger.Info("Updated WorkloadMixing status condition",
 			"status", condition.Status,
 			"reason", condition.Reason,
@@ -209,8 +207,6 @@ func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context,
 			"status", condition.Status,
 			"reason", condition.Reason)
 	}
-
-	metrics.SetWorkloadMixingAvailable(workloadMixing.Namespace, workloadMixing.Name, condition.Status == metav1.ConditionTrue)
 
 	return nil
 }

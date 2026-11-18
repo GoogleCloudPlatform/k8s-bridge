@@ -28,12 +28,12 @@ const (
 	metricNamespace = "k8s_bridge"
 
 	// Label names.
-	labelNamespace      = "namespace"
-	labelController     = "controller"
-	labelWorkloadMixing = "workload_mixing"
-	labelPartition      = "partition"
-	labelStatus         = "status"
-	labelReason         = "reason"
+	labelWorkloadMixingNamespace = "workload_mixing_namespace"
+	labelController              = "controller"
+	labelWorkloadMixing          = "workload_mixing"
+	labelPartition               = "partition"
+	labelStatus                  = "status"
+	labelReason                  = "reason"
 
 	// Status constants for job synchronization outcomes.
 	StatusSuccess = "success"
@@ -136,14 +136,14 @@ var (
 		},
 	)
 
-	// WorkloadMixingAvailable reflects the availability status of a WorkloadMixing custom resource.
+	// WorkloadMixingAvailable reflects the effective availability of a WorkloadMixing custom resource.
 	WorkloadMixingAvailable = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: metricNamespace,
 			Name:      "workload_mixing_available",
-			Help:      "Availability status of a WorkloadMixing custom resource (1 for Available=True, 0 for Available=False).",
+			Help:      "Availability status of a WorkloadMixing custom resource (1 when Available=True for the current generation, 0 otherwise).",
 		},
-		[]string{labelNamespace, labelWorkloadMixing},
+		[]string{labelWorkloadMixingNamespace, labelWorkloadMixing},
 	)
 
 	// TrackedPartitions tracks the count of Slurm partitions configured and tracked per WorkloadMixing CR.
@@ -237,7 +237,8 @@ func SetActiveWorkloadMixings(count int) {
 	ActiveWorkloadMixings.Set(float64(count))
 }
 
-// SetWorkloadMixingAvailable sets the availability gauge for a WorkloadMixing CR (1 for Available=True, 0 for Available=False).
+// SetWorkloadMixingAvailable sets the availability gauge for a WorkloadMixing CR
+// (1 when Available=True for the current generation, 0 otherwise).
 func SetWorkloadMixingAvailable(namespace, workloadMixing string, available bool) {
 	val := 0.0
 	if available {
@@ -253,7 +254,7 @@ func SetTrackedPartitions(workloadMixing string, count int) {
 
 // DeleteWorkloadMixingMetrics cleans up partition gauges and resets WorkloadMixing-scoped metrics upon CR deletion.
 func DeleteWorkloadMixingMetrics(namespace, workloadMixing string) {
-	nsLabels := prometheus.Labels{labelNamespace: namespace, labelWorkloadMixing: workloadMixing}
+	nsLabels := prometheus.Labels{labelWorkloadMixingNamespace: namespace, labelWorkloadMixing: workloadMixing}
 	WorkloadMixingAvailable.DeletePartialMatch(nsLabels)
 
 	labels := prometheus.Labels{labelWorkloadMixing: workloadMixing}

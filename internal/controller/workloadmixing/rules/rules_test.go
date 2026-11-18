@@ -151,6 +151,10 @@ func TestSlurmControllerRule_Validate(t *testing.T) {
 		if failure.Reason != ReasonSlurmControllerNotFound {
 			t.Errorf("expected reason %q, got %q", ReasonSlurmControllerNotFound, failure.Reason)
 		}
+		expectedMsg := `Referenced Controller "slurm-ctrl" is being deleted`
+		if failure.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, failure.Message)
+		}
 	})
 
 	t.Run("propagates transient client Get error", func(t *testing.T) {
@@ -300,6 +304,10 @@ func TestSlurmRestAPIRule_Validate(t *testing.T) {
 		}
 		if failure.Reason != ReasonSlurmRestAPINotFound {
 			t.Errorf("expected reason %q, got %q", ReasonSlurmRestAPINotFound, failure.Reason)
+		}
+		expectedMsg := `RestApi for Controller "slurm-ctrl" is being deleted`
+		if failure.Message != expectedMsg {
+			t.Errorf("expected message %q, got %q", expectedMsg, failure.Message)
 		}
 	})
 

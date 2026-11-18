@@ -103,7 +103,7 @@ All metrics use the `k8s_bridge_` prefix and bounded, low-cardinality labels:
 | `k8s_bridge_job_translation_duration_seconds` | Histogram | `workload_mixing`, `partition` | Latency of converting Slurm jobs to Kubernetes JobSets in seconds. |
 | `k8s_bridge_active_jobs` | Gauge | `workload_mixing`, `partition` | Current count of in-flight managed Slurm jobs. |
 | `k8s_bridge_active_workload_mixings` | Gauge | _none_ | Total number of active `WorkloadMixing` custom resources. |
-| `k8s_bridge_workload_mixing_available` | Gauge | `namespace`, `workload_mixing` | Availability status of a `WorkloadMixing` custom resource (`1` = `Available=True`, `0` = `Available=False`). |
+| `k8s_bridge_workload_mixing_available` | Gauge | `workload_mixing_namespace`, `workload_mixing` | Availability status of a `WorkloadMixing` custom resource (`1` when `Available=True` for the current generation, `0` otherwise). |
 | `k8s_bridge_tracked_partitions` | Gauge | `workload_mixing` | Number of Slurm partitions actively configured and tracked per `WorkloadMixing` resource. |
 | `k8s_bridge_dropped_events_total` | Counter | `workload_mixing` | Total number of events dropped due to channel buffer saturation. |
 | `k8s_bridge_events_queue_depth` | Gauge | _none_ | Current depth of the internal poller event queue. |

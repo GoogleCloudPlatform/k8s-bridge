@@ -58,6 +58,14 @@ func (SlurmRestAPIRule) Validate(ctx context.Context, reader client.Reader, wm *
 		}
 	}
 
+	if len(restAPIList.Items) > 0 {
+		logger.V(1).Info("RestApi for Controller is terminating", "slurmController", client.ObjectKeyFromObject(controllerStub))
+		return &ValidationFailure{
+			Reason:  ReasonSlurmRestAPINotFound,
+			Message: fmt.Sprintf("RestApi for Controller %q is being deleted", wm.Spec.ControllerRef.Name),
+		}, nil
+	}
+
 	logger.V(1).Info("No RestApi found for Controller", "slurmController", client.ObjectKeyFromObject(controllerStub))
 	return &ValidationFailure{
 		Reason:  ReasonSlurmRestAPINotFound,
