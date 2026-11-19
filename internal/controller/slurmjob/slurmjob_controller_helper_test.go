@@ -34,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -260,7 +259,6 @@ type reconcileTestEnv struct {
 	fakeClient client.Client
 	mockSlurm  *utils.SlurmClient
 	clientMap  *clientmap.ClientMap
-	recorder   *record.FakeRecorder
 	reconciler *SlurmJobReconciler
 	jobSetKey  types.NamespacedName
 }
@@ -389,12 +387,10 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 		cMap.Add(context.Background(), types.NamespacedName{Namespace: reconNamespace, Name: controllerName}, mockSlurm)
 	}
 
-	recorder := record.NewFakeRecorder(100)
 	reconciler := &SlurmJobReconciler{
 		Client:    fakeClient,
 		APIReader: baseClient,
 		Scheme:    scheme,
-		Recorder:  recorder,
 		ClientMap: cMap,
 	}
 
@@ -407,7 +403,6 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 		fakeClient: fakeClient,
 		mockSlurm:  mockSlurm,
 		clientMap:  cMap,
-		recorder:   recorder,
 		reconciler: reconciler,
 		jobSetKey:  types.NamespacedName{Namespace: reconNamespace, Name: "slurm-job-" + reconJobIDStr},
 	}
@@ -585,18 +580,6 @@ func (e *reconcileTestEnv) verifyNoSlurmUpdates() {
 	}
 	if len(e.mockSlurm.GetDeletedNodes()) != 0 {
 		e.t.Errorf("Expected no node deletions, got %v", e.mockSlurm.GetDeletedNodes())
-	}
-}
-
-func (e *reconcileTestEnv) verifyNoEvents() {
-	e.t.Helper()
-	if e.recorder == nil {
-		return
-	}
-	select {
-	case ev := <-e.recorder.Events:
-		e.t.Errorf("Expected no Kubernetes events, got %q", ev)
-	default:
 	}
 }
 

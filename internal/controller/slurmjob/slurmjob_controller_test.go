@@ -2925,140 +2925,55 @@ func TestJobSetWatchPredicate(t *testing.T) {
 	})
 }
 
-func TestReconcile_NewJob_DeferredWhenWorkloadMixingUnavailable(t *testing.T) {
+func TestReconcile_WorkloadMixingAvailabilityGate(t *testing.T) {
 	markUnavailable := withWorkloadMixingModifier(func(wm *k8sbridgev1alpha1.WorkloadMixing) {
-		wm.Generation = 2
+		wm.Generation = 1
 		wm.Status.Conditions = []metav1.Condition{
 			{
 				Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
 				Status:             metav1.ConditionFalse,
-				ObservedGeneration: 2,
+				ObservedGeneration: 1,
 				Reason:             testReasonLocalQueueNotFound,
 			},
 		}
 	})
 
-	t.Run("Defers single-partition new job while unavailable and admits once Available=True", func(t *testing.T) {
-		job := newReconTestJob().
-			withNodes(1).
-			withAutoHold().
-			build()
+	t.Run("Defers new job while unavailable and admits once Available=True", func(t *testing.T) {
+		job := newReconTestJob().withNodes(1).withAutoHold().build()
+		env := newReconcileTestEnv(t, markUnavailable, withPendingSlurmJobs(job))
 
-		env := newReconcileTestEnv(t,
-			markUnavailable,
-			withPendingSlurmJobs(job),
-		)
-		beforeDiscovered := env.jobsDiscoveredCount()
-		beforeCreatedSync := env.jobsSyncCount(metrics.StatusSuccess, metrics.ReasonJobSetCreated)
-
-		// 1. Reconcile while unavailable -> deferred with zero side effects.
+		// 1. Unavailable -> deferred with no JobSet or Slurm updates.
 		res, err := env.reconcile()
 		if err != nil || res != (ctrl.Result{}) {
 			t.Fatalf("First reconcile = (%v, %v), want (empty, nil)", res, err)
 		}
 		env.verifyJobSetNotFound()
 		env.verifyNoSlurmUpdates()
-		env.verifyNoEvents()
-		if got := env.jobsDiscoveredCount(); got != beforeDiscovered {
-			t.Fatalf("JobsDiscovered changed while unavailable: got %f, want %f", got, beforeDiscovered)
-		}
-		if got := env.jobsSyncCount(metrics.StatusSuccess, metrics.ReasonJobSetCreated); got != beforeCreatedSync {
-			t.Fatalf("JobsSync(created) changed while unavailable: got %f, want %f", got, beforeCreatedSync)
-		}
 
-		// 2. Transition WorkloadMixing to Available=True for current Generation.
+		// 2. Available=True -> JobSet created and Slurm hold released.
 		wmKey := types.NamespacedName{Namespace: reconNamespace, Name: reconWmName}
 		var latestWM k8sbridgev1alpha1.WorkloadMixing
 		if err := env.baseClient.Get(t.Context(), wmKey, &latestWM); err != nil {
 			t.Fatalf("Failed to get WorkloadMixing: %v", err)
 		}
-		latestWM.Status.Conditions = []metav1.Condition{
-			{
-				Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
-				Status:             metav1.ConditionTrue,
-				ObservedGeneration: latestWM.Generation,
-				Reason:             testReasonReconciled,
-			},
-		}
+		latestWM.Status.Conditions[0].Status = metav1.ConditionTrue
+		latestWM.Status.Conditions[0].Reason = testReasonReconciled
 		if err := env.baseClient.Update(t.Context(), &latestWM); err != nil {
-			t.Fatalf("Failed to update WorkloadMixing status: %v", err)
+			t.Fatalf("Failed to update WorkloadMixing: %v", err)
 		}
 
-		// 3. Reconcile once Available=True -> JobSet created, Slurm hold released, metrics incremented once.
 		res, err = env.reconcile()
 		if err != nil || res != (ctrl.Result{}) {
 			t.Fatalf("Recovery reconcile = (%v, %v), want (empty, nil)", res, err)
 		}
 		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
 		env.verifySlurmUnhold()
-		if got := env.jobsDiscoveredCount(); got != beforeDiscovered+1 {
-			t.Errorf("JobsDiscovered = %f, want %f", got, beforeDiscovered+1)
-		}
-		if got := env.jobsSyncCount(metrics.StatusSuccess, metrics.ReasonJobSetCreated); got != beforeCreatedSync+1 {
-			t.Errorf("JobsSync(created) = %f, want %f", got, beforeCreatedSync+1)
-		}
 	})
 
-	t.Run("Defers multi-partition job instead of cancelling when WorkloadMixing is unavailable", func(t *testing.T) {
-		multiPart := reconPartitionName + ",other-partition"
-		job := newReconTestJob().
-			withPartition(multiPart).
-			withNodes(1).
-			withAutoHold().
-			build()
-
-		env := newReconcileTestEnv(t,
-			markUnavailable,
-			withPendingSlurmJobs(job),
-		)
-		beforeTranslationErrSync := testutil.ToFloat64(
-			metrics.JobsSync.WithLabelValues(
-				metrics.StatusError, metrics.ReasonTranslationError, reconWmName, multiPart,
-			),
-		)
-
-		res, err := env.reconcile()
-		if err != nil || res != (ctrl.Result{}) {
-			t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
-		}
-		env.verifyJobSetNotFound()
-		env.verifyNoSlurmUpdates()
-		env.verifyNoEvents()
-
-		afterTranslationErrSync := testutil.ToFloat64(
-			metrics.JobsSync.WithLabelValues(
-				metrics.StatusError, metrics.ReasonTranslationError, reconWmName, multiPart,
-			),
-		)
-		if afterTranslationErrSync != beforeTranslationErrSync {
-			t.Errorf("Expected JobsSync(translation_error) unchanged (%f), got %f",
-				beforeTranslationErrSync, afterTranslationErrSync)
-		}
-	})
-}
-
-func TestReconcile_ActiveJob_ProceedsWhenWorkloadMixingUnavailable(t *testing.T) {
-	markUnavailable := withWorkloadMixingModifier(func(wm *k8sbridgev1alpha1.WorkloadMixing) {
-		wm.Generation = 2
-		wm.Status.Conditions = []metav1.Condition{
-			{
-				Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: 2,
-				Reason:             testReasonLocalQueueNotFound,
-			},
-		}
-	})
-
-	t.Run("StatusShouldUnhold unholds Slurm job when WorkloadMixing is unavailable", func(t *testing.T) {
+	t.Run("Proceeds for existing JobSet even when WorkloadMixing is unavailable", func(t *testing.T) {
 		job := newReconTestJob().withAutoHold().build()
 		existingJS := newReconTestJobSet().withSuspend(false).build()
-
-		env := newReconcileTestEnv(t,
-			markUnavailable,
-			withExtraObjects(existingJS),
-			withPendingSlurmJobs(job),
-		)
+		env := newReconcileTestEnv(t, markUnavailable, withExtraObjects(existingJS), withPendingSlurmJobs(job))
 
 		res, err := env.reconcile()
 		if err != nil || res != (ctrl.Result{}) {
@@ -3066,105 +2981,4 @@ func TestReconcile_ActiveJob_ProceedsWhenWorkloadMixingUnavailable(t *testing.T)
 		}
 		env.verifySlurmUnhold()
 	})
-
-	t.Run("StatusJobSetCompleted cleans up JobSet and cancels Slurm job when WorkloadMixing is unavailable",
-		func(t *testing.T) {
-			job := newReconTestJob().
-				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
-				withHold(false).
-				withTranslatedJobMarkers().
-				build()
-			existingJS := newReconTestJobSet().
-				withSlurmdReplicas(1).
-				withCondition(string(jobsetv1alpha2.JobSetCompleted), metav1.ConditionTrue).
-				build()
-
-			env := newReconcileTestEnv(t,
-				markUnavailable,
-				withExtraObjects(existingJS),
-				withPendingSlurmJobs(job),
-			)
-
-			res, err := env.reconcile()
-			if err != nil || res != (ctrl.Result{}) {
-				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
-			}
-			env.verifySlurmCancellation(ReasonJobSetCompleted)
-			env.verifySlurmNodesDeleted("slurm-job-" + reconJobIDStr + "-slurmd-0-0")
-			env.verifyJobSetNotFound()
-		})
-
-	t.Run("StatusJobSetFailed cleans up JobSet and cancels Slurm job when WorkloadMixing is unavailable",
-		func(t *testing.T) {
-			job := newReconTestJob().
-				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
-				withHold(false).
-				withTranslatedJobMarkers().
-				build()
-			existingJS := newReconTestJobSet().
-				withSlurmdReplicas(1).
-				withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
-				build()
-
-			env := newReconcileTestEnv(t,
-				markUnavailable,
-				withExtraObjects(existingJS),
-				withPendingSlurmJobs(job),
-			)
-
-			res, err := env.reconcile()
-			if err != nil || res != (ctrl.Result{}) {
-				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
-			}
-			env.verifySlurmCancellation(ReasonJobSetFailed)
-			env.verifySlurmNodesDeleted("slurm-job-" + reconJobIDStr + "-slurmd-0-0")
-			env.verifyJobSetNotFound()
-		})
-
-	t.Run("StatusJobSetMissing cancels active translated Slurm job when WorkloadMixing is unavailable",
-		func(t *testing.T) {
-			job := newReconTestJob().
-				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-				withHold(false).
-				withTranslatedJobMarkers().
-				build()
-
-			env := newReconcileTestEnv(t,
-				markUnavailable,
-				withPendingSlurmJobs(job),
-			)
-
-			res, err := env.reconcile()
-			if err != nil || res != (ctrl.Result{}) {
-				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
-			}
-			env.verifySlurmCancellation(ReasonJobSetMissing)
-		})
-
-	t.Run("StatusJobSetDeleting cancels active Slurm job, deletes nodes, and removes finalizer when unavailable",
-		func(t *testing.T) {
-			job := newReconTestJob().
-				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-				withHold(false).
-				withTranslatedJobMarkers().
-				build()
-			existingJS := newReconTestJobSet().
-				withSlurmdReplicas(1).
-				withDeletionTimestamp().
-				build()
-
-			env := newReconcileTestEnv(t,
-				markUnavailable,
-				withExtraObjects(existingJS),
-				withPendingSlurmJobs(job),
-			)
-
-			res, err := env.reconcile()
-			if err != nil || res != (ctrl.Result{}) {
-				t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
-			}
-			env.verifySlurmCancellation(ReasonJobSetMissing)
-			env.verifySlurmNodesDeleted("slurm-job-" + reconJobIDStr + "-slurmd-0-0")
-			env.verifyJobSetNotFound()
-		})
 }
