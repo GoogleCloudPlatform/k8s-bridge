@@ -465,29 +465,16 @@ func (p *SlurmPoller) processPendingJobsForWM(
 ) error {
 	logger := log.FromContext(ctx).WithName("slurm-poller")
 
-	wmAvailable := wm.IsAvailable()
-
-	var jobSetsByName map[string]*jobsetv1alpha2.JobSet
-	for i := range jobSets {
-		if isJobSetOwnedByWM(&jobSets[i], wm) {
-			if jobSetsByName == nil {
-				jobSetsByName = make(map[string]*jobsetv1alpha2.JobSet, len(jobSets))
-			}
-			jobSetsByName[jobSets[i].Name] = &jobSets[i]
-		}
-	}
-
-	if !wmAvailable {
-		logger.V(1).Info("WorkloadMixing is not available, skipping new pending job admission",
-			"workloadMixing", client.ObjectKeyFromObject(wm))
-		if len(jobSetsByName) == 0 {
-			return nil
-		}
-	}
-
 	observedPartitions := make(map[string]bool, len(wm.Spec.PartitionsMapping))
 	for _, pm := range wm.Spec.PartitionsMapping {
 		observedPartitions[pm.Partition] = true
+	}
+
+	jobSetsByName := make(map[string]*jobsetv1alpha2.JobSet, len(jobSets))
+	for i := range jobSets {
+		if isJobSetOwnedByWM(&jobSets[i], wm) {
+			jobSetsByName[jobSets[i].Name] = &jobSets[i]
+		}
 	}
 
 	for i := range jobList.Items {
@@ -509,7 +496,7 @@ func (p *SlurmPoller) processPendingJobsForWM(
 				jobIDStr := strconv.Itoa(int(jobID))
 				jobSetName := jobSetNameForJobID(jobIDStr)
 				existingJS := jobSetsByName[jobSetName]
-				if !shouldEmitAdmissionEvent(wmAvailable, job, existingJS) {
+				if !shouldEmitAdmissionEvent(wm.IsAvailable(), job, existingJS) {
 					continue
 				}
 

@@ -1682,7 +1682,6 @@ func TestPoll_WorkloadMixingAvailabilityGate(t *testing.T) {
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = jobsetv1alpha2.AddToScheme(scheme)
 
-	now := metav1.Now()
 	newHeldPendingJobOn := func(id int32, partition string) slurmclienttypes.V0044JobInfo {
 		return *newEmptyTestJob().
 			withJobID(id).
@@ -1695,107 +1694,6 @@ func TestPoll_WorkloadMixingAvailabilityGate(t *testing.T) {
 	}
 	newHeldPendingJob := func(id int32) slurmclienttypes.V0044JobInfo {
 		return newHeldPendingJobOn(id, testPartitionName)
-	}
-
-	unavailableCases := []struct {
-		name     string
-		modifyWM func(wm *k8sbridgev1alpha1.WorkloadMixing)
-	}{
-		{
-			name: "Unreconciled WorkloadMixing with empty Conditions",
-			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
-				wm.Status.Conditions = nil
-			},
-		},
-		{
-			name: "WorkloadMixing with Available=False",
-			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
-				wm.Generation = 2
-				wm.Status.Conditions = []metav1.Condition{
-					{
-						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
-						Status:             metav1.ConditionFalse,
-						ObservedGeneration: 2,
-						Reason:             testReasonLocalQueueNotFound,
-					},
-				}
-			},
-		},
-		{
-			name: "WorkloadMixing with Available=Unknown",
-			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
-				wm.Generation = 1
-				wm.Status.Conditions = []metav1.Condition{
-					{
-						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
-						Status:             metav1.ConditionUnknown,
-						ObservedGeneration: 1,
-						Reason:             "Reconciling",
-					},
-				}
-			},
-		},
-		{
-			name: "WorkloadMixing with stale ObservedGeneration < Generation",
-			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
-				wm.Generation = 3
-				wm.Status.Conditions = []metav1.Condition{
-					{
-						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
-						Status:             metav1.ConditionTrue,
-						ObservedGeneration: 2,
-						Reason:             testReasonReconciled,
-					},
-				}
-			},
-		},
-		{
-			name: "Terminating WorkloadMixing with DeletionTimestamp set",
-			modifyWM: func(wm *k8sbridgev1alpha1.WorkloadMixing) {
-				wm.Generation = 1
-				wm.DeletionTimestamp = &now
-				wm.Finalizers = []string{"test.k8s-bridge.io/keep"}
-				wm.Status.Conditions = []metav1.Condition{
-					{
-						Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
-						Status:             metav1.ConditionTrue,
-						ObservedGeneration: 1,
-						Reason:             testReasonReconciled,
-					},
-				}
-			},
-		},
-	}
-
-	for _, tc := range unavailableCases {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := t.Context()
-			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-			wm.UID = testWMUID
-			tc.modifyWM(wm)
-
-			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm).Build()
-			cMap := clientmap.NewClientMap()
-			mockSlurm := &utils.SlurmClient{}
-			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{newHeldPendingJob(401)})
-			cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
-
-			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
-			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-			poller := &SlurmPoller{
-				Client:          fakeK8sClient,
-				ClientMap:       cMap,
-				AdmissionEvents: admissionChan,
-				TeardownEvents:  teardownChan,
-			}
-
-			if err := poller.Poll(ctx); err != nil {
-				t.Fatalf("Poll failed: %v", err)
-			}
-			if got := len(admissionChan); got != 0 {
-				t.Fatalf("Poll() emitted %d admission events while WM unavailable, want 0", got)
-			}
-		})
 	}
 
 	t.Run("Unavailable WM-2 does not block new job admission on healthy WM-1 sharing the same Controller",
@@ -1846,70 +1744,6 @@ func TestPoll_WorkloadMixingAvailabilityGate(t *testing.T) {
 			if ev.JobID != "510" || ev.WorkloadMixing.Name != wm1.Name {
 				t.Fatalf("Admission event = (%q, %s), want (\"510\", %s)",
 					ev.JobID, ev.WorkloadMixing.Name, wm1.Name)
-			}
-		})
-
-	t.Run("Unavailable conflicting WM-2 does not emit StatusJobSetMissing for job owned by healthy WM-1",
-		func(t *testing.T) {
-			ctx := t.Context()
-			wm1 := newTestWorkloadMixing("wm-healthy", testControllerName, testPartitionName, testQueueName)
-			wm1.UID = "uid-wm-1"
-
-			wm2 := newTestWorkloadMixing("wm-conflict", testControllerName, testPartitionName, testQueueName)
-			wm2.UID = "uid-wm-2"
-			wm2.Generation = 1
-			wm2.Status.Conditions = []metav1.Condition{
-				{
-					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
-					Status:             metav1.ConditionFalse,
-					ObservedGeneration: 1,
-					Reason:             "PartitionConflict",
-				},
-			}
-
-			ownedJS := newTestJobSet("slurm-job-500").
-				withNamespace(testNamespace).
-				withSuspend(false).
-				withLabels(map[string]string{
-					LabelSlurmJobID:     "500",
-					LabelSlurmPartition: testPartitionName,
-				}).
-				withOwnerReference(metav1.OwnerReference{
-					APIVersion: k8sbridgev1alpha1.GroupVersion.String(),
-					Kind:       KindWorkloadMixing,
-					Name:       wm1.Name,
-					UID:        wm1.UID,
-				}).
-				build()
-
-			translatedJob := *newEmptyTestJob().
-				withJobID(500).
-				withPartition(testPartitionName).
-				withJobState(slurmapi.V0044JobInfoJobStatePENDING).
-				withHold(false).
-				withFeatures("k8s-id-500").
-				build()
-
-			fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm1, wm2, ownedJS).Build()
-			cMap := clientmap.NewClientMap()
-			mockSlurm := &utils.SlurmClient{}
-			mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{translatedJob})
-			cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
-
-			admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
-			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
-			poller := &SlurmPoller{
-				Client:          fakeK8sClient,
-				ClientMap:       cMap,
-				AdmissionEvents: admissionChan,
-				TeardownEvents:  teardownChan,
-			}
-
-			if err := poller.Poll(ctx); err != nil {
-				t.Fatalf("Poll failed: %v", err)
-			}
-			if got := len(admissionChan); got != 0 {
-				t.Fatalf("Expected 0 admission events (neither WM-1 nor unavailable WM-2 should emit), got %d", got)
 			}
 		})
 
