@@ -27,19 +27,70 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/controller/slurmjob"
+	"github.com/GoogleCloudPlatform/k8s-bridge/internal/controller/workloadmixing/rules"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
 	slinkyv1beta1 "github.com/SlinkyProject/slurm-operator/api/v1beta1"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 )
+
+type staticRule struct {
+	failure *rules.ValidationFailure
+	err     error
+}
+
+func (s staticRule) Validate(_ context.Context, _ client.Reader, _ *k8sbridgev1alpha1.WorkloadMixing) (*rules.ValidationFailure, error) {
+	return s.failure, s.err
+}
+
+func lookupWorkloadMixingAvailableGauge(namespace, name string) (float64, bool) {
+	ch := make(chan prometheus.Metric, 32)
+	go func() {
+		metrics.WorkloadMixingAvailable.Collect(ch)
+		close(ch)
+	}()
+
+	for m := range ch {
+		var pb dto.Metric
+		ExpectWithOffset(1, m.Write(&pb)).To(Succeed())
+		var gotNS, gotWM string
+		for _, lp := range pb.GetLabel() {
+			switch lp.GetName() {
+			case "workload_mixing_namespace":
+				gotNS = lp.GetValue()
+			case "workload_mixing":
+				gotWM = lp.GetValue()
+			}
+		}
+		if gotNS == namespace && gotWM == name {
+			return pb.GetGauge().GetValue(), true
+		}
+	}
+	return 0, false
+}
+
+func expectWorkloadMixingAvailableGauge(namespace, name string, expected float64) {
+	val, exists := lookupWorkloadMixingAvailableGauge(namespace, name)
+	ExpectWithOffset(1, exists).To(BeTrue(), "expected k8s_bridge_workload_mixing_available series for %s/%s to exist", namespace, name)
+	ExpectWithOffset(1, val).To(Equal(expected))
+}
+
+func expectNoWorkloadMixingAvailableGauge(namespace, name string) {
+	_, exists := lookupWorkloadMixingAvailableGauge(namespace, name)
+	ExpectWithOffset(1, exists).To(BeFalse(), "expected k8s_bridge_workload_mixing_available series for %s/%s not to exist", namespace, name)
+}
 
 var _ = Describe("WorkloadMixing Controller", func() {
 	const (
@@ -61,7 +112,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 	}
 
 	Context("When setting up the controller with manager", func() {
-		It("should register the reconciler successfully", func() {
+		It("should register the reconciler successfully with default WatchableRules", func() {
 			mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 				Scheme: k8sClient.Scheme(),
 			})
@@ -70,6 +121,21 @@ var _ = Describe("WorkloadMixing Controller", func() {
 			controllerReconciler := &WorkloadMixingReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
+			}
+			Expect(controllerReconciler.SetupWithManager(mgr)).To(Succeed())
+		})
+
+		It("should register the reconciler successfully when Rules include non-watchable rules", func() {
+			mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+				Scheme:     k8sClient.Scheme(),
+				Controller: ctrlconfig.Controller{SkipNameValidation: ptr.To(true)},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			controllerReconciler := &WorkloadMixingReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+				Rules:  []rules.ValidationRule{staticRule{}},
 			}
 			Expect(controllerReconciler.SetupWithManager(mgr)).To(Succeed())
 		})
@@ -152,14 +218,20 @@ var _ = Describe("WorkloadMixing Controller", func() {
 			teardown       func(ctx context.Context)
 			getClient      func() client.Client
 			getRecorder    func() record.EventRecorder
+			rules          []rules.ValidationRule
 			req            reconcile.Request
 			expectErr      bool
 			expectedResult reconcile.Result
 			validate       func(ctx context.Context, rec record.EventRecorder)
 		}
 
+		var savedCondition metav1.Condition
+
 		DescribeTable("Reconcile scenarios",
 			func(tc testCase) {
+				metrics.DeleteWorkloadMixingMetrics(resourceNamespace, resourceName)
+				defer metrics.DeleteWorkloadMixingMetrics(resourceNamespace, resourceName)
+
 				if tc.setup != nil {
 					tc.setup(ctx)
 				}
@@ -181,6 +253,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					Client:   c,
 					Scheme:   k8sClient.Scheme(),
 					Recorder: rec,
+					Rules:    tc.rules,
 				}
 
 				res, err := reconciler.Reconcile(ctx, tc.req)
@@ -210,6 +283,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
 					Expect(reconciled.Status.Conditions[0].Type).To(Equal("Available"))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionTrue))
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 1.0)
 
 					fakeRec := rec.(*record.FakeRecorder)
 					Eventually(fakeRec.Events).Should(Receive(ContainSubstring("WorkloadMixing successfully reconciled")))
@@ -274,11 +348,13 @@ var _ = Describe("WorkloadMixing Controller", func() {
 						},
 					}).Build()
 				},
+				rules:          []rules.ValidationRule{staticRule{}},
 				getRecorder:    func() record.EventRecorder { return record.NewFakeRecorder(10) },
 				req:            reconcile.Request{NamespacedName: typeNamespacedName},
 				expectErr:      true,
 				expectedResult: reconcile.Result{},
 				validate: func(ctx context.Context, rec record.EventRecorder) {
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 0.0)
 					fakeRec := rec.(*record.FakeRecorder)
 					Eventually(fakeRec.Events).Should(Receive(ContainSubstring("Failed to update WorkloadMixing status")))
 				},
@@ -312,9 +388,13 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
-					Expect(reconciled.Status.Conditions[0].Type).To(Equal("Available"))
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
-					Expect(reconciled.Status.Conditions[0].Reason).To(Equal("ControllerNotFound"))
+					Expect(reconciled.Status.Conditions[0].Reason).To(Equal(rules.ReasonSlurmControllerNotFound))
+					Expect(reconciled.Status.Conditions[0].Message).To(Equal(
+						`Referenced Controller "missing-controller" not found; No RestApi found for Controller "missing-controller"`,
+					))
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 0.0)
 				},
 			}),
 			Entry("reconciliation when referenced Controller exists but RestApi is missing sets Available to False with Reason RestApiNotFound", testCase{
@@ -372,9 +452,124 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
-					Expect(reconciled.Status.Conditions[0].Type).To(Equal("Available"))
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
-					Expect(reconciled.Status.Conditions[0].Reason).To(Equal("RestApiNotFound"))
+					Expect(reconciled.Status.Conditions[0].Reason).To(Equal(rules.ReasonSlurmRestAPINotFound))
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 0.0)
+				},
+			}),
+			Entry("reconciliation aggregates multiple rule failures using first failed rule Reason", testCase{
+				setup:       createCR,
+				teardown:    deleteCR,
+				getRecorder: func() record.EventRecorder { return record.NewFakeRecorder(10) },
+				rules: []rules.ValidationRule{
+					staticRule{},
+					staticRule{failure: &rules.ValidationFailure{Reason: "FirstRuleFailed", Message: "first failure"}},
+					staticRule{failure: &rules.ValidationFailure{Reason: "SecondRuleFailed", Message: "second failure"}},
+				},
+				req:            reconcile.Request{NamespacedName: typeNamespacedName},
+				expectErr:      false,
+				expectedResult: reconcile.Result{},
+				validate: func(ctx context.Context, rec record.EventRecorder) {
+					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
+					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
+					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
+					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionFalse))
+					Expect(reconciled.Status.Conditions[0].Reason).To(Equal("FirstRuleFailed"))
+					Expect(reconciled.Status.Conditions[0].Message).To(Equal("first failure; second failure"))
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 0.0)
+				},
+			}),
+			Entry("reconciliation returns error without mutating existing Available=True status when a ValidationRule returns a runtime error", testCase{
+				setup: func(ctx context.Context) {
+					createCR(ctx)
+					r := &WorkloadMixingReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+					_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+					Expect(err).NotTo(HaveOccurred())
+
+					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
+					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
+					Expect(reconciled.Status.Conditions).To(HaveLen(1))
+					savedCondition = reconciled.Status.Conditions[0]
+					Expect(savedCondition.Status).To(Equal(metav1.ConditionTrue))
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 1.0)
+				},
+				teardown:    deleteCR,
+				getRecorder: func() record.EventRecorder { return record.NewFakeRecorder(10) },
+				rules: []rules.ValidationRule{
+					staticRule{err: fmt.Errorf("transient rule error")},
+				},
+				req:            reconcile.Request{NamespacedName: typeNamespacedName},
+				expectErr:      true,
+				expectedResult: reconcile.Result{},
+				validate: func(ctx context.Context, rec record.EventRecorder) {
+					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
+					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
+					Expect(reconciled.Status.Conditions).To(HaveLen(1))
+					Expect(reconciled.Status.Conditions[0]).To(Equal(savedCondition))
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 1.0)
+
+					fakeRec := rec.(*record.FakeRecorder)
+					Expect(fakeRec.Events).To(BeEmpty())
+				},
+			}),
+			Entry("reconciliation sets availability gauge to 0 without writing status when initial evaluation returns a runtime error", testCase{
+				setup:       createCR,
+				teardown:    deleteCR,
+				getRecorder: func() record.EventRecorder { return record.NewFakeRecorder(10) },
+				rules: []rules.ValidationRule{
+					staticRule{err: fmt.Errorf("transient rule error")},
+				},
+				req:            reconcile.Request{NamespacedName: typeNamespacedName},
+				expectErr:      true,
+				expectedResult: reconcile.Result{},
+				validate: func(ctx context.Context, rec record.EventRecorder) {
+					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
+					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
+					Expect(reconciled.Status.Conditions).To(BeEmpty())
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 0.0)
+
+					fakeRec := rec.(*record.FakeRecorder)
+					Expect(fakeRec.Events).To(BeEmpty())
+				},
+			}),
+			Entry("reconciliation flips availability gauge to 0 without mutating status when a spec edit hits a runtime rule error", testCase{
+				setup: func(ctx context.Context) {
+					createCR(ctx)
+					r := &WorkloadMixingReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+					_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+					Expect(err).NotTo(HaveOccurred())
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 1.0)
+
+					current := &k8sbridgev1alpha1.WorkloadMixing{}
+					Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+					savedCondition = current.Status.Conditions[0]
+
+					current.Spec.PartitionsMapping = []k8sbridgev1alpha1.PartitionMapping{
+						{Partition: "edited-partition", LocalQueue: "q1"},
+					}
+					Expect(k8sClient.Update(ctx, current)).To(Succeed())
+				},
+				teardown:    deleteCR,
+				getRecorder: func() record.EventRecorder { return record.NewFakeRecorder(10) },
+				rules: []rules.ValidationRule{
+					staticRule{err: fmt.Errorf("transient rule error")},
+				},
+				req:            reconcile.Request{NamespacedName: typeNamespacedName},
+				expectErr:      true,
+				expectedResult: reconcile.Result{},
+				validate: func(ctx context.Context, rec record.EventRecorder) {
+					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
+					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
+					Expect(reconciled.Generation).To(BeNumerically(">", savedCondition.ObservedGeneration))
+					Expect(reconciled.Status.Conditions).To(HaveLen(1))
+					Expect(reconciled.Status.Conditions[0]).To(Equal(savedCondition))
+					Expect(reconciled.IsAvailable()).To(BeFalse())
+					expectWorkloadMixingAvailableGauge(resourceNamespace, resourceName, 0.0)
+
+					fakeRec := rec.(*record.FakeRecorder)
+					Expect(fakeRec.Events).To(BeEmpty())
 				},
 			}),
 			Entry("reconciliation with single, multiple distinct, and omitted workloadPriorityClass partition mappings setting status to Available", testCase{
@@ -454,7 +649,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					reconciled := &k8sbridgev1alpha1.WorkloadMixing{}
 					Expect(k8sClient.Get(ctx, typeNamespacedName, reconciled)).To(Succeed())
 					Expect(reconciled.Status.Conditions).NotTo(BeEmpty())
-					Expect(reconciled.Status.Conditions[0].Type).To(Equal("Available"))
+					Expect(reconciled.Status.Conditions[0].Type).To(Equal(k8sbridgev1alpha1.ConditionTypeAvailable))
 					Expect(reconciled.Status.Conditions[0].Status).To(Equal(metav1.ConditionTrue))
 					Expect(reconciled.Spec.PartitionsMapping).To(HaveLen(3))
 					Expect(reconciled.Spec.PartitionsMapping[0].WorkloadPriorityClass).To(Equal("prod-high"))
@@ -466,7 +661,7 @@ var _ = Describe("WorkloadMixing Controller", func() {
 	})
 
 	Context("When mapping secondary resource events", func() {
-		It("should map Controller events to WorkloadMixing reconcile requests", func() {
+		It("should map Controller events to matching WorkloadMixing reconcile requests via SlurmControllerRule", func() {
 			wm := &k8sbridgev1alpha1.WorkloadMixing{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      wmTestName,
@@ -478,7 +673,18 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					},
 				},
 			}
-			fakeClient := fake.NewClientBuilder().WithScheme(k8sClient.Scheme()).WithObjects(wm).Build()
+			wmOther := &k8sbridgev1alpha1.WorkloadMixing{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wmTestName,
+					Namespace: "secondary-ns",
+				},
+				Spec: k8sbridgev1alpha1.WorkloadMixingSpec{
+					ControllerRef: corev1.LocalObjectReference{
+						Name: controllerTestName,
+					},
+				},
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(k8sClient.Scheme()).WithObjects(wm, wmOther).Build()
 			r := &WorkloadMixingReconciler{Client: fakeClient, Scheme: k8sClient.Scheme()}
 
 			ctrlObj := &slinkyv1beta1.Controller{
@@ -487,12 +693,13 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					Namespace: resourceNamespace,
 				},
 			}
-			reqs := r.mapControllerToWorkloadMixing(ctx, ctrlObj)
+			mapper := r.enqueueMatchingWMs(rules.SlurmControllerRule{}.Watch().Matches)
+			reqs := mapper(ctx, ctrlObj)
 			Expect(reqs).To(HaveLen(1))
 			Expect(reqs[0].NamespacedName).To(Equal(types.NamespacedName{Namespace: resourceNamespace, Name: wmTestName}))
 		})
 
-		It("should map RestApi events to WorkloadMixing reconcile requests", func() {
+		It("should map RestApi events to matching WorkloadMixing reconcile requests via SlurmRestAPIRule", func() {
 			wm := &k8sbridgev1alpha1.WorkloadMixing{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      wmTestName,
@@ -518,19 +725,63 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					},
 				},
 			}
-			reqs := r.mapRestAPIToWorkloadMixing(ctx, restAPIObj)
+			mapper := r.enqueueMatchingWMs(rules.SlurmRestAPIRule{}.Watch().Matches)
+			reqs := mapper(ctx, restAPIObj)
 			Expect(reqs).To(HaveLen(1))
 			Expect(reqs[0].NamespacedName).To(Equal(types.NamespacedName{Namespace: resourceNamespace, Name: wmTestName}))
+		})
+
+		It("should list across all namespaces when mapping cluster-scoped events and handle nil or List errors safely", func() {
+			wm1 := &k8sbridgev1alpha1.WorkloadMixing{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wmTestName,
+					Namespace: resourceNamespace,
+				},
+			}
+			wm2 := &k8sbridgev1alpha1.WorkloadMixing{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wmTestName,
+					Namespace: "cluster-test-ns",
+				},
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(k8sClient.Scheme()).WithObjects(wm1, wm2).Build()
+			r := &WorkloadMixingReconciler{Client: fakeClient, Scheme: k8sClient.Scheme()}
+
+			clusterScopedEvent := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster-scoped-trigger"},
+			}
+			mapper := r.enqueueMatchingWMs(func(_ client.Object, _ *k8sbridgev1alpha1.WorkloadMixing) bool {
+				return true
+			})
+			reqs := mapper(ctx, clusterScopedEvent)
+			Expect(reqs).To(ConsistOf(
+				reconcile.Request{NamespacedName: types.NamespacedName{Namespace: resourceNamespace, Name: wmTestName}},
+				reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "cluster-test-ns", Name: wmTestName}},
+			))
+
+			Expect(mapper(ctx, nil)).To(BeNil())
+			Expect(r.enqueueMatchingWMs(nil)(ctx, clusterScopedEvent)).To(BeNil())
+
+			errClient := fake.NewClientBuilder().WithScheme(k8sClient.Scheme()).WithInterceptorFuncs(interceptor.Funcs{
+				List: func(_ context.Context, _ client.WithWatch, _ client.ObjectList, _ ...client.ListOption) error {
+					return fmt.Errorf("list failure")
+				},
+			}).Build()
+			rErr := &WorkloadMixingReconciler{Client: errClient, Scheme: k8sClient.Scheme()}
+			Expect(rErr.enqueueMatchingWMs(func(_ client.Object, _ *k8sbridgev1alpha1.WorkloadMixing) bool {
+				return true
+			})(ctx, clusterScopedEvent)).To(BeNil())
 		})
 	})
 
 	Context("When tracking inventory metrics", func() {
 		const (
-			wmMetrics1 = "wm-metrics-1"
-			wmMetrics2 = "wm-metrics-2"
+			wmMetrics1     = "wm-metrics-1"
+			wmMetrics2     = "wm-metrics-2"
+			otherNamespace = "other-ns"
 		)
 
-		It("should update active workload mixings and tracked partitions gauges", func() {
+		It("should update active workload mixings, availability, and tracked partitions gauges", func() {
 			wm1 := &k8sbridgev1alpha1.WorkloadMixing{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      wmMetrics1,
@@ -543,6 +794,37 @@ var _ = Describe("WorkloadMixing Controller", func() {
 					PartitionsMapping: []k8sbridgev1alpha1.PartitionMapping{
 						{Partition: "p1", LocalQueue: "q1"},
 						{Partition: "p2", LocalQueue: "q2"},
+					},
+				},
+			}
+			wm1OtherNs := &k8sbridgev1alpha1.WorkloadMixing{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      wmMetrics1,
+					Namespace: otherNamespace,
+				},
+				Spec: k8sbridgev1alpha1.WorkloadMixingSpec{
+					ControllerRef: corev1.LocalObjectReference{
+						Name: testSlurmClusterName,
+					},
+					PartitionsMapping: []k8sbridgev1alpha1.PartitionMapping{
+						{Partition: "p1", LocalQueue: "q1"},
+					},
+				},
+			}
+			otherNsCtrl := &slinkyv1beta1.Controller{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testSlurmClusterName,
+					Namespace: otherNamespace,
+				},
+			}
+			otherNsRestAPI := &slinkyv1beta1.RestApi{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testSlurmClusterName + "-restapi",
+					Namespace: otherNamespace,
+				},
+				Spec: slinkyv1beta1.RestApiSpec{
+					ControllerRef: corev1.LocalObjectReference{
+						Name: testSlurmClusterName,
 					},
 				},
 			}
@@ -581,35 +863,51 @@ var _ = Describe("WorkloadMixing Controller", func() {
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(k8sClient.Scheme()).
 				WithStatusSubresource(&k8sbridgev1alpha1.WorkloadMixing{}).
-				WithObjects(wm1, wm2, js1).
+				WithObjects(wm1, wm1OtherNs, otherNsCtrl, otherNsRestAPI, wm2, js1).
 				Build()
 			r := &WorkloadMixingReconciler{Client: fakeClient, Scheme: k8sClient.Scheme()}
 
-			// Reconcile wm1
+			metrics.DeleteWorkloadMixingMetrics(resourceNamespace, wmMetrics1)
+			metrics.DeleteWorkloadMixingMetrics(otherNamespace, wmMetrics1)
+			metrics.DeleteWorkloadMixingMetrics(resourceNamespace, wmMetrics2)
+
+			// Reconcile wm1 (Controller missing in default -> Available=False -> 0.0)
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: resourceNamespace, Name: wmMetrics1}})
 			Expect(err).NotTo(HaveOccurred())
 
+			expectWorkloadMixingAvailableGauge(resourceNamespace, wmMetrics1, 0.0)
 			Expect(testutil.ToFloat64(metrics.TrackedPartitions.WithLabelValues(wmMetrics1))).To(Equal(2.0))
-			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(2.0))
+			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(3.0))
 			Expect(testutil.ToFloat64(metrics.ActiveJobs.WithLabelValues(wmMetrics1, "p1"))).To(Equal(1.0))
 			Expect(testutil.ToFloat64(metrics.ActiveJobs.WithLabelValues(wmMetrics1, "p2"))).To(Equal(0.0))
+
+			// Reconcile same-named wm1 in otherNamespace (Controller + RestApi present -> Available=True -> 1.0)
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: otherNamespace, Name: wmMetrics1}})
+			Expect(err).NotTo(HaveOccurred())
+			expectWorkloadMixingAvailableGauge(otherNamespace, wmMetrics1, 1.0)
 
 			// Reconcile wm2
 			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: resourceNamespace, Name: wmMetrics2}})
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(testutil.ToFloat64(metrics.TrackedPartitions.WithLabelValues(wmMetrics2))).To(Equal(1.0))
-			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(2.0))
+			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(3.0))
 
-			// Delete wm1
+			// Delete wm1 in resourceNamespace
 			Expect(fakeClient.Delete(ctx, wm1)).To(Succeed())
 
 			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: resourceNamespace, Name: wmMetrics1}})
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(1.0))
+			Expect(testutil.ToFloat64(metrics.ActiveWorkloadMixings)).To(Equal(2.0))
+			expectNoWorkloadMixingAvailableGauge(resourceNamespace, wmMetrics1)
+			expectWorkloadMixingAvailableGauge(otherNamespace, wmMetrics1, 1.0)
 			Expect(metrics.TrackedPartitions.DeleteLabelValues(wmMetrics1)).To(BeFalse())
 			Expect(testutil.ToFloat64(metrics.TrackedPartitions.WithLabelValues(wmMetrics2))).To(Equal(1.0))
+
+			// Clean up remaining metric series
+			metrics.DeleteWorkloadMixingMetrics(otherNamespace, wmMetrics1)
+			metrics.DeleteWorkloadMixingMetrics(resourceNamespace, wmMetrics2)
 		})
 	})
 })
