@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -975,10 +974,17 @@ func TestPoll_OrphanedJobSet_ReappearanceClearsTracking(t *testing.T) {
 type pollerTestEnv struct {
 	poller        *SlurmPoller
 	teardownChan  chan slurmtypes.SlurmJobTeardownEvent
+	admissionChan chan slurmtypes.SlurmJobAdmissionEvent
 	clientMap     *clientmap.ClientMap
 	mockSlurm     *utils.SlurmClient
 	controllerKey types.NamespacedName
 	now           time.Time
+	k8sClient     client.WithWatch
+	reader        client.Client
+	// workloadListErr is returned by the Workload LISTs of the poller's APIReader.
+	workloadListErr error
+	// workloadSelectors are the label selectors of the Workload LISTs.
+	workloadSelectors []string
 }
 
 func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, objs ...client.Object) *pollerTestEnv {
@@ -987,6 +993,7 @@ func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, o
 	_ = corev1.AddToScheme(scheme)
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = jobsetv1alpha2.AddToScheme(scheme)
+	addTestWorkloadTypes(scheme)
 
 	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 	wm.UID = testWMUID
@@ -999,14 +1006,31 @@ func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, o
 
 	env := &pollerTestEnv{
 		teardownChan:  make(chan slurmtypes.SlurmJobTeardownEvent, 10),
+		admissionChan: make(chan slurmtypes.SlurmJobAdmissionEvent, 2*maxWorkloadUIDsPerList),
 		clientMap:     cMap,
 		mockSlurm:     mockSlurm,
 		controllerKey: controllerKey,
 		now:           time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
+		k8sClient:     fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm}, objs...)...).Build(),
 	}
+	env.reader = interceptor.NewClient(env.k8sClient, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind() == workloadListGVK {
+				listOpts := &client.ListOptions{}
+				listOpts.ApplyOptions(opts)
+				env.workloadSelectors = append(env.workloadSelectors, listOpts.LabelSelector.String())
+				if env.workloadListErr != nil {
+					return env.workloadListErr
+				}
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
 	env.poller = &SlurmPoller{
-		Client:            fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm}, objs...)...).Build(),
+		Client:            env.k8sClient,
+		APIReader:         env.reader,
 		ClientMap:         cMap,
+		AdmissionEvents:   env.admissionChan,
 		TeardownEvents:    env.teardownChan,
 		PollInterval:      10 * time.Second,
 		OrphanGracePeriod: time.Minute,
@@ -1432,13 +1456,18 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 	// quotaWorkloads maps the test JobSets, which have no UID, to a Workload waiting for quota.
 	quotaWorkloads := workloadsByJobUID{"": newTestWorkload("wl", "",
 		workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)))}
-	newRunningJobBuilder := func() *testJobBuilder {
-		return newEmptyTestJob().
-			withJobID(jobID).
-			withPartition(testPartitionName).
-			withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
-			withHold(false).
-			withFeatures(translatedFeature)
+	translatedPendingJob := func(hold bool, stateReason, comment string) *slurmclienttypes.V0044JobInfo {
+		return newPendingJobBuilder().withHold(hold).withStateReason(stateReason).withFeatures(translatedFeature).withComment(comment).build()
+	}
+	autoHeldJob := func(comment string) *slurmclienttypes.V0044JobInfo {
+		return newPendingJobBuilder().withHold(true).withStateReason(ReasonJobHeldUser).withComment(comment).build()
+	}
+	runningJob := func(comment string) *slurmclienttypes.V0044JobInfo {
+		return newEmptyTestJob().withJobID(jobID).withPartition(testPartitionName).withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
+			withHold(false).withFeatures(translatedFeature).withComment(comment).build()
+	}
+	jobSet := func(suspended bool) *jobsetv1alpha2.JobSet {
+		return newTestJobSet(jobSetName).withSuspend(suspended).build()
 	}
 
 	tests := []struct {
@@ -1529,144 +1558,47 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       true,
 		},
 		{
-			name: "Emits when translated unheld PENDING job has a suspended JobSet (StatusPendingInKubernetes)",
-			job: newPendingJobBuilder().
-				withHold(false).
-				withFeatures(translatedFeature).
-				withComment(unheld).
-				build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
-			workloads:  quotaWorkloads,
-			want:       true,
-		},
-		{
-			name: "Emits when translated PENDING job held by Slurm for BadConstraints has a suspended JobSet (StatusPendingInKubernetes)",
-			job: newPendingJobBuilder().
-				withHold(true).
-				withStateReason("BadConstraints").
-				withFeatures(translatedFeature).
-				withComment(unheld).
-				build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			name:       "Emits when translated PENDING job held by Slurm for BadConstraints has a suspended JobSet (StatusPendingInKubernetes)",
+			job:        translatedPendingJob(true, "BadConstraints", unheld),
+			existingJS: jobSet(true),
 			workloads:  quotaWorkloads,
 			want:       true,
 			wantStatus: StatusPendingInKubernetes,
 		},
 		{
-			name: "Skips when translated PENDING job with a suspended JobSet is explicitly held by user (StatusNoAction)",
-			job: newPendingJobBuilder().
-				withHold(true).
-				withStateReason(ReasonJobHeldUser).
-				withFeatures(translatedFeature).
-				withComment(unheld).
-				build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			name:       "Skips when translated PENDING job with a suspended JobSet is explicitly held by user (StatusNoAction)",
+			job:        translatedPendingJob(true, ReasonJobHeldUser, unheld),
+			existingJS: jobSet(true),
 			want:       false,
 			wantStatus: StatusNoAction,
 		},
 		{
-			name: "Emits when translated PENDING job with a Pending status has an unsuspended JobSet",
-			job: newPendingJobBuilder().
-				withHold(false).
-				withFeatures(translatedFeature).
-				withComment(pending).
-				build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
-			want:       true,
-		},
-		{
-			name: "Skips when translated PENDING job with a suspended JobSet is explicitly held by admin (StatusNoAction)",
-			job: newPendingJobBuilder().
-				withHold(true).
-				withStateReason(ReasonJobHeldAdmin).
-				withFeatures(translatedFeature).
-				withComment(unheld).
-				build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			name:       "Skips when translated PENDING job with a suspended JobSet is explicitly held by admin (StatusNoAction)",
+			job:        translatedPendingJob(true, ReasonJobHeldAdmin, unheld),
+			existingJS: jobSet(true),
 			want:       false,
 		},
+		{name: "Skips when the comment already shows the Kueue reason", job: translatedPendingJob(false, "", pending), existingJS: jobSet(true), workloads: quotaWorkloads, want: false, wantStatus: StatusPendingInKubernetes},
+		{name: "Emits when the Kueue reason changed", job: translatedPendingJob(false, "", pendingStatus(kueueReasonPrefix+"old reason")), existingJS: jobSet(true), workloads: quotaWorkloads, want: true},
+		{name: "Skips the Kueue reason when the Workloads could not be read", job: translatedPendingJob(false, "", unheld), existingJS: jobSet(true), workloads: nil, want: false},
+		{name: "Emits the Unheld restore of a PENDING job without reading Workloads", job: translatedPendingJob(false, "", pending), existingJS: jobSet(false), workloads: nil, want: true},
 		{
-			name: "Emits when auto-held PENDING job with a JobSet creation retry status has no JobSet (StatusNewJob)",
-			job: newPendingJobBuilder().
-				withHold(true).
-				withStateReason(ReasonJobHeldUser).
-				withComment("my run, " + pendingStatus(jobSetCreateRetryReason+"etcd unavailable") + commentSeparator + AutoHoldMarker).
-				build(),
-			existingJS: nil,
+			name:       "Emits when auto-held PENDING job with a JobSet creation retry status has no JobSet (StatusNewJob)",
+			job:        autoHeldJob("my run, " + pendingStatus(jobSetCreateRetryReason+"etcd unavailable") + commentSeparator + AutoHoldMarker),
 			want:       true,
 			wantStatus: StatusNewJob,
 		},
 		{
-			name: "Emits when auto-held PENDING job with a JobSet creation retry status has a suspended JobSet (StatusShouldUnhold)",
-			job: newPendingJobBuilder().
-				withHold(true).
-				withStateReason(ReasonJobHeldUser).
-				withComment(pendingStatus(jobSetCreateRetryReason+"timeout") + commentSeparator + AutoHoldMarker).
-				build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			name:       "Emits when auto-held PENDING job with a JobSet creation retry status has a suspended JobSet (StatusShouldUnhold)",
+			job:        autoHeldJob(pendingStatus(jobSetCreateRetryReason+"timeout") + commentSeparator + AutoHoldMarker),
+			existingJS: jobSet(true),
 			want:       true,
 			wantStatus: StatusShouldUnhold,
 		},
-		{
-			name:       "Skips when RUNNING job has a clean comment",
-			job:        newRunningJobBuilder().withComment(unheld).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
-			want:       false,
-		},
-		{
-			name:       "Emits when RUNNING job still has a Pending status",
-			job:        newRunningJobBuilder().withComment("my run, " + pending).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
-			want:       true,
-		},
-		{
-			name:       "Skips when RUNNING job with a Pending status has a suspended JobSet",
-			job:        newRunningJobBuilder().withComment(pending).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
-			want:       false,
-		},
-		{
-			name:       "Skips when RUNNING job with a Pending status has no JobSet",
-			job:        newRunningJobBuilder().withComment(pending).build(),
-			existingJS: nil,
-			want:       false,
-		},
-		{
-			name:       "Skips when the comment already shows the Kueue reason",
-			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(pending).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
-			workloads:  quotaWorkloads,
-			want:       false,
-			wantStatus: StatusPendingInKubernetes,
-		},
-		{
-			name:       "Emits when the Kueue reason changed",
-			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(pendingStatus(kueueReasonPrefix + "old reason")).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
-			workloads:  quotaWorkloads,
-			want:       true,
-		},
-		{
-			name:       "Skips when the suspended JobSet has no Workload",
-			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(unheld).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
-			workloads:  workloadsByJobUID{},
-			want:       false,
-		},
-		{
-			name:       "Skips the Kueue reason when the Workloads could not be read",
-			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(unheld).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
-			workloads:  nil,
-			want:       false,
-		},
-		{
-			name:       "Emits the Unheld restore when the Workloads could not be read",
-			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(pending).build(),
-			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
-			workloads:  nil,
-			want:       true,
-		},
+		{name: "Skips when RUNNING job has a clean comment", job: runningJob(unheld), existingJS: jobSet(false), want: false},
+		{name: "Emits when RUNNING job still has a Pending status", job: runningJob("my run, " + pending), existingJS: jobSet(false), want: true},
+		{name: "Skips when RUNNING job with a Pending status has a suspended JobSet", job: runningJob(pending), existingJS: jobSet(true), want: false},
+		{name: "Skips when RUNNING job with a Pending status has no JobSet", job: runningJob(pending), existingJS: nil, want: false},
 	}
 
 	for _, tc := range tests {
@@ -1683,14 +1615,11 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 	}
 }
 
-const pollJobSetUID types.UID = "poll-jobset-uid"
-
 func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = k8sbridgev1alpha1.AddToScheme(scheme)
 	_ = jobsetv1alpha2.AddToScheme(scheme)
-	addTestWorkloadTypes(scheme)
 
 	const jobID int32 = 301
 	const jobSetName = "slurm-job-301"
@@ -1705,7 +1634,6 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 	newOwnedJobSetBuilder := func(ownerUID types.UID) *testJobSetBuilder {
 		return newTestJobSet(jobSetName).
 			withNamespace(testNamespace).
-			withUID(pollJobSetUID).
 			withLabels(map[string]string{
 				LabelSlurmJobID:     "301",
 				LabelSlurmPartition: testPartitionName,
@@ -1743,43 +1671,6 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 			existingJS: newOwnedJobSetBuilder("stale-wm-uid").withSuspend(true).build(),
 			wantEmit:   true,
 		},
-		{
-			name: "Emits when translated unheld PENDING job has a suspended JobSet",
-			job: *newPendingJobBuilder().
-				withHold(false).
-				withStateReason("Resources").
-				withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)).
-				withComment(unheldStatus(jobSetName)).
-				build(),
-			existingJS: newOwnedJobSetBuilder(testWMUID).withSuspend(true).build(),
-			wantEmit:   true,
-		},
-		{
-			name: "Emits when RUNNING job still has a Pending status",
-			job: *newEmptyTestJob().
-				withJobID(jobID).
-				withPartition(testPartitionName).
-				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
-				withHold(false).
-				withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)).
-				withComment(pendingStatus(kueueReasonPrefix + testQuotaMessage)).
-				build(),
-			existingJS: newOwnedJobSetBuilder(testWMUID).withSuspend(false).build(),
-			wantEmit:   true,
-		},
-		{
-			name: "Skips when RUNNING job has a clean comment",
-			job: *newEmptyTestJob().
-				withJobID(jobID).
-				withPartition(testPartitionName).
-				withJobState(slurmapi.V0044JobInfoJobStateRUNNING).
-				withHold(false).
-				withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)).
-				withComment(unheldStatus(jobSetName)).
-				build(),
-			existingJS: newOwnedJobSetBuilder(testWMUID).withSuspend(false).build(),
-			wantEmit:   false,
-		},
 	}
 
 	for _, tc := range tests {
@@ -1788,10 +1679,7 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 			wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
 			wm.UID = testWMUID
 
-			wl := newTestWorkload("wl", pollJobSetUID,
-				workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)))
-			wl.SetNamespace(testNamespace)
-			objs := []client.Object{wm, wl}
+			objs := []client.Object{wm}
 			if tc.existingJS != nil {
 				objs = append(objs, tc.existingJS)
 			}
@@ -1807,7 +1695,6 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 			teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
 			poller := &SlurmPoller{
 				Client:          fakeK8sClient,
-				APIReader:       fakeK8sClient,
 				ClientMap:       cMap,
 				AdmissionEvents: admissionChan,
 				TeardownEvents:  teardownChan,
@@ -1829,78 +1716,8 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 	}
 }
 
-// pendingReasonPollEnv is a poller with translated jobs waiting in Kueue, whose Workload LISTs are
-// counted.
-type pendingReasonPollEnv struct {
-	poller        *SlurmPoller
-	admissionChan chan slurmtypes.SlurmJobAdmissionEvent
-	workloadLists *atomic.Int32
-	// workloadSelectors are the label selectors of the Workload LISTs.
-	workloadSelectors []string
-	k8sClient         client.WithWatch
-	reader            client.Client
-	mockSlurm         *utils.SlurmClient
-	clientMap         *clientmap.ClientMap
-}
-
-func newPendingReasonPollEnv(t *testing.T, jobs []slurmclienttypes.V0044JobInfo, objs []client.Object, listErr error) *pendingReasonPollEnv {
-	t.Helper()
-	scheme := runtime.NewScheme()
-	_ = corev1.AddToScheme(scheme)
-	_ = k8sbridgev1alpha1.AddToScheme(scheme)
-	_ = jobsetv1alpha2.AddToScheme(scheme)
-	addTestWorkloadTypes(scheme)
-
-	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
-	wm.UID = testWMUID
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm}, objs...)...).Build()
-
-	lists := &atomic.Int32{}
-	env := &pendingReasonPollEnv{
-		admissionChan: make(chan slurmtypes.SlurmJobAdmissionEvent, 2*maxWorkloadUIDsPerList),
-		workloadLists: lists,
-		k8sClient:     k8sClient,
-	}
-	reader := interceptor.NewClient(k8sClient, interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if u, ok := list.(*unstructured.UnstructuredList); ok && u.GroupVersionKind() == workloadListGVK {
-				lists.Add(1)
-				listOpts := &client.ListOptions{}
-				listOpts.ApplyOptions(opts)
-				selector := ""
-				if listOpts.LabelSelector != nil {
-					selector = listOpts.LabelSelector.String()
-				}
-				env.workloadSelectors = append(env.workloadSelectors, selector)
-				if listErr != nil {
-					return listErr
-				}
-			}
-			return c.List(ctx, list, opts...)
-		},
-	})
-
-	mockSlurm := &utils.SlurmClient{MutateOnUpdate: true}
-	mockSlurm.SetPendingJobs(testPartitionName, jobs)
-	cMap := clientmap.NewClientMap()
-	cMap.Add(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
-
-	env.reader = reader
-	env.mockSlurm = mockSlurm
-	env.clientMap = cMap
-	env.poller = &SlurmPoller{
-		Client:          k8sClient,
-		APIReader:       reader,
-		ClientMap:       cMap,
-		AdmissionEvents: env.admissionChan,
-		TeardownEvents:  make(chan slurmtypes.SlurmJobTeardownEvent, 20),
-		PollInterval:    10 * time.Second,
-	}
-	return env
-}
-
 // emittedJobIDs polls once and returns the job IDs of the admission events, sorted.
-func (e *pendingReasonPollEnv) emittedJobIDs(t *testing.T) []string {
+func (e *pollerTestEnv) emittedJobIDs(t *testing.T) []string {
 	t.Helper()
 	if err := e.poller.Poll(t.Context()); err != nil {
 		t.Fatalf("Poll failed: %v", err)
@@ -1914,7 +1731,7 @@ func (e *pendingReasonPollEnv) emittedJobIDs(t *testing.T) []string {
 }
 
 // reconcile runs the SlurmJobReconciler for the job, against the same Kubernetes and Slurm state.
-func (e *pendingReasonPollEnv) reconcile(t *testing.T, jobID string) error {
+func (e *pollerTestEnv) reconcile(t *testing.T, jobID string) error {
 	t.Helper()
 	r := &SlurmJobReconciler{
 		Client:    e.k8sClient,
@@ -1932,20 +1749,12 @@ func (e *pendingReasonPollEnv) reconcile(t *testing.T, jobID string) error {
 func TestPoll_PendingReasons(t *testing.T) {
 	// A translated PENDING job is reported as held for BadConstraints until it has a node.
 	translatedJob := func(id int32, state slurmapi.V0044JobInfoJobState, comment string) slurmclienttypes.V0044JobInfo {
-		pending := state == slurmapi.V0044JobInfoJobStatePENDING
-		reason := ""
-		if pending {
-			reason = "BadConstraints"
+		b := newEmptyTestJob().withJobID(id).withPartition(testPartitionName).withJobState(state).
+			withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, id)).withComment(comment)
+		if state == slurmapi.V0044JobInfoJobStatePENDING {
+			b = b.withHold(true).withStateReason("BadConstraints")
 		}
-		return *newEmptyTestJob().
-			withJobID(id).
-			withPartition(testPartitionName).
-			withJobState(state).
-			withHold(pending).
-			withStateReason(reason).
-			withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, id)).
-			withComment(comment).
-			build()
+		return *b.build()
 	}
 	ownedJobSet := func(id int32, suspended bool) *jobsetv1alpha2.JobSet {
 		return newTestJobSet(fmt.Sprintf("slurm-job-%d", id)).
@@ -1956,12 +1765,12 @@ func TestPoll_PendingReasons(t *testing.T) {
 			withSuspend(suspended).
 			build()
 	}
-	quotaWorkload := func(id int32) *unstructured.Unstructured {
-		wl := newTestWorkload(fmt.Sprintf("wl-%d", id), types.UID(fmt.Sprintf("uid-%d", id)),
-			workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)))
+	workload := func(id int32, status map[string]any) *unstructured.Unstructured {
+		wl := newTestWorkload(fmt.Sprintf("wl-%d", id), types.UID(fmt.Sprintf("uid-%d", id)), status)
 		wl.SetNamespace(testNamespace)
 		return wl
 	}
+	quotaStatus := workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage))
 	kueueQuota := pendingStatus(kueueReasonPrefix + testQuotaMessage)
 
 	jobs := []slurmclienttypes.V0044JobInfo{
@@ -1977,47 +1786,21 @@ func TestPoll_PendingReasons(t *testing.T) {
 		*newEmptyTestJob().withJobID(405).withPartition(testPartitionName).withAutoHold().build(),
 	}
 	objs := []client.Object{
-		ownedJobSet(401, true), quotaWorkload(401),
-		ownedJobSet(402, true), func() client.Object {
-			wl := newTestWorkload("wl-402", "uid-402", nil)
-			wl.SetNamespace(testNamespace)
-			return wl
-		}(),
-		ownedJobSet(403, true), quotaWorkload(403),
+		ownedJobSet(401, true), workload(401, quotaStatus),
+		ownedJobSet(402, true), workload(402, nil),
+		ownedJobSet(403, true), workload(403, quotaStatus),
 		ownedJobSet(404, false),
 	}
-	workloadGR := schema.GroupResource{Group: workloadListGVK.Group, Resource: "workloads"}
+	wantSelectors := []string{kueueJobUIDLabel + " in (uid-401,uid-402,uid-403)"}
 
-	const wantSelector = kueueJobUIDLabel + " in (uid-401,uid-402,uid-403)"
-	tests := []struct {
-		name      string
-		listErr   error
-		wantIDs   []string
-		wantLists int32
-	}{
-		{name: "one LIST, emits only changed comments", wantIDs: []string{"401", "402", "404", "405"}, wantLists: 1},
-		{name: "LIST error skips the Kueue reasons only", listErr: errors.New("connection refused"), wantIDs: []string{"404", "405"}, wantLists: 1},
-		{name: "unavailable API skips the Kueue reasons only", listErr: apierrors.NewForbidden(workloadGR, "", errors.New("RBAC denied")), wantIDs: []string{"404", "405"}, wantLists: 1},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			env := newPendingReasonPollEnv(t, jobs, objs, tc.listErr)
-			if got := env.emittedJobIDs(t); !slices.Equal(got, tc.wantIDs) {
-				t.Errorf("Poll() emitted events for jobs %v, want %v", got, tc.wantIDs)
-			}
-			if got := env.workloadLists.Load(); got != tc.wantLists {
-				t.Errorf("Poll() listed Workloads %d times, want %d", got, tc.wantLists)
-			}
-			if want := []string{wantSelector}; !slices.Equal(env.workloadSelectors, want) {
-				t.Errorf("Workload LIST selectors = %q, want %q", env.workloadSelectors, want)
-			}
-		})
-	}
-
-	t.Run("converges after the emitted jobs are reconciled", func(t *testing.T) {
-		env := newPendingReasonPollEnv(t, jobs, objs, nil)
+	t.Run("one LIST emits only changed comments and converges after the reconciles", func(t *testing.T) {
+		env := newPollerTestEnv(t, jobs, objs...)
+		env.mockSlurm.MutateOnUpdate = true
 		if got, want := env.emittedJobIDs(t), []string{"401", "402", "404", "405"}; !slices.Equal(got, want) {
 			t.Fatalf("first Poll() emitted events for jobs %v, want %v", got, want)
+		}
+		if !slices.Equal(env.workloadSelectors, wantSelectors) {
+			t.Errorf("Workload LIST selectors = %q, want %q", env.workloadSelectors, wantSelectors)
 		}
 		// The new job 405 cannot be translated here (no Slurm Controller), so only the translated
 		// jobs are reconciled.
@@ -2031,6 +1814,26 @@ func TestPoll_PendingReasons(t *testing.T) {
 		}
 	})
 
+	workloadGR := schema.GroupResource{Group: workloadListGVK.Group, Resource: "workloads"}
+	for _, tc := range []struct {
+		name    string
+		listErr error
+	}{
+		{name: "LIST error skips the Kueue reasons only", listErr: errors.New("connection refused")},
+		{name: "unavailable API skips the Kueue reasons only", listErr: apierrors.NewForbidden(workloadGR, "", errors.New("RBAC denied"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newPollerTestEnv(t, jobs, objs...)
+			env.workloadListErr = tc.listErr
+			if got, want := env.emittedJobIDs(t), []string{"404", "405"}; !slices.Equal(got, want) {
+				t.Errorf("Poll() emitted events for jobs %v, want %v", got, want)
+			}
+			if !slices.Equal(env.workloadSelectors, wantSelectors) {
+				t.Errorf("Workload LIST selectors = %q, want %q", env.workloadSelectors, wantSelectors)
+			}
+		})
+	}
+
 	t.Run("more than maxWorkloadUIDsPerList waiting jobs are read in chunks", func(t *testing.T) {
 		const waiting = maxWorkloadUIDsPerList + 5
 		manyJobs := make([]slurmclienttypes.V0044JobInfo, 0, waiting)
@@ -2038,23 +1841,23 @@ func TestPoll_PendingReasons(t *testing.T) {
 		for i := range int32(waiting) {
 			id := 1000 + i
 			manyJobs = append(manyJobs, translatedJob(id, slurmapi.V0044JobInfoJobStatePENDING, unheldStatus(fmt.Sprintf("slurm-job-%d", id))))
-			manyObjs = append(manyObjs, ownedJobSet(id, true), quotaWorkload(id))
+			manyObjs = append(manyObjs, ownedJobSet(id, true), workload(id, quotaStatus))
 		}
-		env := newPendingReasonPollEnv(t, manyJobs, manyObjs, nil)
+		env := newPollerTestEnv(t, manyJobs, manyObjs...)
 		if got := len(env.emittedJobIDs(t)); got != waiting {
 			t.Errorf("Poll() emitted %d events, want %d (one per waiting job, from the merged LISTs)", got, waiting)
 		}
-		if got := env.workloadLists.Load(); got != 2 {
+		if got := len(env.workloadSelectors); got != 2 {
 			t.Errorf("Poll() listed Workloads %d times, want 2", got)
 		}
 	})
 
 	t.Run("no LIST without a job waiting in Kueue", func(t *testing.T) {
-		env := newPendingReasonPollEnv(t, jobs[3:], []client.Object{ownedJobSet(404, false)}, nil)
+		env := newPollerTestEnv(t, jobs[3:], ownedJobSet(404, false))
 		if got, want := env.emittedJobIDs(t), []string{"404", "405"}; !slices.Equal(got, want) {
 			t.Errorf("Poll() emitted events for jobs %v, want %v", got, want)
 		}
-		if got := env.workloadLists.Load(); got != 0 {
+		if got := len(env.workloadSelectors); got != 0 {
 			t.Errorf("Poll() listed Workloads %d times, want 0", got)
 		}
 	})
