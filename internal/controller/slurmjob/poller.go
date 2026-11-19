@@ -442,6 +442,8 @@ func shouldEmitAdmissionEvent(
 	job *slurmclienttypes.V0044JobInfo,
 	existingJS *jobsetv1alpha2.JobSet,
 ) bool {
+	// Without an owned JobSet there is no OwnerReference proving this WM owns the job, so an
+	// unavailable WM must skip both new jobs and StatusJobSetMissing for jobs owned by sibling WMs.
 	if existingJS == nil && !wmAvailable {
 		return false
 	}

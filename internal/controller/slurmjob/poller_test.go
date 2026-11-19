@@ -1821,6 +1821,8 @@ func TestPoll_WorkloadMixingAvailabilityGate(t *testing.T) {
 			mockSlurm := &utils.SlurmClient{}
 			mockSlurm.SetPendingJobs("part-healthy", []slurmclienttypes.V0044JobInfo{
 				newHeldPendingJobOn(510, "part-healthy"),
+			})
+			mockSlurm.SetPendingJobs("part-unavailable", []slurmclienttypes.V0044JobInfo{
 				newHeldPendingJobOn(520, "part-unavailable"),
 			})
 			cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)

@@ -357,6 +357,8 @@ var _ = Describe("Manager", func() {
 				g.Expect(out).To(Equal("True:Reconciled:1"))
 			}, 2*time.Minute, time.Second).Should(Succeed())
 
+			// Missing Controller/RestApi would also evict the Slurm client from ClientMap and skip Poll
+			// before reaching wm.IsAvailable(); holding WM in terminating state keeps ClientMap active.
 			By("holding WorkloadMixing in terminating state so IsAvailable() is false while Slurm client stays active")
 			addFinalizerCmd := exec.Command("kubectl", "patch", "workloadmixing", wmName,
 				"-n", slurmNamespace,
@@ -400,6 +402,7 @@ var _ = Describe("Manager", func() {
 				g.Expect(queryErr).NotTo(HaveOccurred())
 				g.Expect(jobState.JobState).To(Equal("PENDING"))
 				g.Expect(jobState.Reason).To(Equal("JobHeldUser"))
+				g.Expect(jobState.Comment).To(Equal(slurmjob.AutoHoldMarker))
 			}, 3*utils.E2EPollInterval, time.Second).Should(Succeed())
 
 			By("completing deletion and re-applying WorkloadMixing so it becomes Available=True")
