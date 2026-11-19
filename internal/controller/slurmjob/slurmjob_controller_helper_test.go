@@ -545,6 +545,29 @@ func (e *reconcileTestEnv) firstUpdatedComment() string {
 	return *reqMsg.Comment
 }
 
+// verifyCommentOnlyUpdate checks that the only Slurm job update set the comment to want, without
+// changing the hold or the constraints, and that no job was cancelled.
+func (e *reconcileTestEnv) verifyCommentOnlyUpdate(want string) {
+	e.t.Helper()
+	updates := e.mockSlurm.GetUpdatedJobs()
+	if len(updates) != 1 {
+		e.t.Fatalf("Expected 1 Slurm job update, got %d", len(updates))
+	}
+	req, ok := updates[0].Req.(slurmapi.V0044JobDescMsg)
+	if !ok {
+		e.t.Fatalf("Expected update request to be V0044JobDescMsg, got %T", updates[0].Req)
+	}
+	if req.Hold != nil || req.Constraints != nil {
+		e.t.Errorf("Slurm job update changed hold or constraints: %+v", req)
+	}
+	if got := ptr.Deref(req.Comment, ""); got != want {
+		e.t.Errorf("Slurm job comment = %q, want %q", got, want)
+	}
+	if deleted := e.mockSlurm.GetDeletedJobs(); len(deleted) != 0 {
+		e.t.Errorf("Deleted Slurm jobs = %v, want none", deleted)
+	}
+}
+
 func (e *reconcileTestEnv) verifySlurmNodesDeleted(wantNodes ...string) {
 	e.t.Helper()
 	if gotNodes := e.mockSlurm.GetDeletedNodes(); !slices.Equal(gotNodes, wantNodes) {

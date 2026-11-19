@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,7 +28,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,12 +45,15 @@ import (
 )
 
 const (
+	// maxWorkloadUIDsPerList bounds the JobSet UIDs in the label selector of one Workload LIST, so that
+	// the request URL stays short.
+	maxWorkloadUIDsPerList = 100
 	// defaultOrphanGracePeriod defines the default duration an absent Slurm workload's
 	// corresponding JobSet must remain missing before being flagged as orphaned and torn down.
 	defaultOrphanGracePeriod = 1 * time.Minute
 )
 
-// SlurmPoller periodically queries the Slurm REST API for pending jobs
+// SlurmPoller periodically queries the Slurm REST API for pending and running jobs
 // and audits active workloads for termination and orphan cleanup.
 // It implements the manager.Runnable interface.
 type SlurmPoller struct {
@@ -58,7 +61,8 @@ type SlurmPoller struct {
 	ClientMap       *clientmap.ClientMap
 	AdmissionEvents chan<- slurmtypes.SlurmJobAdmissionEvent
 	TeardownEvents  chan<- slurmtypes.SlurmJobTeardownEvent
-	// APIReader reads Kueue Workloads from the API server, which the manager does not cache.
+	// APIReader reads Kueue Workloads from the API server, which the manager does not cache. If it
+	// is nil, the Kueue pending reasons are not reported.
 	APIReader         client.Reader
 	PollInterval      time.Duration
 	OrphanGracePeriod time.Duration
@@ -192,7 +196,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				logger.Error(err, "Failed to process pending jobs for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
+				logger.Error(err, "Failed to process Slurm jobs for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
 				continue
 			}
 
@@ -446,18 +450,12 @@ func getTeardownEvent(
 	}
 }
 
-// shouldEmitAdmissionEvent reports whether the reconciler has work to do for job. workloads returns
-// the Kueue Workloads of the job's namespace, or nil if they could not be read; it is only called
-// for jobs whose JobSet waits in Kueue.
-func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet, workloads func() workloadsByJobUID) bool {
-	states := job.GetStateAsSet()
-	if !states.Has(slurmapi.V0044JobInfoJobStatePENDING) {
-		// A job that is no longer pending only needs an event to clear a stale Pending in
-		// Kubernetes status from its comment.
-		return states.Has(slurmapi.V0044JobInfoJobStateRUNNING) &&
-			hasPendingStatus(ptr.Deref(job.Comment, "")) &&
-			activeJobStatus(job, existingJS) == StatusPendingInKubernetes &&
-			pendingCommentChanged(job, existingJS, workloads)
+// shouldEmitAdmissionEvent reports whether the reconciler has work to do for job. workloads holds
+// the Workloads of the JobSets waiting in Kueue, indexed by JobSet UID; it is nil if they could not
+// be read, which leaves the Pending in Kubernetes status of waiting jobs as it is until the next poll.
+func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet, workloads workloadsByJobUID) bool {
+	if !job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING) {
+		return needsPendingStatusCleanup(job, existingJS)
 	}
 	switch status := activeJobStatus(job, existingJS); status {
 	case StatusNewJob:
@@ -466,48 +464,43 @@ func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jo
 		}
 		return !isJobExplicitlyHeld(job)
 	case StatusPendingInKubernetes:
-		return pendingCommentChanged(job, existingJS, workloads)
+		comment, ok := desiredPendingComment(job, existingJS, workloads[existingJS.UID])
+		return ok && comment != ptr.Deref(job.Comment, "")
 	default:
 		return status != StatusNoAction
 	}
 }
 
-// pendingCommentChanged reports whether the comment computed by desiredPendingComment differs from
-// the job's comment. While the JobSet is suspended this needs its Workload; if the Workloads could
-// not be read, the comment is left as it is until the next poll.
-func pendingCommentChanged(job *slurmclienttypes.V0044JobInfo, js *jobsetv1alpha2.JobSet, workloads func() workloadsByJobUID) bool {
-	var wl *unstructured.Unstructured
-	if isJobSetSuspended(js) {
-		index := workloads()
-		if index == nil {
-			return false
-		}
-		wl = index[js.UID]
-	}
-	comment, ok := desiredPendingComment(job, js, wl)
-	return ok && comment != ptr.Deref(job.Comment, "")
+// needsPendingStatusCleanup reports whether a RUNNING job still shows a Pending in Kubernetes status.
+// Its JobSet was admitted but the status may not have been cleared, for example because the
+// unsuspend event was missed or the comment update failed, so the poller emits one event to restore
+// the Unheld status.
+func needsPendingStatusCleanup(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
+	return job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateRUNNING) &&
+		activeJobStatus(job, existingJS) == StatusPendingInKubernetes
 }
 
-// readWorkloads lists the Kueue Workloads of the given JobSet UIDs in namespace, with one LIST and
-// none if there are no UIDs. It returns nil if the Workloads could not be read.
+// readWorkloads lists the Kueue Workloads of the given JobSet UIDs in namespace, with one LIST per
+// maxWorkloadUIDsPerList UIDs, and none if there are no UIDs. It returns nil if any LIST fails.
 func (p *SlurmPoller) readWorkloads(ctx context.Context, namespace string, jobSetUIDs []string) workloadsByJobUID {
-	if p.APIReader == nil {
+	if p.APIReader == nil || len(jobSetUIDs) == 0 {
 		return nil
-	}
-	if len(jobSetUIDs) == 0 {
-		return workloadsByJobUID{}
 	}
 	logger := log.FromContext(ctx).WithName("slurm-poller").WithValues("namespace", namespace)
 	slices.Sort(jobSetUIDs)
-	req, err := labels.NewRequirement(kueueJobUIDLabel, selection.In, jobSetUIDs)
-	if err != nil {
-		logger.Error(err, "Failed to build the Kueue Workload label selector")
-		return nil
-	}
-	workloads, err := listWorkloads(ctx, p.APIReader, namespace, client.MatchingLabelsSelector{Selector: labels.NewSelector().Add(*req)})
-	if err != nil {
-		logWorkloadReadError(log.IntoContext(ctx, logger), &p.workloadAPIUnavailableLogged, err)
-		return nil
+	workloads := workloadsByJobUID{}
+	for chunk := range slices.Chunk(jobSetUIDs, maxWorkloadUIDsPerList) {
+		req, err := labels.NewRequirement(kueueJobUIDLabel, selection.In, chunk)
+		if err != nil {
+			logger.Error(err, "Failed to build the Kueue Workload label selector")
+			return nil
+		}
+		chunkWorkloads, err := listWorkloads(ctx, p.APIReader, namespace, client.MatchingLabelsSelector{Selector: labels.NewSelector().Add(*req)})
+		if err != nil {
+			logWorkloadReadError(log.IntoContext(ctx, logger), &p.workloadAPIUnavailableLogged, err)
+			return nil
+		}
+		maps.Copy(workloads, chunkWorkloads)
 	}
 	p.workloadAPIUnavailableLogged.Store(false)
 	return workloads
@@ -549,6 +542,8 @@ func waitingJobSetUIDs(
 	return uids
 }
 
+// processPendingJobsForWM emits admission events for the PENDING and RUNNING jobs of wm's
+// partitions that need a reconcile.
 func (p *SlurmPoller) processPendingJobsForWM(
 	ctx context.Context,
 	jobList *slurmclienttypes.V0044JobInfoList,
@@ -571,7 +566,6 @@ func (p *SlurmPoller) processPendingJobsForWM(
 
 	// The Workloads of the JobSets waiting in Kueue are read with at most one LIST per poll.
 	workloads := p.readWorkloads(ctx, wm.Namespace, waitingJobSetUIDs(jobList, observedPartitions, jobSetsByName))
-	getWorkloads := func() workloadsByJobUID { return workloads }
 
 	for i := range jobList.Items {
 		job := &jobList.Items[i]
@@ -582,7 +576,7 @@ func (p *SlurmPoller) processPendingJobsForWM(
 		jobIDStr := strconv.Itoa(int(jobID))
 		jobSetName := jobSetNameForJobID(jobIDStr)
 		existingJS := jobSetsByName[jobSetName]
-		if !shouldEmitAdmissionEvent(job, existingJS, getWorkloads) {
+		if !shouldEmitAdmissionEvent(job, existingJS, workloads) {
 			continue
 		}
 

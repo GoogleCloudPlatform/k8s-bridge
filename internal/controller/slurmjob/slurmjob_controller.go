@@ -526,6 +526,12 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 		return StatusShouldUnhold
 	}
 
+	// The JobSet of an auto-held job already exists, for example because its Create returned an
+	// error after the JobSet was stored. Release the hold as after an AlreadyExists error.
+	if isUntranslatedNewJob(jobInfo) && hasAutoHoldMarker(ptr.Deref(jobInfo.Comment, "")) {
+		return StatusShouldUnhold
+	}
+
 	if needsPendingStatusUpdate(jobInfo, existingJS) {
 		return StatusPendingInKubernetes
 	}
@@ -821,8 +827,9 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 		// The status is only recorded next to the AutoHoldMarker, which is kept: without the marker,
 		// a Pending status would make the job look translated (see isJobTranslated).
 		if hasAutoHoldMarker(ptr.Deref(jobInfo.Comment, "")) {
-			reason := jobSetCreateRetryReason + apiStatusMessage(err)
-			if updateErr := r.setJobStatus(ctx, slurmClient, jobInfo, pendingStatus(reason), true); updateErr != nil {
+			reason := jobSetCreateRetryReason + singleLine(apiStatusMessage(err))
+			// The Create may have used up the reconcile deadline; setJobStatus has its own timeout.
+			if updateErr := r.setJobStatus(context.WithoutCancel(ctx), slurmClient, jobInfo, pendingStatus(reason), true); updateErr != nil {
 				logger.Error(updateErr, "Failed to record the JobSet creation failure in the Slurm job comment")
 			}
 		}
@@ -1048,15 +1055,24 @@ func (r *SlurmJobReconciler) setJobStatus(
 	status string,
 	keepAutoHoldMarker bool,
 ) error {
-	currentComment := ptr.Deref(jobInfo.Comment, "")
-	comment, truncated := buildJobComment(currentComment, status, keepAutoHoldMarker)
-	if comment == currentComment {
+	comment, truncated := buildJobComment(ptr.Deref(jobInfo.Comment, ""), status, keepAutoHoldMarker)
+	if truncated {
+		log.FromContext(ctx).Info("Truncated Slurm job comment to fit Slurm's limit", "maxLength", maxSlurmCommentLength)
+	}
+	return r.writeJobComment(ctx, slurmClient, jobInfo, comment)
+}
+
+// writeJobComment sets the Slurm job comment, skipping the update if it would not change.
+func (r *SlurmJobReconciler) writeJobComment(
+	ctx context.Context,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	comment string,
+) error {
+	if comment == ptr.Deref(jobInfo.Comment, "") {
 		return nil
 	}
 	logger := log.FromContext(ctx)
-	if truncated {
-		logger.Info("Truncated Slurm job comment to fit Slurm's limit", "maxLength", maxSlurmCommentLength)
-	}
 	callCtx, cancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
 	defer cancel()
 	if err := slurmClient.Update(callCtx, jobInfo, slurmapi.V0044JobDescMsg{Comment: ptr.To(comment)}); err != nil {

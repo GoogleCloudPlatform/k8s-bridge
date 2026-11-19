@@ -24,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.uber.org/zap/zapcore"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -110,7 +111,11 @@ func withAdmissionChecks(status map[string]any, checks ...map[string]any) map[st
 
 func TestKueuePendingReason(t *testing.T) {
 	quotaFalse := workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)
+	quotaTrue := workloadCondition(workloadConditionQuotaReserved, "True", "Quota reserved in ClusterQueue cq")
 	evicted := workloadCondition(workloadConditionEvicted, "True", testEvictedMessage)
+	provisioningCheck := admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testProvisioningMessage)
+	emptyCheck := admissionCheck(testProvisioningCheckName, admissionCheckStatePending, "")
+	resetCheck := admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testResetCheckMessage)
 
 	tests := []struct {
 		name      string
@@ -119,18 +124,15 @@ func TestKueuePendingReason(t *testing.T) {
 		queueName string
 		want      string
 	}{
-		{name: "no status is queued in the JobSet LocalQueue", status: nil, want: testQueuedReason},
-		{name: "QuotaReserved=False", status: workloadConditions(quotaFalse), want: testQuotaMessage},
+		{name: "no status is queued in the JobSet LocalQueue", queueName: testLocalQueue, want: testQueuedReason},
+		{name: "QuotaReserved=False", status: workloadConditions(quotaFalse), queueName: testLocalQueue, want: testQuotaMessage},
+		{name: "QuotaReserved=True without a check has no reason", status: workloadConditions(quotaTrue), queueName: testLocalQueue, want: ""},
+		{name: "Evicted=True", status: workloadConditions(evicted), queueName: testLocalQueue, want: testEvictedMessage},
 		{
-			name:   "QuotaReserved=True is not a pending reason",
-			status: workloadConditions(workloadCondition(workloadConditionQuotaReserved, "True", "Quota reserved in ClusterQueue cq")),
-			want:   "",
-		},
-		{name: "Evicted=True", status: workloadConditions(evicted), want: testEvictedMessage},
-		{
-			name:   "Evicted=False is not a pending reason",
-			status: workloadConditions(workloadCondition(workloadConditionEvicted, "False", "not evicted")),
-			want:   testQueuedReason,
+			name:      "Evicted=False is not a pending reason",
+			status:    workloadConditions(workloadCondition(workloadConditionEvicted, "False", "not evicted")),
+			queueName: testLocalQueue,
+			want:      testQueuedReason,
 		},
 		{
 			name: "newer Evicted wins over QuotaReserved",
@@ -155,11 +157,9 @@ func TestKueuePendingReason(t *testing.T) {
 		},
 		{name: "QuotaReserved wins without transition times", status: workloadConditions(evicted, quotaFalse), want: testQuotaMessage},
 		{
-			name: "Evicted with a time wins over QuotaReserved without one",
-			status: workloadConditions(
-				workloadConditionAt(workloadConditionEvicted, "True", testEvictedMessage, testEarlier),
-				quotaFalse),
-			want: testEvictedMessage,
+			name:   "Evicted with a time wins over QuotaReserved without one",
+			status: workloadConditions(workloadConditionAt(workloadConditionEvicted, "True", testEvictedMessage, testEarlier), quotaFalse),
+			want:   testEvictedMessage,
 		},
 		{
 			name:   "Evicted without a message falls back to QuotaReserved",
@@ -167,87 +167,85 @@ func TestKueuePendingReason(t *testing.T) {
 			want:   testQuotaMessage,
 		},
 		{
-			name:   "pending admission check wins over conditions",
-			status: withAdmissionChecks(workloadConditions(quotaFalse, evicted), admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testProvisioningMessage)),
+			name:   "reserved Workload shows the pending admission check message",
+			status: withAdmissionChecks(workloadConditions(quotaTrue), provisioningCheck),
 			want:   testProvisioningCheckName + ": " + testProvisioningMessage,
 		},
 		{
-			name: "pending admission checks are joined",
-			status: withAdmissionChecks(map[string]any{},
+			name: "reserved Workload joins the pending admission check messages",
+			status: withAdmissionChecks(workloadConditions(quotaTrue),
 				admissionCheck("a", admissionCheckStatePending, "first"),
 				admissionCheck("b", "Ready", "ready check"),
 				admissionCheck("c", admissionCheckStatePending, "second")),
 			want: "a: first; c: second",
 		},
 		{
-			name:   "pending admission check without message falls back to conditions",
-			status: withAdmissionChecks(workloadConditions(quotaFalse), admissionCheck("a", admissionCheckStatePending, "")),
-			want:   testQuotaMessage,
-		},
-		{
-			name:   "multi-line message is put on one line",
-			status: workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", "line one\n  line two ")),
-			want:   "line one line two",
-		},
-		{name: "unexpected status shape is ignored", status: map[string]any{"conditions": "not-a-list"}, want: testQueuedReason},
-		{
-			name: "deactivated Workload shows Evicted instead of the reset admission check",
-			status: withAdmissionChecks(workloadConditions(
-				workloadConditionAt(workloadConditionQuotaReserved, "False", testQuotaMessage, testLater),
-				workloadConditionAt(workloadConditionEvicted, "True", testDeactivatedMessage, testEarlier)),
-				admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testResetCheckMessage)),
-			spec: deactivatedSpec(),
-			want: testDeactivatedMessage,
-		},
-		{
-			name: "deactivated Workload without Evicted shows QuotaReserved",
-			status: withAdmissionChecks(workloadConditions(quotaFalse),
-				admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testResetCheckMessage)),
-			spec: deactivatedSpec(),
-			want: testQuotaMessage,
-		},
-		{
-			name:   "deactivated Workload without a message has no reason",
-			status: withAdmissionChecks(map[string]any{}, admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testResetCheckMessage)),
-			spec:   deactivatedSpec(),
-			want:   "",
-		},
-		{
-			name:   "active Workload shows the pending admission check message",
-			status: withAdmissionChecks(map[string]any{}, admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testProvisioningMessage)),
-			spec:   map[string]any{workloadSpecActive: true},
-			want:   testProvisioningCheckName + ": " + testProvisioningMessage,
-		},
-		{
-			name:   "pending admission check without a message",
-			status: withAdmissionChecks(map[string]any{}, admissionCheck(testProvisioningCheckName, admissionCheckStatePending, "")),
+			name:   "reserved Workload with a pending check without a message",
+			status: withAdmissionChecks(workloadConditions(quotaTrue), emptyCheck),
 			want:   "waiting for " + testProvisioningCheckName,
 		},
 		{
-			name: "pending admission checks without a message are joined",
-			status: withAdmissionChecks(map[string]any{},
+			name: "reserved Workload joins the pending checks without a message",
+			status: withAdmissionChecks(workloadConditions(quotaTrue),
 				admissionCheck("a", admissionCheckStatePending, ""),
 				admissionCheck("b", "Ready", ""),
 				admissionCheck("c", admissionCheckStatePending, " ")),
 			want: "waiting for a, c",
 		},
 		{
-			name:   "Workload with reserved quota and no message has no reason",
-			status: workloadConditions(workloadCondition(workloadConditionQuotaReserved, "True", "")),
-			want:   "",
+			name:      "queued Workload ignores a pending check without a message",
+			status:    withAdmissionChecks(map[string]any{}, emptyCheck),
+			queueName: testLocalQueue,
+			want:      testQueuedReason,
+		},
+		{
+			name:   "unreserved Workload ignores pending check messages",
+			status: withAdmissionChecks(workloadConditions(quotaFalse), provisioningCheck),
+			want:   testQuotaMessage,
+		},
+		{
+			name: "preempted Workload shows the eviction, not the reset admission check",
+			status: withAdmissionChecks(workloadConditions(
+				workloadConditionAt(workloadConditionQuotaReserved, "False", testQuotaMessage, testEarlier),
+				workloadConditionAt(workloadConditionEvicted, "True", testEvictedMessage, testLater)),
+				resetCheck),
+			want: testEvictedMessage,
+		},
+		{
+			name:   "multi-line message is put on one line",
+			status: workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", "line one\n  line two ")),
+			want:   "line one line two",
+		},
+		{name: "unexpected status shape is ignored", status: map[string]any{"conditions": "not-a-list"}, queueName: testLocalQueue, want: testQueuedReason},
+		{
+			name: "deactivated Workload shows Evicted instead of the reset admission check",
+			status: withAdmissionChecks(workloadConditions(
+				workloadConditionAt(workloadConditionQuotaReserved, "False", testQuotaMessage, testLater),
+				workloadConditionAt(workloadConditionEvicted, "True", testDeactivatedMessage, testEarlier)),
+				resetCheck),
+			spec: deactivatedSpec(),
+			want: testDeactivatedMessage,
+		},
+		{
+			name:   "deactivated Workload without Evicted shows QuotaReserved",
+			status: withAdmissionChecks(workloadConditions(quotaFalse), resetCheck),
+			spec:   deactivatedSpec(),
+			want:   testQuotaMessage,
+		},
+		{
+			name:      "deactivated Workload without a message has no reason",
+			status:    withAdmissionChecks(map[string]any{}, resetCheck),
+			spec:      deactivatedSpec(),
+			queueName: testLocalQueue,
+			want:      "",
 		},
 		{
 			name:   "admitted Workload has no reason",
 			status: workloadConditions(workloadCondition(workloadConditionAdmitted, "True", "The workload is admitted"), quotaFalse),
 			want:   "",
 		},
-		{
-			name:      "queued in the Workload queueName without a JobSet label",
-			spec:      map[string]any{"queueName": "wl-queue"},
-			queueName: "-",
-			want:      "queued in wl-queue",
-		},
-		{name: "no LocalQueue has no reason", queueName: "-", want: ""},
+		{name: "queued in the Workload queueName without a JobSet label", spec: map[string]any{"queueName": "wl-queue"}, want: "queued in wl-queue"},
+		{name: "no LocalQueue has no reason", want: ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -255,14 +253,7 @@ func TestKueuePendingReason(t *testing.T) {
 			if tc.spec != nil {
 				wl.Object["spec"] = tc.spec
 			}
-			queueName := tc.queueName
-			switch queueName {
-			case "":
-				queueName = testLocalQueue
-			case "-":
-				queueName = ""
-			}
-			if got := kueuePendingReason(wl, queueName); got != tc.want {
+			if got := kueuePendingReason(wl, tc.queueName); got != tc.want {
 				t.Errorf("kueuePendingReason() = %q, want %q", got, tc.want)
 			}
 		})
@@ -356,7 +347,8 @@ func TestReconcile_KueuePendingReason(t *testing.T) {
 		{
 			name:    "admission check reason",
 			comment: unheld,
-			workloads: []client.Object{newTestWorkload("wl", testJobSetUID, withAdmissionChecks(map[string]any{},
+			workloads: []client.Object{newTestWorkload("wl", testJobSetUID, withAdmissionChecks(
+				workloadConditions(workloadCondition(workloadConditionQuotaReserved, "True", "")),
 				admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testProvisioningMessage)))},
 			wantComment: pendingStatus(kueueReasonPrefix + testProvisioningCheckName + ": " + testProvisioningMessage),
 		},
@@ -418,17 +410,7 @@ func TestReconcile_KueuePendingReason(t *testing.T) {
 				env.verifyNoSlurmUpdates()
 				return
 			}
-			updates := env.mockSlurm.GetUpdatedJobs()
-			if len(updates) != 1 {
-				t.Fatalf("Expected 1 Slurm job update, got %d", len(updates))
-			}
-			req := updates[0].Req.(slurmapi.V0044JobDescMsg)
-			if req.Hold != nil || req.Constraints != nil {
-				t.Errorf("Slurm job update changed hold or constraints: %+v", req)
-			}
-			if got := env.firstUpdatedComment(); got != tc.wantComment {
-				t.Errorf("Slurm job comment = %q, want %q", got, tc.wantComment)
-			}
+			env.verifyCommentOnlyUpdate(tc.wantComment)
 		})
 	}
 }
@@ -452,15 +434,96 @@ func TestReconcile_KueuePendingReason_JobHeldForBadConstraints(t *testing.T) {
 	if _, err := env.reconcile(); err != nil {
 		t.Fatalf("Reconcile() returned unexpected error: %v", err)
 	}
-	updates := env.mockSlurm.GetUpdatedJobs()
-	if len(updates) != 1 {
-		t.Fatalf("Expected 1 Slurm job update, got %d", len(updates))
+	env.verifyCommentOnlyUpdate(pendingStatus(kueueReasonPrefix + testQuotaMessage))
+}
+
+func TestReconcile_KueuePendingReason_SlurmUpdateError(t *testing.T) {
+	updateErr := errors.New("slurmrestd unavailable")
+	tests := []struct {
+		name      string
+		updateErr error
+		wantErr   error
+	}{
+		{name: "update error is returned", updateErr: updateErr, wantErr: updateErr},
+		{name: "partition configuration unavailable is ignored", updateErr: newPartConfigUnavailable422Error()},
 	}
-	req := updates[0].Req.(slurmapi.V0044JobDescMsg)
-	if req.Hold != nil || req.Constraints != nil {
-		t.Errorf("Slurm job update changed hold or constraints: %+v", req)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := newReconTestJobSet().withUID(testJobSetUID).withSuspend(true).build()
+			wl := newTestWorkload("wl", testJobSetUID,
+				workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)))
+			env := newReconcileTestEnv(t,
+				withPendingSlurmJobs(newTranslatedPendingReconJob(unheldStatus("slurm-job-"+reconJobIDStr))),
+				withExtraObjects(js, wl),
+				withSlurmUpdateError(tc.updateErr, false))
+
+			_, err := env.reconcile()
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Reconcile() error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil && !strings.Contains(err.Error(), "failed to update comment of Slurm job") {
+				t.Errorf("Reconcile() error = %q, want it wrapped with the comment update context", err)
+			}
+		})
 	}
-	if got, want := env.firstUpdatedComment(), pendingStatus(kueueReasonPrefix+testQuotaMessage); got != want {
+}
+
+func TestReconcile_JobSetDeletedWhileWaitingInKueue_CancelsJob(t *testing.T) {
+	// A Pending status marks the job as translated, so a missing JobSet cancels the job instead
+	// of creating a new JobSet.
+	job := newReconTestJob().
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		withStateReason("BadConstraints").
+		withTranslatedJobMarkers().
+		withComment(pendingStatus(kueueReasonPrefix + testQueuedReason)).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmCancellation(ReasonJobSetMissing)
+	env.verifyJobSetNotFound()
+}
+
+func TestReconcile_PendingStatusCleared_HeldForBadConstraints(t *testing.T) {
+	// A translated job is held for BadConstraints until its JobSet is admitted, so the Pending status
+	// is cleared by releaseHold when the JobSet is no longer suspended.
+	job := newReconTestJob().
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		withStateReason("BadConstraints").
+		withTranslatedJobMarkers().
+		withComment("my run, " + pendingStatus(kueueReasonPrefix+testQuotaMessage)).
+		build()
+	js := newReconTestJobSet().withUID(testJobSetUID).withSuspend(false).build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job), withExtraObjects(js))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	if got, want := env.firstUpdatedComment(), "my run, "+unheldStatus("slurm-job-"+reconJobIDStr); got != want {
+		t.Errorf("Slurm job comment = %q, want %q", got, want)
+	}
+}
+
+func TestReconcile_ExistingJobSetOfAutoHeldJob_ReleasesHold(t *testing.T) {
+	// The Create of the JobSet returned an error after the JobSet was stored, so the job is still
+	// auto-held with the creation retry status while its JobSet waits in Kueue.
+	job := newReconTestJob().
+		withAutoHold().
+		withComment("my run, " + pendingStatus(jobSetCreateRetryReason+"timeout") + commentSeparator + AutoHoldMarker).
+		build()
+	js := newReconTestJobSet().withUID(testJobSetUID).withSuspend(true).build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job), withExtraObjects(js))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	if got, want := env.firstUpdatedComment(), "my run, "+unheldStatus("slurm-job-"+reconJobIDStr); got != want {
 		t.Errorf("Slurm job comment = %q, want %q", got, want)
 	}
 }
@@ -494,6 +557,54 @@ func TestReconcile_KueueWorkloadAPIUnavailable_LoggedOnce(t *testing.T) {
 				t.Errorf("Logged %q %d times, want 1", unavailableLog, got)
 			}
 			env.verifyNoSlurmUpdates()
+		})
+	}
+}
+
+func TestReconcile_KueueWorkloadAPIUnavailable_LogLatch(t *testing.T) {
+	const unavailableLog = "Kueue Workload API is not available, Kueue pending reasons are not reported"
+	noMatch := &meta.NoKindMatchError{GroupKind: workloadListGVK.GroupVersion().WithKind("Workload").GroupKind()}
+
+	tests := []struct {
+		name string
+		// errs are the Workload LIST errors of successive reconciles; nil means the LIST succeeds.
+		errs        []error
+		wantInfoLog int
+	}{
+		{name: "API back and gone again is logged again", errs: []error{noMatch, nil, noMatch}, wantInfoLog: 2},
+		{name: "transient error is not logged at Info", errs: []error{errors.New("connection refused")}, wantInfoLog: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			js := newReconTestJobSet().withUID(testJobSetUID).withSuspend(true).build()
+			env := newReconcileTestEnv(t,
+				withPendingSlurmJobs(newTranslatedPendingReconJob(unheldStatus("slurm-job-"+reconJobIDStr))),
+				withExtraObjects(js))
+			var listErr error
+			env.reconciler.APIReader = interceptor.NewClient(env.baseClient.(client.WithWatch), interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if listErr != nil {
+						return listErr
+					}
+					return c.List(ctx, list, opts...)
+				},
+			})
+			ctx, recorded := newObservedLoggerContext(t.Context())
+
+			for i, err := range tc.errs {
+				listErr = err
+				if _, err := env.reconcile(ctx); err != nil {
+					t.Fatalf("Reconcile() #%d returned unexpected error: %v", i, err)
+				}
+			}
+			if got := recorded.FilterMessage(unavailableLog).Len(); got != tc.wantInfoLog {
+				t.Errorf("Logged %q %d times, want %d", unavailableLog, got, tc.wantInfoLog)
+			}
+			for _, entry := range recorded.FilterLevelExact(zapcore.InfoLevel).All() {
+				if strings.Contains(entry.Message, "Kueue") && entry.Message != unavailableLog {
+					t.Errorf("Unexpected Info log %q", entry.Message)
+				}
+			}
 		})
 	}
 }
@@ -561,17 +672,19 @@ func TestReconcile_TransientJobSetCreateError(t *testing.T) {
 				t.Fatalf("Reconcile() #%d error = %v, want the JobSet create error", i, err)
 			}
 		}
-		updates := env.mockSlurm.GetUpdatedJobs()
-		if len(updates) != 1 {
-			t.Fatalf("Expected 1 Slurm job update after two failed creates, got %d", len(updates))
-		}
-		if got, want := env.firstUpdatedComment(), "my run, "+retryComment; got != want {
-			t.Errorf("Slurm job comment = %q, want %q", got, want)
-		}
-		if req := updates[0].Req.(slurmapi.V0044JobDescMsg); req.Hold != nil {
-			t.Errorf("Slurm job update changed hold: %v", *req.Hold)
-		}
+		env.verifyCommentOnlyUpdate("my run, " + retryComment)
 		env.verifyJobSetNotFound()
+	})
+
+	t.Run("multi-line error is put on one line", func(t *testing.T) {
+		job := newReconTestJob().withAutoHold().build()
+		env := newReconcileTestEnv(t, withPendingSlurmJobs(job), withInterceptors(rejectJobSetCreate(errors.New("line one\n  line two"))))
+
+		if _, err := env.reconcile(); err == nil {
+			t.Fatal("Reconcile() returned nil error, want the JobSet create error")
+		}
+		env.verifyCommentOnlyUpdate(pendingStatus(jobSetCreateRetryReason+"failed to create Kubernetes resource slurm-job-"+reconJobIDStr+": line one line two") +
+			commentSeparator + AutoHoldMarker)
 	})
 
 	t.Run("comment update failure still returns the create error", func(t *testing.T) {

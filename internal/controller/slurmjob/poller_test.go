@@ -1429,6 +1429,9 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 	translatedFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
 	unheld := unheldStatus(jobSetName)
 	pending := pendingStatus(kueueReasonPrefix + testQuotaMessage)
+	// quotaWorkloads maps the test JobSets, which have no UID, to a Workload waiting for quota.
+	quotaWorkloads := workloadsByJobUID{"": newTestWorkload("wl", "",
+		workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)))}
 	newRunningJobBuilder := func() *testJobBuilder {
 		return newEmptyTestJob().
 			withJobID(jobID).
@@ -1445,10 +1448,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 		want       bool
 		// wantStatus, if set, is the expected activeJobStatus.
 		wantStatus K8sbridgeJobStatus
-		// workloads replaces the default index, which maps the JobSet to a Workload waiting for quota.
+		// workloads is the Workload index of the poll; nil means it could not be read.
 		workloads workloadsByJobUID
-		// workloadsUnavailable simulates a failed Workload LIST.
-		workloadsUnavailable bool
 	}{
 		{
 			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
@@ -1535,6 +1536,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 				withComment(unheld).
 				build(),
 			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			workloads:  quotaWorkloads,
 			want:       true,
 		},
 		{
@@ -1546,6 +1548,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 				withComment(unheld).
 				build(),
 			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			workloads:  quotaWorkloads,
 			want:       true,
 			wantStatus: StatusPendingInKubernetes,
 		},
@@ -1572,10 +1575,10 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       true,
 		},
 		{
-			name: "Skips when explicitly held translated PENDING job has a suspended JobSet",
+			name: "Skips when translated PENDING job with a suspended JobSet is explicitly held by admin (StatusNoAction)",
 			job: newPendingJobBuilder().
 				withHold(true).
-				withStateReason(ReasonJobHeldUser).
+				withStateReason(ReasonJobHeldAdmin).
 				withFeatures(translatedFeature).
 				withComment(unheld).
 				build(),
@@ -1592,6 +1595,17 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			existingJS: nil,
 			want:       true,
 			wantStatus: StatusNewJob,
+		},
+		{
+			name: "Emits when auto-held PENDING job with a JobSet creation retry status has a suspended JobSet (StatusShouldUnhold)",
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(pendingStatus(jobSetCreateRetryReason+"timeout") + commentSeparator + AutoHoldMarker).
+				build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			want:       true,
+			wantStatus: StatusShouldUnhold,
 		},
 		{
 			name:       "Skips when RUNNING job has a clean comment",
@@ -1621,6 +1635,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			name:       "Skips when the comment already shows the Kueue reason",
 			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(pending).build(),
 			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			workloads:  quotaWorkloads,
 			want:       false,
 			wantStatus: StatusPendingInKubernetes,
 		},
@@ -1628,6 +1643,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			name:       "Emits when the Kueue reason changed",
 			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(pendingStatus(kueueReasonPrefix + "old reason")).build(),
 			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			workloads:  quotaWorkloads,
 			want:       true,
 		},
 		{
@@ -1638,32 +1654,24 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name:                 "Skips the Kueue reason when the Workloads cannot be read",
-			job:                  newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(unheld).build(),
-			existingJS:           newTestJobSet(jobSetName).withSuspend(true).build(),
-			workloadsUnavailable: true,
-			want:                 false,
+			name:       "Skips the Kueue reason when the Workloads could not be read",
+			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(unheld).build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(true).build(),
+			workloads:  nil,
+			want:       false,
 		},
 		{
-			name:                 "Emits the Unheld restore when the Workloads cannot be read",
-			job:                  newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(pending).build(),
-			existingJS:           newTestJobSet(jobSetName).withSuspend(false).build(),
-			workloadsUnavailable: true,
-			want:                 true,
+			name:       "Emits the Unheld restore when the Workloads could not be read",
+			job:        newPendingJobBuilder().withHold(false).withFeatures(translatedFeature).withComment(pending).build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
+			workloads:  nil,
+			want:       true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			workloads := tc.workloads
-			if workloads == nil && tc.existingJS != nil {
-				workloads = workloadsByJobUID{tc.existingJS.UID: newTestWorkload("wl", tc.existingJS.UID,
-					workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)))}
-			}
-			if tc.workloadsUnavailable {
-				workloads = nil
-			}
-			if got := shouldEmitAdmissionEvent(tc.job, tc.existingJS, func() workloadsByJobUID { return workloads }); got != tc.want {
+			if got := shouldEmitAdmissionEvent(tc.job, tc.existingJS, tc.workloads); got != tc.want {
 				t.Errorf("shouldEmitAdmissionEvent() = %v, want %v", got, tc.want)
 			}
 			if tc.wantStatus != "" {
@@ -1849,7 +1857,7 @@ func newPendingReasonPollEnv(t *testing.T, jobs []slurmclienttypes.V0044JobInfo,
 
 	lists := &atomic.Int32{}
 	env := &pendingReasonPollEnv{
-		admissionChan: make(chan slurmtypes.SlurmJobAdmissionEvent, 20),
+		admissionChan: make(chan slurmtypes.SlurmJobAdmissionEvent, 2*maxWorkloadUIDsPerList),
 		workloadLists: lists,
 		k8sClient:     k8sClient,
 	}
@@ -2008,14 +2016,36 @@ func TestPoll_PendingReasons(t *testing.T) {
 
 	t.Run("converges after the emitted jobs are reconciled", func(t *testing.T) {
 		env := newPendingReasonPollEnv(t, jobs, objs, nil)
-		for _, id := range env.emittedJobIDs(t) {
-			// The new job 405 cannot be translated here (no Slurm Controller); it stays new.
-			if err := env.reconcile(t, id); err != nil && id != "405" {
+		if got, want := env.emittedJobIDs(t), []string{"401", "402", "404", "405"}; !slices.Equal(got, want) {
+			t.Fatalf("first Poll() emitted events for jobs %v, want %v", got, want)
+		}
+		// The new job 405 cannot be translated here (no Slurm Controller), so only the translated
+		// jobs are reconciled.
+		for _, id := range []string{"401", "402", "404"} {
+			if err := env.reconcile(t, id); err != nil {
 				t.Fatalf("Reconcile(%s) returned unexpected error: %v", id, err)
 			}
 		}
 		if got, want := env.emittedJobIDs(t), []string{"405"}; !slices.Equal(got, want) {
 			t.Errorf("second Poll() emitted events for jobs %v, want only the untranslated job %v", got, want)
+		}
+	})
+
+	t.Run("more than maxWorkloadUIDsPerList waiting jobs are read in chunks", func(t *testing.T) {
+		const waiting = maxWorkloadUIDsPerList + 5
+		manyJobs := make([]slurmclienttypes.V0044JobInfo, 0, waiting)
+		manyObjs := make([]client.Object, 0, 2*waiting)
+		for i := range int32(waiting) {
+			id := 1000 + i
+			manyJobs = append(manyJobs, translatedJob(id, slurmapi.V0044JobInfoJobStatePENDING, unheldStatus(fmt.Sprintf("slurm-job-%d", id))))
+			manyObjs = append(manyObjs, ownedJobSet(id, true), quotaWorkload(id))
+		}
+		env := newPendingReasonPollEnv(t, manyJobs, manyObjs, nil)
+		if got := len(env.emittedJobIDs(t)); got != waiting {
+			t.Errorf("Poll() emitted %d events, want %d (one per waiting job, from the merged LISTs)", got, waiting)
+		}
+		if got := env.workloadLists.Load(); got != 2 {
+			t.Errorf("Poll() listed Workloads %d times, want 2", got)
 		}
 	})
 

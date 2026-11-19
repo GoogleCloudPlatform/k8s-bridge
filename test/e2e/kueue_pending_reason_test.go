@@ -21,6 +21,7 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -32,21 +33,34 @@ import (
 const (
 	pendingReasonWorkloadMixingPath = "test/e2e/testdata/workloadmixing_template.yaml"
 	pendingReasonClusterQueue       = "cluster-queue"
-	// defaultClusterQueueCPUQuota matches the cpu nominalQuota in testdata/kueue_resources.yaml.
-	defaultClusterQueueCPUQuota = "1000"
-	pendingInKubernetesPrefix   = "Pending in Kubernetes:"
-	pendingReasonUserComment    = "e2e-pending-reason"
+	pendingInKubernetesPrefix       = "Pending in Kubernetes:"
+	pendingReasonUserComment        = "e2e-pending-reason"
 	// pendingReasonLocalQueue is the LocalQueue of the WorkloadMixing template.
 	pendingReasonLocalQueue = "test-local-queue"
 )
+
+// clusterQueueCPUResource is the JSON path of the cpu resource of the default flavor of a ClusterQueue.
+const clusterQueueCPUResource = "/spec/resourceGroups/0/flavors/0/resources/0"
+
+// clusterQueueCPUQuota returns the cpu nominalQuota of the default flavor of the ClusterQueue.
+func clusterQueueCPUQuota(clusterQueue string) string {
+	GinkgoHelper()
+	cmd := exec.Command("kubectl", "get", "clusterqueue", clusterQueue, "-o",
+		"jsonpath={.spec.resourceGroups[0].flavors[0].resources[0].name} {.spec.resourceGroups[0].flavors[0].resources[0].nominalQuota}")
+	out, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to read the cpu quota of ClusterQueue %s", clusterQueue)
+	name, quota, _ := strings.Cut(strings.TrimSpace(out), " ")
+	Expect(name).To(Equal("cpu"), "The first resource of ClusterQueue %s is not cpu", clusterQueue)
+	Expect(quota).NotTo(BeEmpty(), "ClusterQueue %s has no cpu nominalQuota", clusterQueue)
+	return quota
+}
 
 // setClusterQueueCPUQuota sets the cpu nominalQuota of the default flavor of the ClusterQueue.
 // The test op makes the patch fail instead of changing another resource if cpu is not the first one.
 func setClusterQueueCPUQuota(clusterQueue, quota string) {
 	GinkgoHelper()
-	const resource = "/spec/resourceGroups/0/flavors/0/resources/0"
 	patch := fmt.Sprintf(`[{"op":"test","path":"%s/name","value":"cpu"},{"op":"replace","path":"%s/nominalQuota","value":%q}]`,
-		resource, resource, quota)
+		clusterQueueCPUResource, clusterQueueCPUResource, quota)
 	cmd := exec.Command("kubectl", "patch", "clusterqueue", clusterQueue, "--type=json", "-p", patch)
 	_, err := utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred(), "Failed to set the cpu quota of ClusterQueue %s to %s", clusterQueue, quota)
@@ -68,7 +82,8 @@ var _ = Describe("Kubernetes pending reasons", func() {
 		utils.ApplyManifestWithCleanup(pendingReasonWorkloadMixingPath)
 
 		By("removing the cpu quota of the ClusterQueue so that Kueue cannot admit the JobSet")
-		DeferCleanup(setClusterQueueCPUQuota, pendingReasonClusterQueue, defaultClusterQueueCPUQuota)
+		originalQuota := clusterQueueCPUQuota(pendingReasonClusterQueue)
+		DeferCleanup(setClusterQueueCPUQuota, pendingReasonClusterQueue, originalQuota)
 		setClusterQueueCPUQuota(pendingReasonClusterQueue, "0")
 
 		jobID := utils.NewBatchJobBuilder(slurmNamespace).
@@ -107,7 +122,7 @@ var _ = Describe("Kubernetes pending reasons", func() {
 		}, jobsetTimeout, time.Second).Should(Succeed())
 
 		By("restoring the cpu quota of the ClusterQueue")
-		setClusterQueueCPUQuota(pendingReasonClusterQueue, defaultClusterQueueCPUQuota)
+		setClusterQueueCPUQuota(pendingReasonClusterQueue, originalQuota)
 
 		By("verifying the Pending status is replaced by the Unheld status")
 		Eventually(func(g Gomega) {

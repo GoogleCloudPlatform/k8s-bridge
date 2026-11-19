@@ -370,13 +370,7 @@ func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
 				if err == nil {
 					t.Fatal("Reconcile() returned nil error, want a retriable error")
 				}
-				want := pendingStatus(jobSetCreateRetryReason+tc.wantRetryReason) + commentSeparator + AutoHoldMarker
-				if got := env.firstUpdatedComment(); got != want {
-					t.Errorf("Slurm job comment = %q, want %q", got, want)
-				}
-				if deleted := env.mockSlurm.GetDeletedJobs(); len(deleted) != 0 {
-					t.Errorf("Deleted Slurm jobs = %v, want none", deleted)
-				}
+				env.verifyCommentOnlyUpdate(pendingStatus(jobSetCreateRetryReason+tc.wantRetryReason) + commentSeparator + AutoHoldMarker)
 				if got := testutil.ToFloat64(rejectedMetric); got != initRejected {
 					t.Errorf("JobsSync (%s) = %f, want %f", metrics.ReasonJobSetAdmissionRejected, got, initRejected)
 				}
