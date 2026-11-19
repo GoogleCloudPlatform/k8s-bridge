@@ -81,6 +81,13 @@ rules:
   - patch
   - update
 - apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - workloads
+  verbs:
+  - get
+  - list
+- apiGroups:
   - slinky.slurm.net
   resources:
   - controllers

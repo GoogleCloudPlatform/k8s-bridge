@@ -93,6 +93,7 @@ func setupReconcileTest(t *testing.T) (*runtime.Scheme, *k8sbridgev1alpha1.Workl
 	_ = jobsetv1alpha2.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	_ = slinkyv1beta1.AddToScheme(scheme)
+	addTestWorkloadTypes(scheme)
 
 	wm := &k8sbridgev1alpha1.WorkloadMixing{
 		ObjectMeta: metav1.ObjectMeta{
@@ -191,6 +192,11 @@ func (b *testJobSetBuilder) withLabels(labels map[string]string) *testJobSetBuil
 
 func (b *testJobSetBuilder) withOwnerReference(owner metav1.OwnerReference) *testJobSetBuilder {
 	b.jobSet.OwnerReferences = append(b.jobSet.OwnerReferences, owner)
+	return b
+}
+
+func (b *testJobSetBuilder) withUID(uid types.UID) *testJobSetBuilder {
+	b.jobSet.UID = uid
 	return b
 }
 

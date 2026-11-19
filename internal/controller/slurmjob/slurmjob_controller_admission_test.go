@@ -164,6 +164,7 @@ func TestBuildJobComment(t *testing.T) {
 	const marker = commentSeparator + AutoHoldMarker
 	cancelled := cancelledStatus("Translation failed: bad request")
 	unheld := UnheldCommentPrefix + " Kubernetes resource slurm-job-1 created successfully"
+	pending := pendingStatus(jobSetCreateRetryReason + "etcd unavailable")
 	tests := []struct {
 		name       string
 		current    string
@@ -185,6 +186,12 @@ func TestBuildJobComment(t *testing.T) {
 		{name: "bare reason from older k8s-bridge versions is kept as user text", current: "JobSet completed", status: cancelled, want: "JobSet completed, " + cancelled},
 		{name: "marker is dropped on request", current: "my run, " + AutoHoldMarker, status: unheld, dropMarker: true, want: "my run, " + unheld},
 		{name: "cancelled status is replaced by unheld and marker is dropped", current: "my run, " + cancelled + marker, status: unheld, dropMarker: true, want: "my run, " + unheld},
+		{name: "pending status keeps the marker", current: "my run, " + AutoHoldMarker, status: pending, want: "my run, " + pending + marker},
+		{name: "pending status is replaced by a newer one", current: "my run, " + pendingStatus("old reason") + marker, status: pending, want: "my run, " + pending + marker},
+		{name: "repeated pending status is a no-op", current: "my run, " + pending + marker, status: pending, want: "my run, " + pending + marker},
+		{name: "unheld status is replaced by pending", current: "my run, " + unheld, status: pending, want: "my run, " + pending},
+		{name: "pending status is replaced by unheld and marker is dropped", current: "my run, " + pending + marker, status: unheld, dropMarker: true, want: "my run, " + unheld},
+		{name: "pending status is replaced by cancelled", current: pending + marker, status: cancelled, want: cancelled + marker},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -307,6 +314,8 @@ func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
 		createErr       error
 		wantCancelled   bool
 		wantCommentPart string
+		// wantRetryReason is the API error message recorded in the comment of a retried job.
+		wantRetryReason string
 	}{
 		{
 			name:            "422 invalid cancels Slurm job",
@@ -327,16 +336,19 @@ func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
 			wantCommentPart: admissionRejectedCommentPrefix + testPolicyWebhookDenial,
 		},
 		{
-			name:      "403 rbac forbidden is retried",
-			createErr: apierrors.NewForbidden(testJobSetGroupResource, "slurm-job-"+reconJobIDStr, errors.New("RBAC denied")),
+			name:            "403 rbac forbidden is retried",
+			createErr:       apierrors.NewForbidden(testJobSetGroupResource, "slurm-job-"+reconJobIDStr, errors.New("RBAC denied")),
+			wantRetryReason: `jobsets.jobset.x-k8s.io "slurm-job-` + reconJobIDStr + `" is forbidden: RBAC denied`,
 		},
 		{
-			name:      "500 internal error is retried",
-			createErr: apierrors.NewInternalError(errors.New("etcd unavailable")),
+			name:            "500 internal error is retried",
+			createErr:       apierrors.NewInternalError(errors.New("etcd unavailable")),
+			wantRetryReason: "Internal error occurred: etcd unavailable",
 		},
 		{
-			name:      "503 service unavailable is retried",
-			createErr: apierrors.NewServiceUnavailable("webhook unreachable"),
+			name:            "503 service unavailable is retried",
+			createErr:       apierrors.NewServiceUnavailable("webhook unreachable"),
+			wantRetryReason: "webhook unreachable",
 		},
 	}
 
@@ -358,7 +370,13 @@ func TestReconcile_JobSetAdmissionRejection(t *testing.T) {
 				if err == nil {
 					t.Fatal("Reconcile() returned nil error, want a retriable error")
 				}
-				env.verifyNoSlurmUpdates()
+				want := pendingStatus(jobSetCreateRetryReason+tc.wantRetryReason) + commentSeparator + AutoHoldMarker
+				if got := env.firstUpdatedComment(); got != want {
+					t.Errorf("Slurm job comment = %q, want %q", got, want)
+				}
+				if deleted := env.mockSlurm.GetDeletedJobs(); len(deleted) != 0 {
+					t.Errorf("Deleted Slurm jobs = %v, want none", deleted)
+				}
 				if got := testutil.ToFloat64(rejectedMetric); got != initRejected {
 					t.Errorf("JobsSync (%s) = %f, want %f", metrics.ReasonJobSetAdmissionRejected, got, initRejected)
 				}
