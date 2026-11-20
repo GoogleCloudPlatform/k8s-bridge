@@ -2924,3 +2924,61 @@ func TestJobSetWatchPredicate(t *testing.T) {
 		}
 	})
 }
+
+func TestReconcile_WorkloadMixingAvailabilityGate(t *testing.T) {
+	markUnavailable := withWorkloadMixingModifier(func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+		wm.Generation = 1
+		wm.Status.Conditions = []metav1.Condition{
+			{
+				Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: 1,
+				Reason:             testReasonLocalQueueNotFound,
+			},
+		}
+	})
+
+	t.Run("Defers new job while unavailable and admits once Available=True", func(t *testing.T) {
+		job := newReconTestJob().withNodes(1).withAutoHold().build()
+		env := newReconcileTestEnv(t, markUnavailable, withPendingSlurmJobs(job))
+
+		// 1. Unavailable -> deferred with no JobSet or Slurm updates.
+		res, err := env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("First reconcile = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifyJobSetNotFound()
+		env.verifyNoSlurmUpdates()
+
+		// 2. Available=True -> JobSet created and Slurm hold released.
+		wmKey := types.NamespacedName{Namespace: reconNamespace, Name: reconWmName}
+		var latestWM k8sbridgev1alpha1.WorkloadMixing
+		if err := env.baseClient.Get(t.Context(), wmKey, &latestWM); err != nil {
+			t.Fatalf("Failed to get WorkloadMixing: %v", err)
+		}
+		latestWM.Status.Conditions[0].Status = metav1.ConditionTrue
+		latestWM.Status.Conditions[0].Reason = testReasonReconciled
+		if err := env.baseClient.Update(t.Context(), &latestWM); err != nil {
+			t.Fatalf("Failed to update WorkloadMixing: %v", err)
+		}
+
+		res, err = env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("Recovery reconcile = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+		env.verifySlurmUnhold()
+	})
+
+	t.Run("Proceeds for existing JobSet even when WorkloadMixing is unavailable", func(t *testing.T) {
+		job := newReconTestJob().withAutoHold().build()
+		existingJS := newReconTestJobSet().withSuspend(false).build()
+		env := newReconcileTestEnv(t, markUnavailable, withExtraObjects(existingJS), withPendingSlurmJobs(job))
+
+		res, err := env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifySlurmUnhold()
+	})
+}

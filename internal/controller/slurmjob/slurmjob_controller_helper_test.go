@@ -53,13 +53,15 @@ import (
 )
 
 const (
-	reconWmName          = "test-wm"
-	reconNamespace       = "test-ns"
-	reconControllerName  = "test-controller"
-	reconPartitionName   = "test-partition"
-	reconJobID           = 12345
-	reconJobIDStr        = "12345"
-	reconSlurmAuthSecret = "slurm-auth-slurm"
+	reconWmName                  = "test-wm"
+	reconNamespace               = "test-ns"
+	reconControllerName          = "test-controller"
+	reconPartitionName           = "test-partition"
+	reconJobID                   = 12345
+	reconJobIDStr                = "12345"
+	reconSlurmAuthSecret         = "slurm-auth-slurm"
+	testReasonReconciled         = "Reconciled"
+	testReasonLocalQueueNotFound = "LocalQueueNotFound"
 )
 
 func newPartConfigUnavailable422Error() error {
@@ -105,6 +107,16 @@ func setupReconcileTest(t *testing.T) (*runtime.Scheme, *k8sbridgev1alpha1.Workl
 			},
 			PartitionsMapping: []k8sbridgev1alpha1.PartitionMapping{
 				{Partition: reconPartitionName, LocalQueue: "some-queue"},
+			},
+		},
+		Status: k8sbridgev1alpha1.WorkloadMixingStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 0,
+					Reason:             testReasonReconciled,
+				},
 			},
 		},
 	}
@@ -257,6 +269,7 @@ type reconcileEnvConfig struct {
 	withoutController      bool
 	withoutSlurmClient     bool
 	emptyControllerRefName bool
+	wmModifiers            []func(*k8sbridgev1alpha1.WorkloadMixing)
 	extraObjects           []client.Object
 	interceptors           *interceptor.Funcs
 	pendingJobs            []slurmclienttypes.V0044JobInfo
@@ -264,6 +277,14 @@ type reconcileEnvConfig struct {
 	slurmUpdateError       error
 	slurmMutateOnUpdate    bool
 	slurmDeleteJobError    error
+}
+
+func withWorkloadMixingModifier(fn func(*k8sbridgev1alpha1.WorkloadMixing)) reconcileEnvOpt {
+	return func(c *reconcileEnvConfig) {
+		if fn != nil {
+			c.wmModifiers = append(c.wmModifiers, fn)
+		}
+	}
 }
 
 func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
@@ -330,6 +351,9 @@ func newReconcileTestEnv(t *testing.T, opts ...reconcileEnvOpt) *reconcileTestEn
 	scheme, wm, req := setupReconcileTest(t)
 	if cfg.emptyControllerRefName {
 		wm.Spec.ControllerRef.Name = ""
+	}
+	for _, mod := range cfg.wmModifiers {
+		mod(wm)
 	}
 
 	var initObjs []client.Object

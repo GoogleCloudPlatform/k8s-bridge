@@ -437,9 +437,16 @@ func getTeardownEvent(
 	}
 }
 
-func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
+func shouldEmitAdmissionEvent(
+	wmAvailable bool,
+	job *slurmclienttypes.V0044JobInfo,
+	existingJS *jobsetv1alpha2.JobSet,
+) bool {
 	status := activeJobStatus(job, existingJS)
 	if status == StatusNewJob {
+		if !wmAvailable {
+			return false
+		}
 		if strings.Contains(ptr.Deref(job.Partition, ""), ",") {
 			return true
 		}
@@ -487,7 +494,7 @@ func (p *SlurmPoller) processPendingJobsForWM(
 				jobIDStr := strconv.Itoa(int(jobID))
 				jobSetName := jobSetNameForJobID(jobIDStr)
 				existingJS := jobSetsByName[jobSetName]
-				if !shouldEmitAdmissionEvent(job, existingJS) {
+				if !shouldEmitAdmissionEvent(wm.IsAvailable(), job, existingJS) {
 					continue
 				}
 
