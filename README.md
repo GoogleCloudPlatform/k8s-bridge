@@ -51,10 +51,26 @@ See the `config/samples/` directory for full examples of configuring the `Worklo
 - [Quickstart Guide](docs/quickstart.md): Step-by-step instructions to deploy k8s-bridge and a sample workload mixing cluster.
 - [Priorities and Preemption](docs/priorities-and-preemption.md): Configure partition-based priorities and Kueue preemption for Slurm workloads.
 - [GPU Workloads](docs/gpu-workloads.md): Configure GPU-enabled Slurm partitions and run GPU jobs on Kubernetes.
-- [Job Status Comments](docs/job-status-comments.md): Read the Kubernetes and Kueue status of a Slurm job, such as why it waits in Kueue, in the Slurm job comment.
 - [Pod Annotations](docs/pod-annotations.md): Pass Kubernetes Pod annotations, such as Kueue Topology-Aware Scheduling requests, with Slurm's `--extra` option, and configure Slurm for Topology-Aware Scheduling.
 - [GPU DWS Workloads](docs/gke/gpu-dws-workloads.md): Configure Dynamic Workload Scheduler (DWS) on GKE for GPU workloads.
 - [CCC](docs/gke/ccc.md): Configure Custom Compute Classes (CCC) on GKE.
+
+## Job Status in the Slurm Job Comment
+
+`k8s-bridge` adds the Kubernetes status of a job to its Slurm `Comment`, which you can see with `scontrol show job <id>` or `squeue -O comment`. The user's own `--comment` text is kept in front of this status.
+
+| Status | Meaning |
+|---|---|
+| `Unheld by k8s-bridge: Kubernetes resource slurm-job-<id> created successfully` | The JobSet was created and the job was released to Slurm. |
+| `Pending in Kubernetes: JobSet creation failed, retrying: <error>` | The JobSet cannot be created yet, for example because an admission webhook is unavailable. `k8s-bridge` retries with backoff. |
+| `Pending in Kubernetes: Kueue: <reason>` | The JobSet waits for Kueue admission. The reason is the message from the job's Kueue Workload, such as missing quota, a topology that does not fit, a preemption, or a pending admission check. The text is `waiting for <check>` when a check has no message yet, and `queued in <LocalQueue>` when Kueue has no message for the Workload. |
+| `Cancelled by k8s-bridge: <reason>` | `k8s-bridge` cancelled the job, for example because its JobSet failed or was rejected. |
+
+Limitations:
+- Kueue reasons require `get` and `list` on `workloads.kueue.x-k8s.io` in the `k8s-bridge` ClusterRole.
+- The status is refreshed on each poll. Kueue explains its decision only for the Workloads at the head of a queue, so a job further back can show an outdated Kueue message until Kueue evaluates it again.
+- Reasons longer than 200 bytes are cut. If the user's comment is close to Slurm's 1024-byte limit, writing a reason can shorten it.
+- Problems with Pods after Kueue admission, such as an unschedulable Pod, are not reported.
 
 ## Cleanup
 
