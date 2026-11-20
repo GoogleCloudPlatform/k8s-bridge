@@ -67,7 +67,6 @@ See the `config/samples/` directory for full examples of configuring the `Worklo
 | `Cancelled by k8s-bridge: <reason>` | `k8s-bridge` cancelled the job, for example because its JobSet failed or was rejected. |
 
 Limitations:
-- Kueue reasons require `get` and `list` on `workloads.kueue.x-k8s.io` in the `k8s-bridge` ClusterRole.
 - The status is refreshed on each poll. Kueue explains its decision only for the Workloads at the head of a queue, so a job further back can show an outdated Kueue message until Kueue evaluates it again.
 - Reasons longer than 200 bytes are cut. If the user's comment is close to Slurm's 1024-byte limit, writing a reason can shorten it.
 - Problems with Pods after Kueue admission, such as an unschedulable Pod, are not reported.
