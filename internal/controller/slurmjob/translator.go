@@ -46,6 +46,8 @@ const (
 	LabelSlurmPartition         = "k8s-bridge.x-k8s.io/slurm-partition"
 	LabelKueueQueue             = "kueue.x-k8s.io/queue-name"
 	LabelKueuePriorityClass     = "kueue.x-k8s.io/priority-class"
+	kueueJobUIDLabel            = "kueue.x-k8s.io/job-uid" // Set by Kueue on a Workload to the UID of its job.
+	kueueGroup                  = "kueue.x-k8s.io"
 	GRESGPU                     = "gpu"
 	tresNode                    = "node"
 	ContainerSlurmd             = "slurmd"

@@ -93,6 +93,7 @@ func setupReconcileTest(t *testing.T) (*runtime.Scheme, *k8sbridgev1alpha1.Workl
 	_ = jobsetv1alpha2.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	_ = slinkyv1beta1.AddToScheme(scheme)
+	addTestWorkloadTypes(scheme)
 
 	wm := &k8sbridgev1alpha1.WorkloadMixing{
 		ObjectMeta: metav1.ObjectMeta{
@@ -191,6 +192,11 @@ func (b *testJobSetBuilder) withLabels(labels map[string]string) *testJobSetBuil
 
 func (b *testJobSetBuilder) withOwnerReference(owner metav1.OwnerReference) *testJobSetBuilder {
 	b.jobSet.OwnerReferences = append(b.jobSet.OwnerReferences, owner)
+	return b
+}
+
+func (b *testJobSetBuilder) withUID(uid types.UID) *testJobSetBuilder {
+	b.jobSet.UID = uid
 	return b
 }
 
@@ -537,6 +543,28 @@ func (e *reconcileTestEnv) firstUpdatedComment() string {
 		e.t.Fatalf("Expected the first Slurm job update to set a comment, got %+v", updates[0].Req)
 	}
 	return *reqMsg.Comment
+}
+
+// verifyCommentOnlyUpdate checks for exactly one update, setting only the comment to want.
+func (e *reconcileTestEnv) verifyCommentOnlyUpdate(want string) {
+	e.t.Helper()
+	updates := e.mockSlurm.GetUpdatedJobs()
+	if len(updates) != 1 {
+		e.t.Fatalf("Expected 1 Slurm job update, got %d", len(updates))
+	}
+	req, ok := updates[0].Req.(slurmapi.V0044JobDescMsg)
+	if !ok {
+		e.t.Fatalf("Expected update request to be V0044JobDescMsg, got %T", updates[0].Req)
+	}
+	if req.Hold != nil || req.Constraints != nil {
+		e.t.Errorf("Slurm job update changed hold or constraints: %+v", req)
+	}
+	if got := ptr.Deref(req.Comment, ""); got != want {
+		e.t.Errorf("Slurm job comment = %q, want %q", got, want)
+	}
+	if deleted := e.mockSlurm.GetDeletedJobs(); len(deleted) != 0 {
+		e.t.Errorf("Deleted Slurm jobs = %v, want none", deleted)
+	}
 }
 
 func (e *reconcileTestEnv) verifySlurmNodesDeleted(wantNodes ...string) {

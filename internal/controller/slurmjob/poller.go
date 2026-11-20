@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -50,9 +51,11 @@ const (
 // It implements the manager.Runnable interface.
 type SlurmPoller struct {
 	client.Client
-	ClientMap         *clientmap.ClientMap
-	AdmissionEvents   chan<- slurmtypes.SlurmJobAdmissionEvent
-	TeardownEvents    chan<- slurmtypes.SlurmJobTeardownEvent
+	ClientMap       *clientmap.ClientMap
+	AdmissionEvents chan<- slurmtypes.SlurmJobAdmissionEvent
+	TeardownEvents  chan<- slurmtypes.SlurmJobTeardownEvent
+	// APIReader reads Kueue Workloads uncached; nil disables Kueue reasons.
+	APIReader         client.Reader
 	PollInterval      time.Duration
 	OrphanGracePeriod time.Duration
 	// firstSeenMissing tracks the timestamp when a Kubernetes JobSet was first observed
@@ -61,6 +64,8 @@ type SlurmPoller struct {
 	mu               sync.Mutex
 	// nowFn is a clock abstraction hook used exclusively in unit tests to simulate time progression.
 	nowFn func() time.Time
+	// workloadAPIUnavailableLogged latches the "Workload API not available" log.
+	workloadAPIUnavailableLogged atomic.Bool
 }
 
 // NeedLeaderElection implements the manager.LeaderElectionRunnable interface
@@ -437,15 +442,37 @@ func getTeardownEvent(
 	}
 }
 
-func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
-	status := activeJobStatus(job, existingJS)
-	if status == StatusNewJob {
+// shouldEmitAdmissionEvent reports whether the reconciler has work to do for a PENDING job.
+// workloads is nil if the Workloads could not be read.
+func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet, workloads workloadsByJobUID) bool {
+	switch status := activeJobStatus(job, existingJS); status {
+	case StatusNewJob:
 		if strings.Contains(ptr.Deref(job.Partition, ""), ",") {
 			return true
 		}
 		return !isJobExplicitlyHeld(job)
+	case StatusPendingInKubernetes:
+		comment, ok := desiredPendingComment(job, existingJS, workloads[existingJS.UID])
+		return ok && comment != ptr.Deref(job.Comment, "")
+	default:
+		return status != StatusNoAction
 	}
-	return status != StatusNoAction
+}
+
+// readWorkloads lists the Workloads in namespace with one LIST. It returns nil if they could not
+// be read.
+func (p *SlurmPoller) readWorkloads(ctx context.Context, namespace string) workloadsByJobUID {
+	if p.APIReader == nil {
+		return nil
+	}
+	workloads, err := listWorkloads(ctx, p.APIReader, namespace)
+	if err != nil {
+		logger := log.FromContext(ctx).WithName("slurm-poller").WithValues("namespace", namespace)
+		logWorkloadReadError(log.IntoContext(ctx, logger), &p.workloadAPIUnavailableLogged, err)
+		return nil
+	}
+	p.workloadAPIUnavailableLogged.Store(false)
+	return workloads
 }
 
 func (p *SlurmPoller) processPendingJobsForWM(
@@ -462,10 +489,16 @@ func (p *SlurmPoller) processPendingJobsForWM(
 	}
 
 	jobSetsByName := make(map[string]*jobsetv1alpha2.JobSet, len(jobSets))
+	waitingInKueue := false
 	for i := range jobSets {
 		if isJobSetOwnedByWM(&jobSets[i], wm) {
 			jobSetsByName[jobSets[i].Name] = &jobSets[i]
+			waitingInKueue = waitingInKueue || isJobSetSuspended(&jobSets[i])
 		}
+	}
+	var workloads workloadsByJobUID
+	if waitingInKueue {
+		workloads = p.readWorkloads(ctx, wm.Namespace)
 	}
 
 	for i := range jobList.Items {
@@ -487,7 +520,7 @@ func (p *SlurmPoller) processPendingJobsForWM(
 				jobIDStr := strconv.Itoa(int(jobID))
 				jobSetName := jobSetNameForJobID(jobIDStr)
 				existingJS := jobSetsByName[jobSetName]
-				if !shouldEmitAdmissionEvent(job, existingJS) {
+				if !shouldEmitAdmissionEvent(job, existingJS, workloads) {
 					continue
 				}
 

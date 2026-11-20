@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -68,7 +69,10 @@ const (
 	// Prefixes of the k8s-bridge status in a Slurm job comment. A comment has at most one status.
 	UnheldCommentPrefix    = "Unheld by k8s-bridge:"
 	CancelledCommentPrefix = "Cancelled by k8s-bridge:"
+	// PendingCommentPrefix is followed by why the job waits in Kubernetes.
+	PendingCommentPrefix = "Pending in Kubernetes:"
 
+	jobSetCreateRetryReason        = "JobSet creation failed, retrying: "
 	admissionRejectedCommentPrefix = "JobSet admission rejected: "
 	admissionWebhookMarker         = "admission webhook"
 	admissionDeniedMarker          = "denied the request"
@@ -77,16 +81,19 @@ const (
 	maxSlurmCommentLength  = 1024
 	truncatedCommentSuffix = "..."
 	// minStatusBudget is the minimum room, in bytes, kept for a long status next to the user's comment.
-	minStatusBudget  = 512
-	commentSeparator = ", "
+	minStatusBudget = 512
+	// maxPendingReasonLength caps the reason of a Pending status, in bytes.
+	maxPendingReasonLength = 200
+	commentSeparator       = ", "
 )
 
 // k8sBridgeStatusPrefixes lists all k8s-bridge status prefixes.
-var k8sBridgeStatusPrefixes = []string{UnheldCommentPrefix, CancelledCommentPrefix}
+var k8sBridgeStatusPrefixes = []string{UnheldCommentPrefix, CancelledCommentPrefix, PendingCommentPrefix}
 
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
 type SlurmJobReconciler struct {
 	client.Client
+	// APIReader reads uncached, including Kueue Workloads.
 	APIReader             client.Reader
 	Scheme                *runtime.Scheme
 	Recorder              record.EventRecorder
@@ -96,6 +103,8 @@ type SlurmJobReconciler struct {
 	Translator            JobTranslator
 	slurmCallTimeout      time.Duration
 	reconciliationTimeout time.Duration
+	// workloadAPIUnavailableLogged latches the "Workload API not available" log.
+	workloadAPIUnavailableLogged atomic.Bool
 }
 
 func (r *SlurmJobReconciler) getSlurmCallTimeout() time.Duration {
@@ -305,6 +314,7 @@ type slurmJobState struct {
 // +kubebuilder:rbac:groups=k8s-bridge.x-k8s.io,resources=workloadmixings,verbs=get;list;watch
 // +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets/finalizers,verbs=update
+// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads,verbs=get;list
 
 // requestLogger builds the per-request logger used by controller-runtime for
 // both the Reconcile context and its "Reconciler error" log lines. It keeps the
@@ -482,6 +492,8 @@ const (
 	StatusJobSetFailed    K8sbridgeJobStatus = "JobSetFailed"
 	StatusJobSetMissing   K8sbridgeJobStatus = "JobSetMissing"
 	StatusJobSetDeleting  K8sbridgeJobStatus = "JobSetDeleting"
+	// StatusPendingInKubernetes means the job's Pending status must be refreshed or cleared.
+	StatusPendingInKubernetes K8sbridgeJobStatus = "PendingInKubernetes"
 )
 
 func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) K8sbridgeJobStatus {
@@ -512,7 +524,34 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 		return StatusShouldUnhold
 	}
 
+	// The JobSet was stored despite a Create error: release the hold as after AlreadyExists.
+	if isUntranslatedNewJob(jobInfo) && hasAutoHoldMarker(ptr.Deref(jobInfo.Comment, "")) {
+		return StatusShouldUnhold
+	}
+
+	if needsPendingStatusUpdate(jobInfo, existingJS) {
+		return StatusPendingInKubernetes
+	}
+
 	return StatusNoAction
+}
+
+// needsPendingStatusUpdate reports whether a translated job's Pending status must be refreshed
+// (suspended JobSet) or cleared. Holds are not checked: Slurm reports translated jobs as held
+// (BadConstraints) until a node has their k8s-id feature.
+func needsPendingStatusUpdate(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
+	if existingJS == nil || !isJobTranslated(jobInfo) {
+		return false
+	}
+	if isJobSetSuspended(existingJS) {
+		return jobInfo.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING)
+	}
+	return hasPendingStatus(ptr.Deref(jobInfo.Comment, ""))
+}
+
+// hasPendingStatus reports whether comment has the Pending in Kubernetes status.
+func hasPendingStatus(comment string) bool {
+	return strings.Contains(comment, PendingCommentPrefix)
 }
 
 // isUntranslatedNewJob check if a Slurm job seems active (PENDING + Held) but also that it is recent (untranslated)
@@ -537,7 +576,11 @@ func isJobTranslated(jobInfo *slurmclienttypes.V0044JobInfo) bool {
 		}
 	}
 	comment := ptr.Deref(jobInfo.Comment, "")
-	return strings.Contains(comment, UnheldCommentPrefix) && !hasAutoHoldMarker(comment)
+	if hasAutoHoldMarker(comment) {
+		return false
+	}
+	// A Pending status replaces Unheld while the JobSet waits.
+	return strings.Contains(comment, UnheldCommentPrefix) || hasPendingStatus(comment)
 }
 
 func terminalJobSetStatus(js *jobsetv1alpha2.JobSet) (K8sbridgeJobStatus, bool) {
@@ -630,6 +673,9 @@ func (r *SlurmJobReconciler) reconcileActiveJob(
 			return ReconciliationDone, ctrl.Result{}, unholdErr
 		}
 		return ReconciliationDone, ctrl.Result{}, nil
+
+	case StatusPendingInKubernetes:
+		return ReconciliationDone, ctrl.Result{}, r.syncPendingStatus(ctx, slurmClient, jobInfo, existingJS)
 
 	case StatusNewJob:
 		return ReconciliationContinue, ctrl.Result{}, nil
@@ -772,6 +818,14 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 		if isPermanentAdmissionRejection(err) {
 			return ctrl.Result{}, r.handleJobSetAdmissionRejection(ctx, wm, slurmClient, jobInfo, jobID, partition, err)
 		}
+		// Without the marker, a Pending status would make the job look translated.
+		if hasAutoHoldMarker(ptr.Deref(jobInfo.Comment, "")) {
+			reason := jobSetCreateRetryReason + singleLine(apiStatusMessage(err))
+			// The Create may have used up the reconcile deadline.
+			if updateErr := r.setJobStatus(context.WithoutCancel(ctx), slurmClient, jobInfo, pendingStatus(reason), true); updateErr != nil {
+				logger.Error(updateErr, "Failed to record the JobSet creation failure in the Slurm job comment")
+			}
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -907,14 +961,14 @@ func isPermanentAdmissionRejection(err error) bool {
 		return true
 	}
 	if apierrors.IsForbidden(err) || apierrors.IsBadRequest(err) {
-		msg := admissionRejectionMessage(err)
+		msg := apiStatusMessage(err)
 		return strings.Contains(msg, admissionWebhookMarker) && strings.Contains(msg, admissionDeniedMarker)
 	}
 	return false
 }
 
-// admissionRejectionMessage returns the API status message of err, falling back to err.Error().
-func admissionRejectionMessage(err error) string {
+// apiStatusMessage returns the API status message of err, falling back to err.Error().
+func apiStatusMessage(err error) string {
 	var status apierrors.APIStatus
 	if errors.As(err, &status) {
 		if msg := status.Status().Message; msg != "" {
@@ -936,7 +990,7 @@ func (r *SlurmJobReconciler) handleJobSetAdmissionRejection(
 	createErr error,
 ) error {
 	logger := log.FromContext(ctx)
-	msg := admissionRejectionMessage(createErr)
+	msg := apiStatusMessage(createErr)
 
 	metrics.RecordJobSync(metrics.StatusError, metrics.ReasonJobSetAdmissionRejected, wm.Name, partition)
 	logger.Error(createErr, "JobSet creation was rejected, cancelling Slurm job", "partition", partition)
@@ -974,6 +1028,56 @@ func cancelledStatus(reason string) string {
 	return CancelledCommentPrefix + " " + reason
 }
 
+// unheldStatus returns the k8s-bridge status for a job released after its JobSet was created.
+func unheldStatus(jobSetName string) string {
+	return fmt.Sprintf("%s Kubernetes resource %s created successfully", UnheldCommentPrefix, jobSetName)
+}
+
+// pendingStatus returns the Pending status for reason, cut to maxPendingReasonLength so the user's
+// comment is almost never cut.
+func pendingStatus(reason string) string {
+	return PendingCommentPrefix + " " + truncateComment(reason, maxPendingReasonLength)
+}
+
+// setJobStatus sets the k8s-bridge status in the job comment (see buildJobComment).
+func (r *SlurmJobReconciler) setJobStatus(
+	ctx context.Context,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	status string,
+	keepAutoHoldMarker bool,
+) error {
+	comment, truncated := buildJobComment(ptr.Deref(jobInfo.Comment, ""), status, keepAutoHoldMarker)
+	if truncated {
+		log.FromContext(ctx).Info("Truncated Slurm job comment to fit Slurm's limit", "maxLength", maxSlurmCommentLength)
+	}
+	return r.writeJobComment(ctx, slurmClient, jobInfo, comment)
+}
+
+// writeJobComment sets the Slurm job comment, skipping the update if it would not change.
+func (r *SlurmJobReconciler) writeJobComment(
+	ctx context.Context,
+	slurmClient slurmclient.Client,
+	jobInfo *slurmclienttypes.V0044JobInfo,
+	comment string,
+) error {
+	if comment == ptr.Deref(jobInfo.Comment, "") {
+		return nil
+	}
+	logger := log.FromContext(ctx)
+	callCtx, cancel := context.WithTimeout(ctx, r.getSlurmCallTimeout())
+	defer cancel()
+	if err := slurmClient.Update(callCtx, jobInfo, slurmapi.V0044JobDescMsg{Comment: ptr.To(comment)}); err != nil {
+		if isSlurmPartConfigUnavailable(err) {
+			logger.V(1).Info("Slurm returned partition configuration unavailable after updating job comment", "error", err)
+			return nil
+		}
+		return fmt.Errorf("failed to update comment of Slurm job %d: %w", ptr.Deref(jobInfo.JobId, 0), err)
+	}
+	logger.V(1).Info("Updated Slurm job status comment", "comment", comment)
+	return nil
+}
+
 // userJobComment returns comment without the AutoHoldMarker and the k8s-bridge status.
 func userJobComment(comment string) string {
 	comment = stripAutoHoldMarker(comment)
@@ -985,7 +1089,7 @@ func userJobComment(comment string) string {
 	return strings.TrimSpace(strings.TrimRight(strings.TrimSpace(comment), ","))
 }
 
-// buildJobComment updates a Slurm job comment with a k8s-bridge status (Unheld or Cancelled)
+// buildJobComment updates a Slurm job comment with a k8s-bridge status (Unheld, Cancelled or Pending)
 // and reports whether any text was truncated. It guarantees that:
 //   - the user's comment is kept, and is truncated before the status if needed,
 //   - an existing AutoHoldMarker is kept if keepAutoHoldMarker is true, and is never truncated,
@@ -1063,8 +1167,7 @@ func (r *SlurmJobReconciler) releaseHold(ctx context.Context, slurmClient slurmc
 	logger := log.FromContext(ctx)
 	jobID := ptr.Deref(jobInfo.JobId, 0)
 
-	msg := fmt.Sprintf("%s Kubernetes resource %s created successfully", UnheldCommentPrefix, obj.GetName())
-	newComment, _ := buildJobComment(ptr.Deref(jobInfo.Comment, ""), msg, false)
+	newComment, _ := buildJobComment(ptr.Deref(jobInfo.Comment, ""), unheldStatus(obj.GetName()), false)
 
 	uniqueFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
 	existingFeatures := strings.TrimSpace(ptr.Deref(jobInfo.Features, ""))

@@ -230,6 +230,7 @@ func main() {
 		ClientMap:         cMap,
 		AdmissionEvents:   admissionEventsChan,
 		TeardownEvents:    teardownEventsChan,
+		APIReader:         mgr.GetAPIReader(),
 		PollInterval:      pollInterval,
 		OrphanGracePeriod: orphanGracePeriod,
 	}

@@ -84,7 +84,7 @@ kubectl -n "${NAMESPACE}" exec "${LOGIN_DEPLOY}" -c login -- \
   scontrol release "${JOB_ID}" || true
 
 if kubectl -n "${NAMESPACE}" exec "${LOGIN_DEPLOY}" -c login -- \
-  scontrol show job "${JOB_ID}" | grep -Eq "Comment=.*(${AUTO_HOLD_MARKER}|Unheld by k8s-bridge)"; then
+  scontrol show job "${JOB_ID}" | grep -Eq "Comment=.*(${AUTO_HOLD_MARKER}|Unheld by k8s-bridge|Pending in Kubernetes:)"; then
   echo "PASS: job_submit.lua converted user release to ${AUTO_HOLD_MARKER}"
 else
   echo "FAIL: job ${JOB_ID} missing ${AUTO_HOLD_MARKER} comment after release" >&2
