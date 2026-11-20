@@ -452,7 +452,9 @@ func getTeardownEvent(
 // if the Workloads could not be read.
 func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet, workloads workloadsByJobUID) bool {
 	if !job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING) {
-		return needsPendingStatusCleanup(job, existingJS)
+		// A RUNNING job only needs an event to clear a stale Pending status.
+		return job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateRUNNING) &&
+			activeJobStatus(job, existingJS) == StatusPendingInKubernetes
 	}
 	switch status := activeJobStatus(job, existingJS); status {
 	case StatusNewJob:
@@ -466,13 +468,6 @@ func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jo
 	default:
 		return status != StatusNoAction
 	}
-}
-
-// needsPendingStatusCleanup reports whether a RUNNING job still shows a Pending status, for example
-// after a missed unsuspend event or a failed comment update.
-func needsPendingStatusCleanup(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
-	return job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateRUNNING) &&
-		activeJobStatus(job, existingJS) == StatusPendingInKubernetes
 }
 
 // readWorkloads lists the Workloads of jobSetUIDs in chunks of maxWorkloadUIDsPerList. It returns
