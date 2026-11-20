@@ -55,8 +55,7 @@ const (
 	testLater                 = "2026-11-18T10:05:00Z"
 )
 
-// addTestWorkloadTypes registers the Kueue Workload kinds as unstructured types, as if the Kueue
-// CRDs were installed.
+// addTestWorkloadTypes registers the Workload kinds, as if the Kueue CRDs were installed.
 func addTestWorkloadTypes(scheme *runtime.Scheme) {
 	scheme.AddKnownTypeWithName(workloadListGVK.GroupVersion().WithKind("Workload"), &unstructured.Unstructured{})
 	scheme.AddKnownTypeWithName(workloadListGVK, &unstructured.UnstructuredList{})
@@ -226,8 +225,7 @@ func TestDesiredPendingStatus(t *testing.T) {
 	}
 }
 
-// newTranslatedReconJob returns a translated job. A held job is held by Slurm for BadConstraints,
-// as after the release until a node has the job's k8s-id feature.
+// newTranslatedReconJob returns a translated job; held jobs are held for BadConstraints.
 func newTranslatedReconJob(state slurmapi.V0044JobInfoJobState, held bool, comment string) *slurmclienttypes.V0044JobInfo {
 	reason := "Resources"
 	if held {
@@ -265,9 +263,8 @@ func TestReconcile_KueuePendingReason(t *testing.T) {
 	longUser := strings.Repeat("u", maxSlurmCommentLength-len(commentSeparator)-len(longStatus))
 
 	tests := []struct {
-		name    string
-		comment string
-		// held jobs are held by Slurm for BadConstraints while their JobSet waits.
+		name        string
+		comment     string
 		held        bool
 		noJobSet    bool
 		workloads   []client.Object
@@ -319,8 +316,6 @@ func TestReconcile_KueuePendingReason(t *testing.T) {
 		{name: "Slurm update error is returned", comment: unheld, workloads: []client.Object{quotaWorkload}, updateErr: updateErr, wantErr: updateErr},
 		{name: "Slurm partition configuration unavailable is ignored", comment: unheld, workloads: []client.Object{quotaWorkload}, updateErr: newPartConfigUnavailable422Error(), wantComment: kueueQuota},
 		{
-			// A Pending status marks the job as translated, so a missing JobSet cancels the job
-			// instead of creating a new JobSet.
 			name:       "JobSet deleted while waiting in Kueue cancels the job",
 			comment:    pendingStatus(kueueReasonPrefix + testQueuedReason),
 			held:       true,
@@ -363,8 +358,6 @@ func TestReconcile_KueuePendingReason(t *testing.T) {
 	}
 }
 
-// TestReconcile_StatusRestoredToUnheld covers every path that replaces a k8s-bridge status with the
-// Unheld status, which must then stay stable.
 func TestReconcile_StatusRestoredToUnheld(t *testing.T) {
 	unheld := unheldStatus("slurm-job-" + reconJobIDStr)
 	kueueQuota := pendingStatus(kueueReasonPrefix + testQuotaMessage)
@@ -377,7 +370,7 @@ func TestReconcile_StatusRestoredToUnheld(t *testing.T) {
 		job  *slurmclienttypes.V0044JobInfo
 		// jobSetSuspended is the state of the existing JobSet; nil means there is none.
 		jobSetSuspended *bool
-		// wantUnhold expects releaseHold (hold released, constraint added) instead of a comment update.
+		// wantUnhold expects releaseHold instead of a comment-only update.
 		wantUnhold bool
 		// wantComment is the comment written to Slurm; empty means no update.
 		wantComment string
@@ -387,7 +380,6 @@ func TestReconcile_StatusRestoredToUnheld(t *testing.T) {
 		{name: "user text is kept", job: newTranslatedReconJob(running, false, "my run, "+kueueQuota), jobSetSuspended: ptr.To(false), wantComment: "my run, " + unheld},
 		{name: "clean comment is not written", job: newTranslatedReconJob(running, false, unheld), jobSetSuspended: ptr.To(false)},
 		{
-			// The Pending status of a job held for BadConstraints is cleared by releaseHold.
 			name:            "job held for BadConstraints with an admitted JobSet",
 			job:             newTranslatedReconJob(pending, true, "my run, "+kueueQuota),
 			jobSetSuspended: ptr.To(false),
@@ -395,7 +387,6 @@ func TestReconcile_StatusRestoredToUnheld(t *testing.T) {
 			wantComment:     "my run, " + unheld,
 		},
 		{
-			// The JobSet Create returned an error after the JobSet was stored.
 			name:            "auto-held job with a JobSet creation retry status and an existing JobSet",
 			job:             newReconTestJob().withAutoHold().withComment("my run, " + retryComment).build(),
 			jobSetSuspended: ptr.To(true),
@@ -499,7 +490,7 @@ func TestReconcile_TransientJobSetCreateError(t *testing.T) {
 	}
 	marker := commentSeparator + AutoHoldMarker
 	longErr := errors.New(strings.Repeat("e", 2000))
-	// longUser is the longest user comment that fits next to the status of longErr and the marker.
+	// longUser is the longest user comment that still fits.
 	longUser := strings.Repeat("u", maxSlurmCommentLength-len(marker)-len(commentSeparator)-len(retryStatus(longErr.Error())))
 
 	tests := []struct {
@@ -507,7 +498,7 @@ func TestReconcile_TransientJobSetCreateError(t *testing.T) {
 		job       *slurmclienttypes.V0044JobInfo
 		createErr error
 		updateErr error
-		// wantComment is the comment written once over two failed creates; empty means no update.
+		// wantComment is written once over two failed creates; empty means no update.
 		wantComment string
 	}{
 		{

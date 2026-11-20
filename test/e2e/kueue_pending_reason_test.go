@@ -39,10 +39,10 @@ const (
 	pendingReasonLocalQueue = "test-local-queue"
 )
 
-// clusterQueueCPUResource is the JSON path of the cpu resource of the default flavor of a ClusterQueue.
+// clusterQueueCPUResource is the JSON path of the ClusterQueue's cpu resource.
 const clusterQueueCPUResource = "/spec/resourceGroups/0/flavors/0/resources/0"
 
-// clusterQueueCPUQuota returns the cpu nominalQuota of the default flavor of the ClusterQueue.
+// clusterQueueCPUQuota returns the ClusterQueue's cpu nominalQuota.
 func clusterQueueCPUQuota(clusterQueue string) string {
 	GinkgoHelper()
 	cmd := exec.Command("kubectl", "get", "clusterqueue", clusterQueue, "-o",
@@ -55,8 +55,7 @@ func clusterQueueCPUQuota(clusterQueue string) string {
 	return quota
 }
 
-// setClusterQueueCPUQuota sets the cpu nominalQuota of the default flavor of the ClusterQueue.
-// The test op makes the patch fail instead of changing another resource if cpu is not the first one.
+// setClusterQueueCPUQuota sets the ClusterQueue's cpu nominalQuota; the test op guards the path.
 func setClusterQueueCPUQuota(clusterQueue, quota string) {
 	GinkgoHelper()
 	patch := fmt.Sprintf(`[{"op":"test","path":"%s/name","value":"cpu"},{"op":"replace","path":"%s/nominalQuota","value":%q}]`,
@@ -94,8 +93,7 @@ var _ = Describe("Kubernetes pending reasons", func() {
 			WithWrap("sleep 300").
 			Submit()
 		jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
-		// Kueue reports the missing quota only on the Workloads at the head of the queue; the
-		// others are shown as queued in their LocalQueue.
+		// Only the head of the queue gets the quota message; others are "queued in".
 		secondJobID := utils.NewBatchJobBuilder(slurmNamespace).
 			WithPartition(defaultSlurmPartition).
 			WithNodes(1).

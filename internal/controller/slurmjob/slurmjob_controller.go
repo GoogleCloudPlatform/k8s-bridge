@@ -69,7 +69,7 @@ const (
 	// Prefixes of the k8s-bridge status in a Slurm job comment. A comment has at most one status.
 	UnheldCommentPrefix    = "Unheld by k8s-bridge:"
 	CancelledCommentPrefix = "Cancelled by k8s-bridge:"
-	// PendingCommentPrefix marks a job that waits for Kubernetes, with the reason after the prefix.
+	// PendingCommentPrefix is followed by why the job waits in Kubernetes.
 	PendingCommentPrefix = "Pending in Kubernetes:"
 
 	jobSetCreateRetryReason        = "JobSet creation failed, retrying: "
@@ -82,7 +82,7 @@ const (
 	truncatedCommentSuffix = "..."
 	// minStatusBudget is the minimum room, in bytes, kept for a long status next to the user's comment.
 	minStatusBudget = 512
-	// maxPendingReasonLength is the longest reason, in bytes, of a Pending in Kubernetes status.
+	// maxPendingReasonLength caps the reason of a Pending status, in bytes.
 	maxPendingReasonLength = 200
 	commentSeparator       = ", "
 )
@@ -93,8 +93,7 @@ var k8sBridgeStatusPrefixes = []string{UnheldCommentPrefix, CancelledCommentPref
 // SlurmJobReconciler reconciles Slurm jobs received from the poller.
 type SlurmJobReconciler struct {
 	client.Client
-	// APIReader reads from the API server without the cache. It is also used to read Kueue Workloads,
-	// which the manager does not watch.
+	// APIReader reads uncached, including Kueue Workloads.
 	APIReader             client.Reader
 	Scheme                *runtime.Scheme
 	Recorder              record.EventRecorder
@@ -104,7 +103,7 @@ type SlurmJobReconciler struct {
 	Translator            JobTranslator
 	slurmCallTimeout      time.Duration
 	reconciliationTimeout time.Duration
-	// workloadAPIUnavailableLogged is set once an unavailable Kueue Workload API has been logged.
+	// workloadAPIUnavailableLogged latches the "Workload API not available" log.
 	workloadAPIUnavailableLogged atomic.Bool
 }
 
@@ -493,8 +492,7 @@ const (
 	StatusJobSetFailed    K8sbridgeJobStatus = "JobSetFailed"
 	StatusJobSetMissing   K8sbridgeJobStatus = "JobSetMissing"
 	StatusJobSetDeleting  K8sbridgeJobStatus = "JobSetDeleting"
-	// StatusPendingInKubernetes means the Pending in Kubernetes status of a translated, unheld job
-	// must be refreshed (its JobSet is suspended) or cleared (its JobSet is no longer suspended).
+	// StatusPendingInKubernetes means the job's Pending status must be refreshed or cleared.
 	StatusPendingInKubernetes K8sbridgeJobStatus = "PendingInKubernetes"
 )
 
@@ -526,8 +524,7 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 		return StatusShouldUnhold
 	}
 
-	// The JobSet of an auto-held job already exists, for example because its Create returned an
-	// error after the JobSet was stored. Release the hold as after an AlreadyExists error.
+	// The JobSet was stored despite a Create error: release the hold as after AlreadyExists.
 	if isUntranslatedNewJob(jobInfo) && hasAutoHoldMarker(ptr.Deref(jobInfo.Comment, "")) {
 		return StatusShouldUnhold
 	}
@@ -539,11 +536,9 @@ func activeJobStatus(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv
 	return StatusNoAction
 }
 
-// needsPendingStatusUpdate reports whether a translated, unheld job with an existing JobSet needs its
-// Pending in Kubernetes status refreshed (PENDING job, suspended JobSet) or cleared (JobSet no
-// longer suspended, comment still has the status). Explicit user and admin holds are handled before
-// this check by activeJobStatus. Other holds are expected: after the release, slurmctld sets
-// Priority=0 (reported as held, reason BadConstraints) until a node has the job's k8s-id feature.
+// needsPendingStatusUpdate reports whether a translated job's Pending status must be refreshed
+// (suspended JobSet) or cleared. Holds are not checked: Slurm reports translated jobs as held
+// (BadConstraints) until a node has their k8s-id feature.
 func needsPendingStatusUpdate(jobInfo *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
 	if existingJS == nil || !isJobTranslated(jobInfo) {
 		return false
@@ -584,8 +579,7 @@ func isJobTranslated(jobInfo *slurmclienttypes.V0044JobInfo) bool {
 	if hasAutoHoldMarker(comment) {
 		return false
 	}
-	// A translated job shows the Unheld status, or the Pending in Kubernetes status that replaces
-	// it while the JobSet waits. A job still held for creation keeps the AutoHoldMarker.
+	// A Pending status replaces Unheld while the JobSet waits.
 	return strings.Contains(comment, UnheldCommentPrefix) || hasPendingStatus(comment)
 }
 
@@ -824,11 +818,10 @@ func (r *SlurmJobReconciler) reconcileNewJob(
 		if isPermanentAdmissionRejection(err) {
 			return ctrl.Result{}, r.handleJobSetAdmissionRejection(ctx, wm, slurmClient, jobInfo, jobID, partition, err)
 		}
-		// The status is only recorded next to the AutoHoldMarker, which is kept: without the marker,
-		// a Pending status would make the job look translated (see isJobTranslated).
+		// Without the marker, a Pending status would make the job look translated.
 		if hasAutoHoldMarker(ptr.Deref(jobInfo.Comment, "")) {
 			reason := jobSetCreateRetryReason + singleLine(apiStatusMessage(err))
-			// The Create may have used up the reconcile deadline; setJobStatus has its own timeout.
+			// The Create may have used up the reconcile deadline.
 			if updateErr := r.setJobStatus(context.WithoutCancel(ctx), slurmClient, jobInfo, pendingStatus(reason), true); updateErr != nil {
 				logger.Error(updateErr, "Failed to record the JobSet creation failure in the Slurm job comment")
 			}
@@ -1040,14 +1033,13 @@ func unheldStatus(jobSetName string) string {
 	return fmt.Sprintf("%s Kubernetes resource %s created successfully", UnheldCommentPrefix, jobSetName)
 }
 
-// pendingStatus returns the k8s-bridge status for a job that waits in Kubernetes for reason. The
-// reason is cut to maxPendingReasonLength, so the user's comment next to it is almost never cut.
+// pendingStatus returns the Pending status for reason, cut to maxPendingReasonLength so the user's
+// comment is almost never cut.
 func pendingStatus(reason string) string {
 	return PendingCommentPrefix + " " + truncateComment(reason, maxPendingReasonLength)
 }
 
-// setJobStatus sets the k8s-bridge status in the Slurm job comment, skipping the update if the
-// comment would not change. See buildJobComment for keepAutoHoldMarker.
+// setJobStatus sets the k8s-bridge status in the job comment (see buildJobComment).
 func (r *SlurmJobReconciler) setJobStatus(
 	ctx context.Context,
 	slurmClient slurmclient.Client,

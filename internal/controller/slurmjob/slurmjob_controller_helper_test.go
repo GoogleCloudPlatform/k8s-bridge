@@ -545,8 +545,7 @@ func (e *reconcileTestEnv) firstUpdatedComment() string {
 	return *reqMsg.Comment
 }
 
-// verifyCommentOnlyUpdate checks that the only Slurm job update set the comment to want, without
-// changing the hold or the constraints, and that no job was cancelled.
+// verifyCommentOnlyUpdate checks for exactly one update, setting only the comment to want.
 func (e *reconcileTestEnv) verifyCommentOnlyUpdate(want string) {
 	e.t.Helper()
 	updates := e.mockSlurm.GetUpdatedJobs()

@@ -49,14 +49,11 @@ const (
 	admissionCheckNamesSeparator = ", "
 )
 
-// workloadListGVK is the kind used to list Kueue Workloads. Workloads are read as unstructured
-// objects, so that k8s-bridge does not depend on the Kueue Go module. v1beta2 is the Workload
-// storage version; v1beta1 is deprecated.
+// workloadListGVK lists Workloads as unstructured objects, to avoid a Kueue Go dependency.
+// v1beta2 is the storage version.
 var workloadListGVK = schema.GroupVersionKind{Group: kueueGroup, Version: "v1beta2", Kind: "WorkloadList"}
 
-// syncPendingStatus keeps the Pending in Kubernetes status of a translated job up to date. It reads
-// the JobSet's Workload, if the JobSet is suspended, and writes desiredPendingComment if it differs
-// from the current comment.
+// syncPendingStatus writes desiredPendingComment if it differs from the job's comment.
 func (r *SlurmJobReconciler) syncPendingStatus(
 	ctx context.Context,
 	slurmClient slurmclient.Client,
@@ -68,7 +65,7 @@ func (r *SlurmJobReconciler) syncPendingStatus(
 		var err error
 		wl, err = r.workloadForJobSet(ctx, js)
 		if err != nil {
-			// The reason is informational only and is read again on the next poll.
+			// Informational only; retried on the next poll.
 			logWorkloadReadError(ctx, &r.workloadAPIUnavailableLogged, err)
 			return nil
 		}
@@ -93,11 +90,10 @@ func (r *SlurmJobReconciler) workloadForJobSet(ctx context.Context, js *jobsetv1
 	return workloads[js.UID], nil
 }
 
-// workloadsByJobUID maps the UID of a job (here a JobSet) to its Kueue Workload.
+// workloadsByJobUID maps a JobSet UID to its Kueue Workload.
 type workloadsByJobUID map[types.UID]*unstructured.Unstructured
 
-// listWorkloads lists the Kueue Workloads in namespace with an uncached reader, indexed by the
-// kueue.x-k8s.io/job-uid label. Workloads being deleted are skipped.
+// listWorkloads lists Workloads in namespace, indexed by job UID, skipping deleting ones.
 func listWorkloads(ctx context.Context, reader client.Reader, namespace string, opts ...client.ListOption) (workloadsByJobUID, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(workloadListGVK)
@@ -111,7 +107,7 @@ func listWorkloads(ctx context.Context, reader client.Reader, namespace string, 
 		if uid == "" || wl.GetDeletionTimestamp() != nil {
 			continue
 		}
-		// A job normally has one Workload; if it briefly has more, the newest one is current.
+		// Keep the newest if a job briefly has more than one Workload.
 		if prev, seen := workloads[uid]; !seen || wl.GetCreationTimestamp().After(prev.GetCreationTimestamp().Time) {
 			workloads[uid] = wl
 		}
@@ -119,9 +115,8 @@ func listWorkloads(ctx context.Context, reader client.Reader, namespace string, 
 	return workloads, nil
 }
 
-// logWorkloadReadError logs a failure to read Workloads. An unavailable Workload API is logged at
-// Info once, until a read succeeds and resets latch; other errors usually affect all waiting jobs
-// at once and are only logged at V(1).
+// logWorkloadReadError logs an unavailable Workload API at Info once (until a read succeeds and
+// resets latch), and other errors at V(1).
 func logWorkloadReadError(ctx context.Context, latch *atomic.Bool, err error) {
 	logger := log.FromContext(ctx)
 	switch {
@@ -134,15 +129,8 @@ func logWorkloadReadError(ctx context.Context, latch *atomic.Bool, err error) {
 	}
 }
 
-// desiredPendingStatus returns the k8s-bridge status that a translated job with JobSet js should
-// show, given the JobSet's Workload wl (nil if there is none or it could not be read):
-//   - a JobSet that is no longer suspended restores the Unheld status, if the comment still has the
-//     Pending in Kubernetes status;
-//   - a suspended JobSet shows the reason Kueue does not admit wl, see kueuePendingReason.
-//
-// ok is false if the status must not change: the comment has no Pending status to clear, there is
-// no Workload, or Kueue gives no reason (for example the Workload is admitted, or has
-// QuotaReserved=True without a message).
+// desiredPendingStatus returns the status a translated job should show given its JobSet and
+// Workload (wl may be nil). ok is false if the status must not change.
 func desiredPendingStatus(job *slurmclienttypes.V0044JobInfo, js *jobsetv1alpha2.JobSet, wl *unstructured.Unstructured) (status string, ok bool) {
 	if js == nil || job == nil {
 		return "", false
@@ -163,9 +151,8 @@ func desiredPendingStatus(job *slurmclienttypes.V0044JobInfo, js *jobsetv1alpha2
 	return pendingStatus(kueueReasonPrefix + reason), true
 }
 
-// desiredPendingComment returns the comment that job should have according to desiredPendingStatus.
-// It is the single place that computes it for the poller and the reconciler. Translated jobs have no
-// AutoHoldMarker, so none is kept.
+// desiredPendingComment returns the job comment with desiredPendingStatus, shared by the poller
+// and the reconciler.
 func desiredPendingComment(job *slurmclienttypes.V0044JobInfo, js *jobsetv1alpha2.JobSet, wl *unstructured.Unstructured) (string, bool) {
 	status, ok := desiredPendingStatus(job, js, wl)
 	if !ok {
@@ -175,29 +162,15 @@ func desiredPendingComment(job *slurmclienttypes.V0044JobInfo, js *jobsetv1alpha
 	return comment, true
 }
 
-// kueuePendingReason returns why Kueue does not admit wl, or "" if it cannot tell:
-//  1. a deactivated Workload (spec.active=false, for example after a rejected admission check)
-//     shows its Evicted=True message, else its QuotaReserved=False message. Its admission checks
-//     are ignored, since Kueue resets them to Pending with a message that hides the reason;
-//  2. a Workload with reserved quota (QuotaReserved=True) shows the messages of its pending admission
-//     checks (for example a provisioning request), else the names of the pending checks without a
-//     message. Admission checks are only used once quota is reserved: before that Kueue shows them
-//     as Pending on every Workload, and resets them after an eviction;
-//  3. the message of the most recent of the Evicted=True (for example a preemption) and
-//     QuotaReserved=False (for example missing quota or topology) conditions. On a tie
-//     QuotaReserved is used, since it describes what currently blocks the admission;
-//  4. a Workload that waits for quota without a message (Kueue only sets QuotaReserved=False on
-//     the Workloads at the head of the queue) is reported as queued in its LocalQueue, which is
-//     queueName or else spec.queueName.
-//
-// An admitted Workload, whose JobSet is about to be resumed, and a Workload with reserved quota but
-// no check to report have no reason ("" is returned), so the job keeps its previous status.
+// kueuePendingReason returns why Kueue does not admit wl, or "" if there is no reason to show
+// (for example the Workload is admitted). queueName is the JobSet's LocalQueue, if known.
 func kueuePendingReason(wl *unstructured.Unstructured, queueName string) string {
 	if hasWorkloadConditionStatus(wl, workloadConditionAdmitted, "True") {
 		return ""
 	}
 	evicted, evictedFound := findWorkloadCondition(wl, workloadConditionEvicted, "True")
 	quota, quotaFound := findWorkloadCondition(wl, workloadConditionQuotaReserved, "False")
+	// Kueue resets admission checks to Pending on deactivation, hiding the reason.
 	if active, found, _ := unstructured.NestedBool(wl.Object, "spec", workloadSpecActive); found && !active {
 		switch {
 		case evictedFound:
@@ -207,6 +180,7 @@ func kueuePendingReason(wl *unstructured.Unstructured, queueName string) string 
 		}
 		return ""
 	}
+	// Admission checks only matter once quota is reserved.
 	reserved := hasWorkloadConditionStatus(wl, workloadConditionQuotaReserved, "True")
 	if reserved {
 		if msg := pendingAdmissionChecksMessage(wl); msg != "" {
@@ -218,6 +192,7 @@ func kueuePendingReason(wl *unstructured.Unstructured, queueName string) string 
 	}
 	switch {
 	case evictedFound && quotaFound:
+		// On a tie, QuotaReserved describes what blocks admission now.
 		if evicted.lastTransition.After(quota.lastTransition) {
 			return evicted.message
 		}
@@ -230,6 +205,7 @@ func kueuePendingReason(wl *unstructured.Unstructured, queueName string) string 
 	if reserved {
 		return ""
 	}
+	// Kueue sets QuotaReserved=False only on Workloads at the head of the queue.
 	if queueName == "" {
 		queueName, _, _ = unstructured.NestedString(wl.Object, "spec", "queueName")
 	}
@@ -239,18 +215,13 @@ func kueuePendingReason(wl *unstructured.Unstructured, queueName string) string 
 	return "queued in " + queueName
 }
 
-// isWorkloadAPIUnavailable reports whether listing Workloads failed because k8s-bridge cannot use the
-// Workload API at all, as opposed to a transient failure.
+// isWorkloadAPIUnavailable reports whether the Workload API cannot be used at all: CRD not
+// installed, resource not served (a LIST returns NotFound only then), or no RBAC access.
 func isWorkloadAPIUnavailable(err error) bool {
-	// NoMatch: the Kueue CRDs are not installed. NotFound: a LIST never returns NotFound for an
-	// existing resource (an empty result is a success), so it means the API server does not serve
-	// the resource, for example when the CRD was removed after discovery. Forbidden: the
-	// ClusterRole does not grant access to Workloads, for example with an older chart.
 	return meta.IsNoMatchError(err) || apierrors.IsNotFound(err) || apierrors.IsForbidden(err)
 }
 
-// pendingAdmissionChecksMessage returns the messages of the pending admission checks, as
-// "<check>: <message>".
+// pendingAdmissionChecksMessage returns the pending admission checks as "<check>: <message>".
 func pendingAdmissionChecksMessage(wl *unstructured.Unstructured) string {
 	checks, _, _ := unstructured.NestedSlice(wl.Object, "status", "admissionChecks")
 	var msgs []string
@@ -313,8 +284,7 @@ type pendingCondition struct {
 	lastTransition time.Time
 }
 
-// findWorkloadCondition returns the condition of condType with status, if it has a message. A
-// missing or invalid lastTransitionTime is read as the zero time.
+// findWorkloadCondition returns the condition of condType with status, if it has a message.
 func findWorkloadCondition(wl *unstructured.Unstructured, condType, status string) (pendingCondition, bool) {
 	conditions, _, _ := unstructured.NestedSlice(wl.Object, "status", "conditions")
 	for _, item := range conditions {
@@ -339,7 +309,7 @@ func findWorkloadCondition(wl *unstructured.Unstructured, condType, status strin
 	return pendingCondition{}, false
 }
 
-// singleLine puts a message on a single line, so it reads well in scontrol output.
+// singleLine puts a message on one line for scontrol output.
 func singleLine(msg string) string {
 	return strings.Join(strings.Fields(msg), " ")
 }

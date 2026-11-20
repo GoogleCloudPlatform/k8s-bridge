@@ -1453,7 +1453,7 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 	translatedFeature := fmt.Sprintf("%s%d", UniqueFeaturePrefix, jobID)
 	unheld := unheldStatus(jobSetName)
 	pending := pendingStatus(kueueReasonPrefix + testQuotaMessage)
-	// quotaWorkloads maps the test JobSets, which have no UID, to a Workload waiting for quota.
+	// The test JobSets have no UID.
 	quotaWorkloads := workloadsByJobUID{"": newTestWorkload("wl", "",
 		workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testQuotaMessage)))}
 	translatedPendingJob := func(hold bool, stateReason, comment string) *slurmclienttypes.V0044JobInfo {
@@ -1730,7 +1730,7 @@ func (e *pollerTestEnv) emittedJobIDs(t *testing.T) []string {
 	return ids
 }
 
-// reconcile runs the SlurmJobReconciler for the job, against the same Kubernetes and Slurm state.
+// reconcile runs the SlurmJobReconciler for the job against the env's state.
 func (e *pollerTestEnv) reconcile(t *testing.T, jobID string) error {
 	t.Helper()
 	r := &SlurmJobReconciler{
@@ -1747,7 +1747,6 @@ func (e *pollerTestEnv) reconcile(t *testing.T, jobID string) error {
 }
 
 func TestPoll_PendingReasons(t *testing.T) {
-	// A translated PENDING job is reported as held for BadConstraints until it has a node.
 	translatedJob := func(id int32, state slurmapi.V0044JobInfoJobState, comment string) slurmclienttypes.V0044JobInfo {
 		b := newEmptyTestJob().withJobID(id).withPartition(testPartitionName).withJobState(state).
 			withFeatures(fmt.Sprintf("%s%d", UniqueFeaturePrefix, id)).withComment(comment)
@@ -1774,13 +1773,13 @@ func TestPoll_PendingReasons(t *testing.T) {
 	kueueQuota := pendingStatus(kueueReasonPrefix + testQuotaMessage)
 
 	jobs := []slurmclienttypes.V0044JobInfo{
-		// Waits for quota and still shows the Unheld status.
+		// Waits for quota, shows Unheld.
 		translatedJob(401, slurmapi.V0044JobInfoJobStatePENDING, unheldStatus("slurm-job-401")),
-		// Waits in the queue without a Kueue message.
+		// Queued without a Kueue message.
 		translatedJob(402, slurmapi.V0044JobInfoJobStatePENDING, unheldStatus("slurm-job-402")),
 		// Already shows the current reason.
 		translatedJob(403, slurmapi.V0044JobInfoJobStatePENDING, kueueQuota),
-		// Admitted, but still shows a Pending status.
+		// Admitted, still shows Pending.
 		translatedJob(404, slurmapi.V0044JobInfoJobStateRUNNING, kueueQuota),
 		// New auto-held job without a JobSet.
 		*newEmptyTestJob().withJobID(405).withPartition(testPartitionName).withAutoHold().build(),
@@ -1802,8 +1801,7 @@ func TestPoll_PendingReasons(t *testing.T) {
 		if !slices.Equal(env.workloadSelectors, wantSelectors) {
 			t.Errorf("Workload LIST selectors = %q, want %q", env.workloadSelectors, wantSelectors)
 		}
-		// The new job 405 cannot be translated here (no Slurm Controller), so only the translated
-		// jobs are reconciled.
+		// 405 cannot be translated here (no Slurm Controller).
 		for _, id := range []string{"401", "402", "404"} {
 			if err := env.reconcile(t, id); err != nil {
 				t.Fatalf("Reconcile(%s) returned unexpected error: %v", id, err)

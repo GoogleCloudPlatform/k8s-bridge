@@ -45,8 +45,7 @@ import (
 )
 
 const (
-	// maxWorkloadUIDsPerList bounds the JobSet UIDs in the label selector of one Workload LIST, so that
-	// the request URL stays short.
+	// maxWorkloadUIDsPerList keeps the label selector of a Workload LIST short.
 	maxWorkloadUIDsPerList = 100
 	// defaultOrphanGracePeriod defines the default duration an absent Slurm workload's
 	// corresponding JobSet must remain missing before being flagged as orphaned and torn down.
@@ -61,8 +60,7 @@ type SlurmPoller struct {
 	ClientMap       *clientmap.ClientMap
 	AdmissionEvents chan<- slurmtypes.SlurmJobAdmissionEvent
 	TeardownEvents  chan<- slurmtypes.SlurmJobTeardownEvent
-	// APIReader reads Kueue Workloads from the API server, which the manager does not cache. If it
-	// is nil, the Kueue pending reasons are not reported.
+	// APIReader reads Kueue Workloads uncached; nil disables Kueue reasons.
 	APIReader         client.Reader
 	PollInterval      time.Duration
 	OrphanGracePeriod time.Duration
@@ -72,7 +70,7 @@ type SlurmPoller struct {
 	mu               sync.Mutex
 	// nowFn is a clock abstraction hook used exclusively in unit tests to simulate time progression.
 	nowFn func() time.Time
-	// workloadAPIUnavailableLogged is set once an unavailable Kueue Workload API has been logged.
+	// workloadAPIUnavailableLogged latches the "Workload API not available" log.
 	workloadAPIUnavailableLogged atomic.Bool
 }
 
@@ -450,9 +448,8 @@ func getTeardownEvent(
 	}
 }
 
-// shouldEmitAdmissionEvent reports whether the reconciler has work to do for job. workloads holds
-// the Workloads of the JobSets waiting in Kueue, indexed by JobSet UID; it is nil if they could not
-// be read, which leaves the Pending in Kubernetes status of waiting jobs as it is until the next poll.
+// shouldEmitAdmissionEvent reports whether the reconciler has work to do for job. workloads is nil
+// if the Workloads could not be read.
 func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet, workloads workloadsByJobUID) bool {
 	if !job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING) {
 		return needsPendingStatusCleanup(job, existingJS)
@@ -471,17 +468,15 @@ func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jo
 	}
 }
 
-// needsPendingStatusCleanup reports whether a RUNNING job still shows a Pending in Kubernetes status.
-// Its JobSet was admitted but the status may not have been cleared, for example because the
-// unsuspend event was missed or the comment update failed, so the poller emits one event to restore
-// the Unheld status.
+// needsPendingStatusCleanup reports whether a RUNNING job still shows a Pending status, for example
+// after a missed unsuspend event or a failed comment update.
 func needsPendingStatusCleanup(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet) bool {
 	return job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateRUNNING) &&
 		activeJobStatus(job, existingJS) == StatusPendingInKubernetes
 }
 
-// readWorkloads lists the Kueue Workloads of the given JobSet UIDs in namespace, with one LIST per
-// maxWorkloadUIDsPerList UIDs, and none if there are no UIDs. It returns nil if any LIST fails.
+// readWorkloads lists the Workloads of jobSetUIDs in chunks of maxWorkloadUIDsPerList. It returns
+// nil if any LIST fails.
 func (p *SlurmPoller) readWorkloads(ctx context.Context, namespace string, jobSetUIDs []string) workloadsByJobUID {
 	if p.APIReader == nil || len(jobSetUIDs) == 0 {
 		return nil
@@ -506,8 +501,7 @@ func (p *SlurmPoller) readWorkloads(ctx context.Context, namespace string, jobSe
 	return workloads
 }
 
-// isPolledJob reports whether the poller looks at job: a PENDING or RUNNING job that requests one
-// of the observed partitions.
+// isPolledJob reports whether job is PENDING or RUNNING on an observed partition.
 func isPolledJob(job *slurmclienttypes.V0044JobInfo, observedPartitions map[string]bool) bool {
 	states := job.GetStateAsSet()
 	if !states.Has(slurmapi.V0044JobInfoJobStatePENDING) && !states.Has(slurmapi.V0044JobInfoJobStateRUNNING) {
@@ -521,8 +515,7 @@ func isPolledJob(job *slurmclienttypes.V0044JobInfo, observedPartitions map[stri
 	return false
 }
 
-// waitingJobSetUIDs returns the UIDs of the suspended JobSets of polled jobs whose Pending in
-// Kubernetes status depends on their Kueue Workload.
+// waitingJobSetUIDs returns the UIDs of suspended JobSets whose job status needs their Workload.
 func waitingJobSetUIDs(
 	jobList *slurmclienttypes.V0044JobInfoList,
 	observedPartitions map[string]bool,
@@ -542,8 +535,7 @@ func waitingJobSetUIDs(
 	return uids
 }
 
-// processPendingJobsForWM emits admission events for the PENDING and RUNNING jobs of wm's
-// partitions that need a reconcile.
+// processPendingJobsForWM emits admission events for wm's jobs that need a reconcile.
 func (p *SlurmPoller) processPendingJobsForWM(
 	ctx context.Context,
 	jobList *slurmclienttypes.V0044JobInfoList,
@@ -564,7 +556,6 @@ func (p *SlurmPoller) processPendingJobsForWM(
 		}
 	}
 
-	// The Workloads of the JobSets waiting in Kueue are read with at most one LIST per poll.
 	workloads := p.readWorkloads(ctx, wm.Namespace, waitingJobSetUIDs(jobList, observedPartitions, jobSetsByName))
 
 	for i := range jobList.Items {
