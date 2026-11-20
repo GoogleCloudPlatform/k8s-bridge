@@ -1543,6 +1543,16 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
 			want:       true,
 		},
+		{
+			name:        "Emits StatusJobSetMissing for unheld job without JobSet even when WorkloadMixing is unavailable",
+			wmAvailable: false,
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
 	}
 
 	for _, tc := range tests {
