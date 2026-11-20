@@ -20,16 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,14 +41,12 @@ import (
 )
 
 const (
-	// maxWorkloadUIDsPerList keeps the label selector of a Workload LIST short.
-	maxWorkloadUIDsPerList = 100
 	// defaultOrphanGracePeriod defines the default duration an absent Slurm workload's
 	// corresponding JobSet must remain missing before being flagged as orphaned and torn down.
 	defaultOrphanGracePeriod = 1 * time.Minute
 )
 
-// SlurmPoller periodically queries the Slurm REST API for pending and running jobs
+// SlurmPoller periodically queries the Slurm REST API for pending jobs
 // and audits active workloads for termination and orphan cleanup.
 // It implements the manager.Runnable interface.
 type SlurmPoller struct {
@@ -194,7 +188,7 @@ func (p *SlurmPoller) Poll(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				logger.Error(err, "Failed to process Slurm jobs for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
+				logger.Error(err, "Failed to process pending jobs for WorkloadMixing", "slurmController", controllerKey, "workloadMixing", client.ObjectKeyFromObject(wm))
 				continue
 			}
 
@@ -448,14 +442,9 @@ func getTeardownEvent(
 	}
 }
 
-// shouldEmitAdmissionEvent reports whether the reconciler has work to do for job. workloads is nil
-// if the Workloads could not be read.
+// shouldEmitAdmissionEvent reports whether the reconciler has work to do for a PENDING job.
+// workloads is nil if the Workloads could not be read.
 func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jobsetv1alpha2.JobSet, workloads workloadsByJobUID) bool {
-	if !job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING) {
-		// A RUNNING job only needs an event to clear a stale Pending status.
-		return job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStateRUNNING) &&
-			activeJobStatus(job, existingJS) == StatusPendingInKubernetes
-	}
 	switch status := activeJobStatus(job, existingJS); status {
 	case StatusNewJob:
 		if strings.Contains(ptr.Deref(job.Partition, ""), ",") {
@@ -470,67 +459,22 @@ func shouldEmitAdmissionEvent(job *slurmclienttypes.V0044JobInfo, existingJS *jo
 	}
 }
 
-// readWorkloads lists the Workloads of jobSetUIDs in chunks of maxWorkloadUIDsPerList. It returns
-// nil if any LIST fails.
-func (p *SlurmPoller) readWorkloads(ctx context.Context, namespace string, jobSetUIDs []string) workloadsByJobUID {
-	if p.APIReader == nil || len(jobSetUIDs) == 0 {
+// readWorkloads lists the Workloads in namespace with one LIST. It returns nil if they could not
+// be read.
+func (p *SlurmPoller) readWorkloads(ctx context.Context, namespace string) workloadsByJobUID {
+	if p.APIReader == nil {
 		return nil
 	}
-	logger := log.FromContext(ctx).WithName("slurm-poller").WithValues("namespace", namespace)
-	slices.Sort(jobSetUIDs)
-	workloads := workloadsByJobUID{}
-	for chunk := range slices.Chunk(jobSetUIDs, maxWorkloadUIDsPerList) {
-		req, err := labels.NewRequirement(kueueJobUIDLabel, selection.In, chunk)
-		if err != nil {
-			logger.Error(err, "Failed to build the Kueue Workload label selector")
-			return nil
-		}
-		chunkWorkloads, err := listWorkloads(ctx, p.APIReader, namespace, client.MatchingLabelsSelector{Selector: labels.NewSelector().Add(*req)})
-		if err != nil {
-			logWorkloadReadError(log.IntoContext(ctx, logger), &p.workloadAPIUnavailableLogged, err)
-			return nil
-		}
-		maps.Copy(workloads, chunkWorkloads)
+	workloads, err := listWorkloads(ctx, p.APIReader, namespace)
+	if err != nil {
+		logger := log.FromContext(ctx).WithName("slurm-poller").WithValues("namespace", namespace)
+		logWorkloadReadError(log.IntoContext(ctx, logger), &p.workloadAPIUnavailableLogged, err)
+		return nil
 	}
 	p.workloadAPIUnavailableLogged.Store(false)
 	return workloads
 }
 
-// isPolledJob reports whether job is PENDING or RUNNING on an observed partition.
-func isPolledJob(job *slurmclienttypes.V0044JobInfo, observedPartitions map[string]bool) bool {
-	states := job.GetStateAsSet()
-	if !states.Has(slurmapi.V0044JobInfoJobStatePENDING) && !states.Has(slurmapi.V0044JobInfoJobStateRUNNING) {
-		return false
-	}
-	for part := range strings.SplitSeq(ptr.Deref(job.Partition, ""), ",") {
-		if observedPartitions[strings.TrimSpace(part)] {
-			return true
-		}
-	}
-	return false
-}
-
-// waitingJobSetUIDs returns the UIDs of suspended JobSets whose job status needs their Workload.
-func waitingJobSetUIDs(
-	jobList *slurmclienttypes.V0044JobInfoList,
-	observedPartitions map[string]bool,
-	jobSetsByName map[string]*jobsetv1alpha2.JobSet,
-) []string {
-	var uids []string
-	for i := range jobList.Items {
-		job := &jobList.Items[i]
-		if !isPolledJob(job, observedPartitions) {
-			continue
-		}
-		js := jobSetsByName[jobSetNameForJobID(strconv.Itoa(int(ptr.Deref(job.JobId, 0))))]
-		if isJobSetSuspended(js) && js.UID != "" && activeJobStatus(job, js) == StatusPendingInKubernetes {
-			uids = append(uids, string(js.UID))
-		}
-	}
-	return uids
-}
-
-// processPendingJobsForWM emits admission events for wm's jobs that need a reconcile.
 func (p *SlurmPoller) processPendingJobsForWM(
 	ctx context.Context,
 	jobList *slurmclienttypes.V0044JobInfoList,
@@ -545,50 +489,66 @@ func (p *SlurmPoller) processPendingJobsForWM(
 	}
 
 	jobSetsByName := make(map[string]*jobsetv1alpha2.JobSet, len(jobSets))
+	waitingInKueue := false
 	for i := range jobSets {
 		if isJobSetOwnedByWM(&jobSets[i], wm) {
 			jobSetsByName[jobSets[i].Name] = &jobSets[i]
+			waitingInKueue = waitingInKueue || isJobSetSuspended(&jobSets[i])
 		}
 	}
-
-	workloads := p.readWorkloads(ctx, wm.Namespace, waitingJobSetUIDs(jobList, observedPartitions, jobSetsByName))
+	var workloads workloadsByJobUID
+	if waitingInKueue {
+		workloads = p.readWorkloads(ctx, wm.Namespace)
+	}
 
 	for i := range jobList.Items {
 		job := &jobList.Items[i]
-		if !isPolledJob(job, observedPartitions) {
-			continue
-		}
-		jobID := ptr.Deref(job.JobId, 0)
-		jobIDStr := strconv.Itoa(int(jobID))
-		jobSetName := jobSetNameForJobID(jobIDStr)
-		existingJS := jobSetsByName[jobSetName]
-		if !shouldEmitAdmissionEvent(job, existingJS, workloads) {
-			continue
-		}
+		if job.GetStateAsSet().Has(slurmapi.V0044JobInfoJobStatePENDING) {
+			jobPartition := ptr.Deref(job.Partition, "")
+			partitions := strings.Split(jobPartition, ",")
+			matched := false
+			for _, part := range partitions {
+				part = strings.TrimSpace(part)
+				if observedPartitions[part] {
+					matched = true
+					break
+				}
+			}
 
-		rawJSON, err := json.Marshal(*job)
-		if err != nil {
-			logger.Error(err, "Failed to marshal job info", "jobID", jobIDStr, "workloadMixing", client.ObjectKeyFromObject(wm))
-			continue
-		}
-		event := slurmtypes.SlurmJobAdmissionEvent{
-			JobID:          jobIDStr,
-			RawJobSpecJSON: string(rawJSON),
-			WorkloadMixing: types.NamespacedName{
-				Namespace: wm.Namespace,
-				Name:      wm.Name,
-			},
-		}
+			if matched {
+				jobID := ptr.Deref(job.JobId, 0)
+				jobIDStr := strconv.Itoa(int(jobID))
+				jobSetName := jobSetNameForJobID(jobIDStr)
+				existingJS := jobSetsByName[jobSetName]
+				if !shouldEmitAdmissionEvent(job, existingJS, workloads) {
+					continue
+				}
 
-		select {
-		case p.AdmissionEvents <- event:
-			metrics.SetEventsQueueDepth(len(p.AdmissionEvents))
-			logger.V(1).Info("Sent SlurmJobAdmissionEvent", "jobID", event.JobID, "workloadMixing", event.WorkloadMixing)
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			metrics.RecordDroppedEvent(wm.Name)
-			logger.Info("Admission event channel is full, dropping event", "jobID", event.JobID, "workloadMixing", event.WorkloadMixing)
+				rawJSON, err := json.Marshal(*job)
+				if err != nil {
+					logger.Error(err, "Failed to marshal job info", "jobID", jobIDStr, "workloadMixing", client.ObjectKeyFromObject(wm))
+					continue
+				}
+				event := slurmtypes.SlurmJobAdmissionEvent{
+					JobID:          jobIDStr,
+					RawJobSpecJSON: string(rawJSON),
+					WorkloadMixing: types.NamespacedName{
+						Namespace: wm.Namespace,
+						Name:      wm.Name,
+					},
+				}
+
+				select {
+				case p.AdmissionEvents <- event:
+					metrics.SetEventsQueueDepth(len(p.AdmissionEvents))
+					logger.V(1).Info("Sent SlurmJobAdmissionEvent", "jobID", event.JobID, "workloadMixing", event.WorkloadMixing)
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+					metrics.RecordDroppedEvent(wm.Name)
+					logger.Info("Admission event channel is full, dropping event", "jobID", event.JobID, "workloadMixing", event.WorkloadMixing)
+				}
+			}
 		}
 	}
 	return nil

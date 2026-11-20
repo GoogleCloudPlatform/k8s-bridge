@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -38,7 +37,6 @@ import (
 )
 
 const (
-	workloadSpecActive             = "active"
 	workloadConditionAdmitted      = "Admitted"
 	workloadConditionEvicted       = "Evicted"
 	workloadConditionQuotaReserved = "QuotaReserved"
@@ -165,45 +163,25 @@ func desiredPendingComment(job *slurmclienttypes.V0044JobInfo, js *jobsetv1alpha
 // kueuePendingReason returns why Kueue does not admit wl, or "" if there is no reason to show
 // (for example the Workload is admitted). queueName is the JobSet's LocalQueue, if known.
 func kueuePendingReason(wl *unstructured.Unstructured, queueName string) string {
-	if hasWorkloadConditionStatus(wl, workloadConditionAdmitted, "True") {
-		return ""
-	}
-	evicted, evictedFound := findWorkloadCondition(wl, workloadConditionEvicted, "True")
-	quota, quotaFound := findWorkloadCondition(wl, workloadConditionQuotaReserved, "False")
-	// Kueue resets admission checks to Pending on deactivation, hiding the reason.
-	if active, found, _ := unstructured.NestedBool(wl.Object, "spec", workloadSpecActive); found && !active {
-		switch {
-		case evictedFound:
-			return evicted.message
-		case quotaFound:
-			return quota.message
-		}
+	if _, admitted := workloadConditionMessage(wl, workloadConditionAdmitted, "True"); admitted {
 		return ""
 	}
 	// Admission checks only matter once quota is reserved.
-	reserved := hasWorkloadConditionStatus(wl, workloadConditionQuotaReserved, "True")
-	if reserved {
+	if _, reserved := workloadConditionMessage(wl, workloadConditionQuotaReserved, "True"); reserved {
 		if msg := pendingAdmissionChecksMessage(wl); msg != "" {
 			return msg
 		}
 		if names := pendingAdmissionCheckNames(wl); len(names) > 0 {
 			return "waiting for " + strings.Join(names, admissionCheckNamesSeparator)
 		}
-	}
-	switch {
-	case evictedFound && quotaFound:
-		// On a tie, QuotaReserved describes what blocks admission now.
-		if evicted.lastTransition.After(quota.lastTransition) {
-			return evicted.message
-		}
-		return quota.message
-	case evictedFound:
-		return evicted.message
-	case quotaFound:
-		return quota.message
-	}
-	if reserved {
 		return ""
+	}
+	// Kueue copies the eviction message into QuotaReserved=False.
+	if msg, _ := workloadConditionMessage(wl, workloadConditionQuotaReserved, "False"); msg != "" {
+		return msg
+	}
+	if msg, _ := workloadConditionMessage(wl, workloadConditionEvicted, "True"); msg != "" {
+		return msg
 	}
 	// Kueue sets QuotaReserved=False only on Workloads at the head of the queue.
 	if queueName == "" {
@@ -261,8 +239,9 @@ func pendingAdmissionCheckNames(wl *unstructured.Unstructured) []string {
 	return names
 }
 
-// hasWorkloadConditionStatus reports whether wl has a condition of condType with status.
-func hasWorkloadConditionStatus(wl *unstructured.Unstructured, condType, status string) bool {
+// workloadConditionMessage returns the one-line message of wl's condType condition with status, and
+// whether that condition exists.
+func workloadConditionMessage(wl *unstructured.Unstructured, condType, status string) (string, bool) {
 	conditions, _, _ := unstructured.NestedSlice(wl.Object, "status", "conditions")
 	for _, item := range conditions {
 		cond, ok := item.(map[string]any)
@@ -272,41 +251,11 @@ func hasWorkloadConditionStatus(wl *unstructured.Unstructured, condType, status 
 		gotType, _, _ := unstructured.NestedString(cond, "type")
 		gotStatus, _, _ := unstructured.NestedString(cond, "status")
 		if gotType == condType && gotStatus == status {
-			return true
+			msg, _, _ := unstructured.NestedString(cond, "message")
+			return singleLine(msg), true
 		}
 	}
-	return false
-}
-
-// pendingCondition is the part of a Workload condition used to pick the pending reason.
-type pendingCondition struct {
-	message        string
-	lastTransition time.Time
-}
-
-// findWorkloadCondition returns the condition of condType with status, if it has a message.
-func findWorkloadCondition(wl *unstructured.Unstructured, condType, status string) (pendingCondition, bool) {
-	conditions, _, _ := unstructured.NestedSlice(wl.Object, "status", "conditions")
-	for _, item := range conditions {
-		cond, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		gotType, _, _ := unstructured.NestedString(cond, "type")
-		gotStatus, _, _ := unstructured.NestedString(cond, "status")
-		if gotType != condType || gotStatus != status {
-			continue
-		}
-		msg, _, _ := unstructured.NestedString(cond, "message")
-		msg = singleLine(msg)
-		if msg == "" {
-			return pendingCondition{}, false
-		}
-		transition, _, _ := unstructured.NestedString(cond, "lastTransitionTime")
-		ts, _ := time.Parse(time.RFC3339, transition)
-		return pendingCondition{message: msg, lastTransition: ts}, true
-	}
-	return pendingCondition{}, false
+	return "", false
 }
 
 // singleLine puts a message on one line for scontrol output.

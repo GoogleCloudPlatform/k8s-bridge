@@ -51,8 +51,6 @@ const (
 	testResetCheckMessage     = "Reset to Pending after eviction. Previously: Rejected"
 	testLocalQueue            = "some-queue"
 	testQueuedReason          = "queued in " + testLocalQueue
-	testEarlier               = "2026-11-18T10:00:00Z"
-	testLater                 = "2026-11-18T10:05:00Z"
 )
 
 // addTestWorkloadTypes registers the Workload kinds, as if the Kueue CRDs were installed.
@@ -85,16 +83,6 @@ func workloadCondition(condType, status, message string) map[string]any {
 	return map[string]any{"type": condType, "status": status, "message": message}
 }
 
-func deactivatedSpec() map[string]any {
-	return map[string]any{workloadSpecActive: false}
-}
-
-func workloadConditionAt(condType, status, message, lastTransitionTime string) map[string]any {
-	cond := workloadCondition(condType, status, message)
-	cond["lastTransitionTime"] = lastTransitionTime
-	return cond
-}
-
 func admissionCheck(name, state, message string) map[string]any {
 	return map[string]any{"name": name, "state": state, "message": message}
 }
@@ -115,12 +103,6 @@ func TestKueuePendingReason(t *testing.T) {
 	provisioningCheck := admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testProvisioningMessage)
 	emptyCheck := admissionCheck(testProvisioningCheckName, admissionCheckStatePending, "")
 	resetCheck := admissionCheck(testProvisioningCheckName, admissionCheckStatePending, testResetCheckMessage)
-	quotaFalseAt := func(ts string) map[string]any {
-		return workloadConditionAt(workloadConditionQuotaReserved, "False", testQuotaMessage, ts)
-	}
-	evictedAt := func(msg, ts string) map[string]any {
-		return workloadConditionAt(workloadConditionEvicted, "True", msg, ts)
-	}
 
 	tests := []struct {
 		name      string
@@ -132,14 +114,9 @@ func TestKueuePendingReason(t *testing.T) {
 		{name: "no status is queued in the JobSet LocalQueue", queueName: testLocalQueue, want: testQueuedReason},
 		{name: "QuotaReserved=False", status: workloadConditions(quotaFalse), queueName: testLocalQueue, want: testQuotaMessage},
 		{name: "QuotaReserved=True without a check has no reason", status: workloadConditions(quotaTrue), queueName: testLocalQueue, want: ""},
-		{name: "Evicted=True", status: workloadConditions(evicted), queueName: testLocalQueue, want: testEvictedMessage},
+		{name: "Evicted=True without QuotaReserved", status: workloadConditions(evicted), queueName: testLocalQueue, want: testEvictedMessage},
+		{name: "QuotaReserved=False wins over Evicted=True", status: workloadConditions(evicted, quotaFalse), want: testQuotaMessage},
 		{name: "Evicted=False is not a pending reason", status: workloadConditions(workloadCondition(workloadConditionEvicted, "False", "not evicted")), queueName: testLocalQueue, want: testQueuedReason},
-		{name: "newer Evicted wins over QuotaReserved", status: workloadConditions(quotaFalseAt(testEarlier), evictedAt(testEvictedMessage, testLater)), want: testEvictedMessage},
-		{name: "newer QuotaReserved wins over Evicted", status: workloadConditions(evictedAt(testEvictedMessage, testEarlier), quotaFalseAt(testLater)), want: testQuotaMessage},
-		{name: "QuotaReserved wins a tie", status: workloadConditions(evictedAt(testEvictedMessage, testLater), quotaFalseAt(testLater)), want: testQuotaMessage},
-		{name: "QuotaReserved wins without transition times", status: workloadConditions(evicted, quotaFalse), want: testQuotaMessage},
-		{name: "Evicted with a time wins over QuotaReserved without one", status: workloadConditions(evictedAt(testEvictedMessage, testEarlier), quotaFalse), want: testEvictedMessage},
-		{name: "Evicted without a message falls back to QuotaReserved", status: workloadConditions(evictedAt("", testLater), quotaFalse), want: testQuotaMessage},
 		{name: "reserved Workload shows the pending admission check message", status: withAdmissionChecks(workloadConditions(quotaTrue), provisioningCheck), want: testProvisioningCheckName + ": " + testProvisioningMessage},
 		{
 			name: "reserved Workload joins the pending admission check messages",
@@ -161,22 +138,12 @@ func TestKueuePendingReason(t *testing.T) {
 		{name: "queued Workload ignores a pending check without a message", status: withAdmissionChecks(map[string]any{}, emptyCheck), queueName: testLocalQueue, want: testQueuedReason},
 		{name: "unreserved Workload ignores pending check messages", status: withAdmissionChecks(workloadConditions(quotaFalse), provisioningCheck), want: testQuotaMessage},
 		{
-			name: "preempted Workload shows the eviction, not the reset admission check",
-			status: withAdmissionChecks(workloadConditions(quotaFalseAt(testEarlier), evictedAt(testEvictedMessage, testLater)),
-				resetCheck),
-			want: testEvictedMessage,
+			name:   "deactivated Workload shows the deactivation message, not the reset admission check",
+			status: withAdmissionChecks(workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", testDeactivatedMessage)), resetCheck),
+			want:   testDeactivatedMessage,
 		},
 		{name: "multi-line message is put on one line", status: workloadConditions(workloadCondition(workloadConditionQuotaReserved, "False", "line one\n  line two ")), want: "line one line two"},
 		{name: "unexpected status shape is ignored", status: map[string]any{"conditions": "not-a-list"}, queueName: testLocalQueue, want: testQueuedReason},
-		{
-			name: "deactivated Workload shows Evicted instead of the reset admission check",
-			status: withAdmissionChecks(workloadConditions(quotaFalseAt(testLater), evictedAt(testDeactivatedMessage, testEarlier)),
-				resetCheck),
-			spec: deactivatedSpec(),
-			want: testDeactivatedMessage,
-		},
-		{name: "deactivated Workload without Evicted shows QuotaReserved", status: withAdmissionChecks(workloadConditions(quotaFalse), resetCheck), spec: deactivatedSpec(), want: testQuotaMessage},
-		{name: "deactivated Workload without a message has no reason", status: withAdmissionChecks(map[string]any{}, resetCheck), spec: deactivatedSpec(), queueName: testLocalQueue, want: ""},
 		{name: "admitted Workload has no reason", status: workloadConditions(workloadCondition(workloadConditionAdmitted, "True", "The workload is admitted"), quotaFalse), want: ""},
 		{name: "queued in the Workload queueName without a JobSet label", spec: map[string]any{"queueName": "wl-queue"}, want: "queued in wl-queue"},
 		{name: "no LocalQueue has no reason", want: ""},
