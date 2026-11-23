@@ -81,10 +81,54 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	logger.V(1).Info("Reconciling WorkloadMixing", "controllerRef", workloadMixing.Spec.ControllerRef.Name)
 
+	// Read the condition before updateAvailabilityStatus, which records the current generation.
+	newGeneration := !isGenerationObserved(workloadMixing)
+
 	err := r.updateAvailabilityStatus(ctx, workloadMixing)
+	if err == nil && newGeneration {
+		r.warnAboutPodTemplate(workloadMixing)
+	}
 	r.updateWorkloadMixingMetrics(ctx, workloadMixing)
 
 	return ctrl.Result{}, err
+}
+
+// isGenerationObserved reports whether the Available condition shows the current spec generation.
+func isGenerationObserved(wm *k8sbridgev1alpha1.WorkloadMixing) bool {
+	available := meta.FindStatusCondition(wm.Status.Conditions, k8sbridgev1alpha1.ConditionTypeAvailable)
+	return available != nil && available.ObservedGeneration == wm.Generation
+}
+
+// warnAboutPodTemplate sends a Warning Event for each problem in the podTemplate.
+// Reconcile calls it only after updateAvailabilityStatus records a new spec generation.
+func (r *WorkloadMixingReconciler) warnAboutPodTemplate(wm *k8sbridgev1alpha1.WorkloadMixing) {
+	if r.Recorder == nil {
+		return
+	}
+	var slurmd corev1.ResourceRequirements
+	if wm.Spec.PodTemplate != nil {
+		for _, c := range wm.Spec.PodTemplate.Spec.Containers {
+			if c.Name == slurmjob.ContainerSlurmd {
+				slurmd = c.Resources
+			}
+		}
+	}
+	var missingLimits []string
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if _, ok := slurmd.Limits[name]; !ok {
+			missingLimits = append(missingLimits, string(name))
+		}
+	}
+	if len(missingLimits) > 0 {
+		r.Recorder.Event(wm, corev1.EventTypeWarning, "MaxNodeSizeNotConfigured",
+			"Maximum node size not configured: the slurmd container in spec.podTemplate has no limit for "+strings.Join(missingLimits, " and "))
+	}
+	_, hasCPURequest := slurmd.Requests[corev1.ResourceCPU]
+	_, hasMemRequest := slurmd.Requests[corev1.ResourceMemory]
+	if hasCPURequest || hasMemRequest {
+		r.Recorder.Event(wm, corev1.EventTypeWarning, "SlurmdRequestsIgnored",
+			"Ignored requests in spec.podTemplate: k8s-bridge sets the cpu and memory requests of the slurmd container for each Slurm job")
+	}
 }
 
 func (r *WorkloadMixingReconciler) getRules() []rules.ValidationRule {

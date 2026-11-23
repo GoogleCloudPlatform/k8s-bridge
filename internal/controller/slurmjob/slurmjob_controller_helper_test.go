@@ -293,6 +293,12 @@ func withExtraObjects(objs ...client.Object) reconcileEnvOpt {
 	}
 }
 
+func withWMPodTemplate(podTemplate *corev1.PodTemplateSpec) reconcileEnvOpt {
+	return withWorkloadMixingModifier(func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+		wm.Spec.PodTemplate = podTemplate
+	})
+}
+
 func withWithoutController() reconcileEnvOpt {
 	return func(c *reconcileEnvConfig) {
 		c.withoutController = true

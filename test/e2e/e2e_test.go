@@ -206,6 +206,30 @@ var _ = Describe("Manager", func() {
 			utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
 		})
 
+		It("should cancel Slurm job that needs more than the maximum node size", func() {
+			const configPath = "test/e2e/testdata/workloadmixing_max_node_size.yaml"
+
+			By("applying a WorkloadMixing CR whose slurmd container has CPU and memory limits")
+			utils.ApplyManifestWithCleanup(configPath)
+
+			By("submitting a batch job that needs 8 CPUs and 16384 MiB on one node")
+			jobID := utils.NewBatchJobBuilder(slurmNamespace).
+				WithPartition(defaultSlurmPartition).
+				WithNodes(1).
+				WithArgs("--ntasks=8").
+				WithWrap("sleep 300").
+				Submit()
+			jobSetName := fmt.Sprintf("slurm-job-%s", jobID)
+
+			By("verifying the job is cancelled with a comment that names the need and the limit")
+			utils.VerifySlurmJobCancelled(slurmNamespace, jobID,
+				"Translation failed: job needs 8 CPUs and 16384 MiB per node, but the maximum node size of partition "+
+					defaultSlurmPartition+" is 4 CPUs and 8192 MiB")
+
+			By("verifying no JobSet was created")
+			utils.VerifyJobSetNotFound(jobSetName, slurmNamespace)
+		})
+
 		It("k8s-bridge core should cancel Slurm job if it requests multiple partitions", func() {
 			const configPath = "test/e2e/testdata/workloadmixing_multi_unmanaged.yaml"
 
