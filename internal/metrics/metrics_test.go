@@ -35,11 +35,12 @@ import (
 )
 
 const (
-	labelController     = "controller"
-	labelWorkloadMixing = "workload_mixing"
-	labelPartition      = "partition"
-	labelStatus         = "status"
-	labelReason         = "reason"
+	labelWorkloadMixingNamespace = "workload_mixing_namespace"
+	labelController              = "controller"
+	labelWorkloadMixing          = "workload_mixing"
+	labelPartition               = "partition"
+	labelStatus                  = "status"
+	labelReason                  = "reason"
 )
 
 func TestMetricsRegistration(t *testing.T) {
@@ -57,6 +58,7 @@ func TestMetricsRegistration(t *testing.T) {
 		{"JobTranslationDuration", metrics.JobTranslationDuration},
 		{"ActiveJobs", metrics.ActiveJobs},
 		{"ActiveWorkloadMixings", metrics.ActiveWorkloadMixings},
+		{"WorkloadMixingAvailable", metrics.WorkloadMixingAvailable},
 		{"TrackedPartitions", metrics.TrackedPartitions},
 		{"DroppedEvents", metrics.DroppedEvents},
 		{"EventsQueueDepth", metrics.EventsQueueDepth},
@@ -158,12 +160,23 @@ func TestTerminationReasonMetrics(t *testing.T) {
 }
 
 func TestResourceAndEventMetrics(t *testing.T) {
+	ns := "slurm"
 	wm := "wm-res-test"
 
 	// Test SetActiveWorkloadMixings
 	metrics.SetActiveWorkloadMixings(4)
 	if val := testutil.ToFloat64(metrics.ActiveWorkloadMixings); val != 4.0 {
 		t.Errorf("expected active workload mixings 4.0, got %f", val)
+	}
+
+	// Test SetWorkloadMixingAvailable
+	metrics.SetWorkloadMixingAvailable(ns, wm, false)
+	if val := testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(ns, wm)); val != 0.0 {
+		t.Errorf("expected workload mixing available 0.0, got %f", val)
+	}
+	metrics.SetWorkloadMixingAvailable(ns, wm, true)
+	if val := testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(ns, wm)); val != 1.0 {
+		t.Errorf("expected workload mixing available 1.0, got %f", val)
 	}
 
 	// Test SetTrackedPartitions
@@ -186,14 +199,25 @@ func TestResourceAndEventMetrics(t *testing.T) {
 	}
 
 	// Test DeleteWorkloadMixingMetrics across all workload_mixing labeled metric vectors
+	otherNs := "other-slurm"
+	metrics.SetWorkloadMixingAvailable(otherNs, wm, true)
 	metrics.RecordJobDiscovered(wm, "p1")
 	metrics.RecordJobSync(metrics.StatusSuccess, metrics.ReasonJobSetCreated, wm, "p1")
 	metrics.RecordJobTranslationDuration(wm, "p1", 50*time.Millisecond)
 	metrics.SetActiveJobs(wm, "p1", 2)
 
-	metrics.DeleteWorkloadMixingMetrics(wm)
+	metrics.DeleteWorkloadMixingMetrics(ns, wm)
 
-	// After deletion, reading with label values returns new zero instances
+	// After deletion, reading with label values returns new zero instances for the deleted namespace,
+	// while preserving WorkloadMixingAvailable for identically named CRs in other namespaces.
+	if val := testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(ns, wm)); val != 0.0 {
+		t.Errorf("expected deleted workload mixing available to reset, got %f", val)
+	}
+	if val := testutil.ToFloat64(metrics.WorkloadMixingAvailable.WithLabelValues(otherNs, wm)); val != 1.0 {
+		t.Errorf("expected other namespace workload mixing available to remain 1.0, got %f", val)
+	}
+	metrics.DeleteWorkloadMixingMetrics(otherNs, wm)
+
 	if val := testutil.ToFloat64(metrics.TrackedPartitions.WithLabelValues(wm)); val != 0.0 {
 		t.Errorf("expected deleted tracked partitions to reset, got %f", val)
 	}
@@ -214,6 +238,7 @@ func TestResourceAndEventMetrics(t *testing.T) {
 func TestMetricsHTTPExposition(t *testing.T) {
 	// Populate observations for all metrics collectors
 	controller := "http-test-controller"
+	ns := "http-test-ns"
 	wm := "wm-http-test"
 	partition := "batch-test"
 
@@ -225,6 +250,7 @@ func TestMetricsHTTPExposition(t *testing.T) {
 	metrics.RecordJobTranslationDuration(wm, partition, 45*time.Millisecond)
 	metrics.SetActiveJobs(wm, partition, 1)
 	metrics.SetActiveWorkloadMixings(3)
+	metrics.SetWorkloadMixingAvailable(ns, wm, true)
 	metrics.SetTrackedPartitions(wm, 2)
 	metrics.RecordDroppedEvent(wm)
 	metrics.SetEventsQueueDepth(16)
@@ -266,6 +292,7 @@ func TestMetricsHTTPExposition(t *testing.T) {
 		"k8s_bridge_job_translation_duration_seconds",
 		"k8s_bridge_active_jobs",
 		"k8s_bridge_active_workload_mixings",
+		"k8s_bridge_workload_mixing_available",
 		"k8s_bridge_tracked_partitions",
 		"k8s_bridge_dropped_events_total",
 		"k8s_bridge_events_queue_depth",
@@ -295,6 +322,14 @@ func TestMetricsHTTPExposition(t *testing.T) {
 	assertGaugeValue(t, metricFamilies["k8s_bridge_active_workload_mixings"], 3.0, nil)
 	assertGaugeValue(t, metricFamilies["k8s_bridge_events_queue_depth"], 16.0, nil)
 	assertGaugeValue(t, metricFamilies["k8s_bridge_slurm_client_status"], 1.0, map[string]string{labelController: controller})
+	assertGaugeValue(t, metricFamilies["k8s_bridge_workload_mixing_available"], 1.0, map[string]string{
+		labelWorkloadMixingNamespace: ns,
+		labelWorkloadMixing:          wm,
+	})
+	expectedAvailLine := `k8s_bridge_workload_mixing_available{workload_mixing="wm-http-test",workload_mixing_namespace="http-test-ns"} 1`
+	if !strings.Contains(bodyStr, expectedAvailLine) {
+		t.Errorf("expected exposition output to contain %q, got:\n%s", expectedAvailLine, bodyStr)
+	}
 	assertGaugeValue(t, metricFamilies["k8s_bridge_tracked_partitions"], 2.0, map[string]string{labelWorkloadMixing: wm})
 	assertCounterValue(t, metricFamilies["k8s_bridge_jobs_discovered_total"], 1.0, map[string]string{
 		labelWorkloadMixing: wm,

@@ -18,11 +18,9 @@ package workloadmixing
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,21 +32,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	slinkyv1beta1 "github.com/SlinkyProject/slurm-operator/api/v1beta1"
-
 	k8sbridgev1alpha1 "github.com/GoogleCloudPlatform/k8s-bridge/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/controller/slurmjob"
+	"github.com/GoogleCloudPlatform/k8s-bridge/internal/controller/workloadmixing/rules"
 	"github.com/GoogleCloudPlatform/k8s-bridge/internal/metrics"
-	"github.com/GoogleCloudPlatform/k8s-bridge/internal/utils/refresolver"
 )
-
-const conditionTypeAvailable = "Available"
 
 // WorkloadMixingReconciler reconciles a WorkloadMixing object
 type WorkloadMixingReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+	Rules    []rules.ValidationRule
 }
 
 // +kubebuilder:rbac:groups=k8s-bridge.x-k8s.io,resources=workloadmixings,verbs=get;list;watch;create;update;patch;delete
@@ -72,7 +67,7 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.Get(ctx, req.NamespacedName, workloadMixing); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			logger.V(1).Info("WorkloadMixing resource not found, cleaning up metrics")
-			r.cleanupWorkloadMixingMetrics(ctx, req.Name)
+			r.cleanupWorkloadMixingMetrics(ctx, req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -80,30 +75,34 @@ func (r *WorkloadMixingReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	if !workloadMixing.DeletionTimestamp.IsZero() {
 		logger.Info("WorkloadMixing is being deleted, cleaning up metrics")
-		r.cleanupWorkloadMixingMetrics(ctx, workloadMixing.Name)
+		r.cleanupWorkloadMixingMetrics(ctx, workloadMixing.Namespace, workloadMixing.Name)
 		return ctrl.Result{}, nil
 	}
 
-	r.updateWorkloadMixingMetrics(ctx, workloadMixing)
-
-	original := workloadMixing.DeepCopy()
-
 	logger.V(1).Info("Reconciling WorkloadMixing", "controllerRef", workloadMixing.Spec.ControllerRef.Name)
 
-	r.warnAboutPodTemplate(workloadMixing)
+	// Read the condition before updateAvailabilityStatus, which records the current generation.
+	newGeneration := !isGenerationObserved(workloadMixing)
 
-	if err := r.updateAvailabilityStatus(ctx, workloadMixing, original); err != nil {
-		return ctrl.Result{}, err
+	err := r.updateAvailabilityStatus(ctx, workloadMixing)
+	if err == nil && newGeneration {
+		r.warnAboutPodTemplate(workloadMixing)
 	}
+	r.updateWorkloadMixingMetrics(ctx, workloadMixing)
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, err
 }
 
-// warnAboutPodTemplate sends a Warning Event for each problem in the podTemplate. It runs
-// only for a spec generation that the Available condition does not show yet.
+// isGenerationObserved reports whether the Available condition shows the current spec generation.
+func isGenerationObserved(wm *k8sbridgev1alpha1.WorkloadMixing) bool {
+	available := meta.FindStatusCondition(wm.Status.Conditions, k8sbridgev1alpha1.ConditionTypeAvailable)
+	return available != nil && available.ObservedGeneration == wm.Generation
+}
+
+// warnAboutPodTemplate sends a Warning Event for each problem in the podTemplate.
+// Reconcile calls it only after updateAvailabilityStatus records a new spec generation.
 func (r *WorkloadMixingReconciler) warnAboutPodTemplate(wm *k8sbridgev1alpha1.WorkloadMixing) {
-	available := meta.FindStatusCondition(wm.Status.Conditions, conditionTypeAvailable)
-	if r.Recorder == nil || (available != nil && available.ObservedGeneration == wm.Generation) {
+	if r.Recorder == nil {
 		return
 	}
 	var slurmd corev1.ResourceRequirements
@@ -132,12 +131,20 @@ func (r *WorkloadMixingReconciler) warnAboutPodTemplate(wm *k8sbridgev1alpha1.Wo
 	}
 }
 
-func (r *WorkloadMixingReconciler) cleanupWorkloadMixingMetrics(ctx context.Context, name string) {
-	metrics.DeleteWorkloadMixingMetrics(name)
+func (r *WorkloadMixingReconciler) getRules() []rules.ValidationRule {
+	if len(r.Rules) > 0 {
+		return r.Rules
+	}
+	return rules.GetRules()
+}
+
+func (r *WorkloadMixingReconciler) cleanupWorkloadMixingMetrics(ctx context.Context, namespace, name string) {
+	metrics.DeleteWorkloadMixingMetrics(namespace, name)
 	r.updateActiveWorkloadMixingsMetrics(ctx)
 }
 
 func (r *WorkloadMixingReconciler) updateWorkloadMixingMetrics(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) {
+	metrics.SetWorkloadMixingAvailable(wm.Namespace, wm.Name, wm.IsAvailable())
 	metrics.SetTrackedPartitions(wm.Name, len(wm.Spec.PartitionsMapping))
 	r.updateActiveWorkloadMixingsMetrics(ctx)
 	r.updateActiveJobsMetrics(ctx, wm)
@@ -170,55 +177,63 @@ func (r *WorkloadMixingReconciler) updateActiveWorkloadMixingsMetrics(ctx contex
 	metrics.SetActiveWorkloadMixings(count)
 }
 
-func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context, workloadMixing *k8sbridgev1alpha1.WorkloadMixing, original *k8sbridgev1alpha1.WorkloadMixing) error {
+// ReasonReconciled indicates all WorkloadMixing validation rules succeeded.
+const ReasonReconciled = "Reconciled"
+
+func (r *WorkloadMixingReconciler) evaluateAvailability(ctx context.Context, wm *k8sbridgev1alpha1.WorkloadMixing) (metav1.Condition, error) {
+	var firstReason string
+	var messages []string
+
+	for _, rule := range r.getRules() {
+		failure, err := rule.Validate(ctx, r.Client, wm)
+		if err != nil {
+			return metav1.Condition{}, err
+		}
+		if failure != nil {
+			if firstReason == "" {
+				firstReason = failure.Reason
+			}
+			messages = append(messages, failure.Message)
+		}
+	}
+
+	if len(messages) > 0 {
+		return metav1.Condition{
+			Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: wm.Generation,
+			Reason:             firstReason,
+			Message:            strings.Join(messages, "; "),
+		}, nil
+	}
+
+	return metav1.Condition{
+		Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: wm.Generation,
+		Reason:             ReasonReconciled,
+		Message:            "WorkloadMixing successfully reconciled",
+	}, nil
+}
+
+func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context, workloadMixing *k8sbridgev1alpha1.WorkloadMixing) error {
 	logger := log.FromContext(ctx)
 
-	var condition metav1.Condition
-
-	controllerCR, err := r.getController(ctx, workloadMixing)
+	condition, err := r.evaluateAvailability(ctx, workloadMixing)
 	if err != nil {
 		return err
 	}
-	if controllerCR == nil {
-		condition = metav1.Condition{
-			Type:               conditionTypeAvailable,
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: workloadMixing.Generation,
-			Reason:             "ControllerNotFound",
-			Message:            fmt.Sprintf("Referenced Controller %q not found", workloadMixing.Spec.ControllerRef.Name),
-		}
-	} else {
-		restAPI, err := r.getRestAPI(ctx, controllerCR)
-		if err != nil {
-			return err
-		}
-		if restAPI == nil {
-			condition = metav1.Condition{
-				Type:               conditionTypeAvailable,
-				Status:             metav1.ConditionFalse,
-				ObservedGeneration: workloadMixing.Generation,
-				Reason:             "RestApiNotFound",
-				Message:            fmt.Sprintf("No RestApi found for Controller %q", controllerCR.Name),
-			}
-		} else {
-			condition = metav1.Condition{
-				Type:               conditionTypeAvailable,
-				Status:             metav1.ConditionTrue,
-				ObservedGeneration: workloadMixing.Generation,
-				Reason:             "Reconciled",
-				Message:            "WorkloadMixing successfully reconciled",
-			}
-		}
-	}
 
-	changed := meta.SetStatusCondition(&workloadMixing.Status.Conditions, condition)
+	updated := workloadMixing.DeepCopy()
+	changed := meta.SetStatusCondition(&updated.Status.Conditions, condition)
 	if changed {
-		if err := r.Status().Patch(ctx, workloadMixing, client.MergeFrom(original)); err != nil {
+		if err := r.Status().Patch(ctx, updated, client.MergeFrom(workloadMixing)); err != nil {
 			if r.Recorder != nil {
 				r.Recorder.Event(workloadMixing, corev1.EventTypeWarning, "StatusUpdateFailed", "Failed to update WorkloadMixing status")
 			}
 			return err
 		}
+		*workloadMixing = *updated
 		logger.Info("Updated WorkloadMixing status condition",
 			"status", condition.Status,
 			"reason", condition.Reason,
@@ -240,111 +255,49 @@ func (r *WorkloadMixingReconciler) updateAvailabilityStatus(ctx context.Context,
 	return nil
 }
 
+func (r *WorkloadMixingReconciler) enqueueMatchingWMs(
+	matches func(eventObj client.Object, wm *k8sbridgev1alpha1.WorkloadMixing) bool,
+) handler.MapFunc {
+	return func(ctx context.Context, eventObj client.Object) []reconcile.Request {
+		if eventObj == nil || matches == nil {
+			return nil
+		}
+
+		wmList := &k8sbridgev1alpha1.WorkloadMixingList{}
+		var listOpts []client.ListOption
+		if ns := eventObj.GetNamespace(); ns != "" {
+			listOpts = append(listOpts, client.InNamespace(ns))
+		}
+		if err := r.List(ctx, wmList, listOpts...); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to list WorkloadMixings", "namespace", eventObj.GetNamespace())
+			return nil
+		}
+
+		var requests []reconcile.Request
+		for i := range wmList.Items {
+			wm := &wmList.Items[i]
+			if matches(eventObj, wm) {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      wm.Name,
+						Namespace: wm.Namespace,
+					},
+				})
+			}
+		}
+		return requests
+	}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadMixingReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&k8sbridgev1alpha1.WorkloadMixing{}).
-		Watches(
-			&slinkyv1beta1.Controller{},
-			handler.EnqueueRequestsFromMapFunc(r.mapControllerToWorkloadMixing),
-		).
-		Watches(
-			&slinkyv1beta1.RestApi{},
-			handler.EnqueueRequestsFromMapFunc(r.mapRestAPIToWorkloadMixing),
-		).
-		Named("workloadmixing").
-		Complete(r)
-}
-
-func (r *WorkloadMixingReconciler) getController(ctx context.Context, workloadMixing *k8sbridgev1alpha1.WorkloadMixing) (*slinkyv1beta1.Controller, error) {
-	logger := log.FromContext(ctx)
-	controllerCR := &slinkyv1beta1.Controller{}
-	controllerKey := types.NamespacedName{
-		Namespace: workloadMixing.Namespace,
-		Name:      workloadMixing.Spec.ControllerRef.Name,
-	}
-
-	if err := r.Get(ctx, controllerKey, controllerCR); err != nil {
-		if apierrors.IsNotFound(err) {
-			logger.V(1).Info("Referenced Controller not found", "slurmController", controllerKey)
-			return nil, nil
-		}
-		return nil, err
-	}
-	return controllerCR, nil
-}
-
-func (r *WorkloadMixingReconciler) getRestAPI(ctx context.Context, controllerCR *slinkyv1beta1.Controller) (*slinkyv1beta1.RestApi, error) {
-	logger := log.FromContext(ctx)
-	resolver := refresolver.New(r.Client)
-	controllerKey := client.ObjectKeyFromObject(controllerCR)
-
-	restAPIList, err := resolver.GetRestapisForController(ctx, controllerCR)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(restAPIList.Items) == 0 {
-		logger.V(1).Info("No RestApi found for Controller", "slurmController", controllerKey)
-		return nil, nil
-	}
-
-	return &restAPIList.Items[0], nil
-}
-
-func (r *WorkloadMixingReconciler) mapControllerToWorkloadMixing(ctx context.Context, obj client.Object) []reconcile.Request {
-	controller, ok := obj.(*slinkyv1beta1.Controller)
-	if !ok {
-		return nil
-	}
-
-	wmList := &k8sbridgev1alpha1.WorkloadMixingList{}
-	if err := r.List(ctx, wmList, client.InNamespace(controller.Namespace)); err != nil {
-		logger := log.FromContext(ctx)
-		logger.Error(err, "Failed to list WorkloadMixings", "namespace", controller.Namespace)
-		return nil
-	}
-
-	var requests []reconcile.Request
-	for _, wm := range wmList.Items {
-		if wm.Spec.ControllerRef.Name == controller.Name {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      wm.Name,
-					Namespace: wm.Namespace,
-				},
-			})
+	b := ctrl.NewControllerManagedBy(mgr).For(&k8sbridgev1alpha1.WorkloadMixing{})
+	for _, rule := range r.getRules() {
+		if watchable, ok := rule.(rules.WatchableRule); ok {
+			if w := watchable.Watch(); w != nil {
+				b = b.Watches(w.Object, handler.EnqueueRequestsFromMapFunc(r.enqueueMatchingWMs(w.Matches)), w.Opts...)
+			}
 		}
 	}
-	return requests
-}
-
-func (r *WorkloadMixingReconciler) mapRestAPIToWorkloadMixing(ctx context.Context, obj client.Object) []reconcile.Request {
-	restAPI, ok := obj.(*slinkyv1beta1.RestApi)
-	if !ok {
-		return nil
-	}
-	if restAPI.Spec.ControllerRef.Name == "" {
-		return nil
-	}
-
-	wmList := &k8sbridgev1alpha1.WorkloadMixingList{}
-	if err := r.List(ctx, wmList, client.InNamespace(restAPI.Namespace)); err != nil {
-		logger := log.FromContext(ctx)
-		logger.Error(err, "Failed to list WorkloadMixings", "namespace", restAPI.Namespace)
-		return nil
-	}
-
-	var requests []reconcile.Request
-	for _, wm := range wmList.Items {
-		if wm.Spec.ControllerRef.Name == restAPI.Spec.ControllerRef.Name {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      wm.Name,
-					Namespace: wm.Namespace,
-				},
-			})
-		}
-	}
-	return requests
+	return b.Named("workloadmixing").Complete(r)
 }

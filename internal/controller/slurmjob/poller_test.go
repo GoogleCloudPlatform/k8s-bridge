@@ -96,6 +96,16 @@ func newTestWorkloadMixing(name, controller, partition, queue string) *k8sbridge
 			},
 			PartitionsMapping: pm,
 		},
+		Status: k8sbridgev1alpha1.WorkloadMixingStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 0,
+					Reason:             testReasonReconciled,
+				},
+			},
+		},
 	}
 }
 
@@ -965,9 +975,12 @@ func TestPoll_OrphanedJobSet_ReappearanceClearsTracking(t *testing.T) {
 }
 
 type pollerTestEnv struct {
-	poller       *SlurmPoller
-	teardownChan chan slurmtypes.SlurmJobTeardownEvent
-	now          time.Time
+	poller        *SlurmPoller
+	teardownChan  chan slurmtypes.SlurmJobTeardownEvent
+	clientMap     *clientmap.ClientMap
+	mockSlurm     *utils.SlurmClient
+	controllerKey types.NamespacedName
+	now           time.Time
 }
 
 func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, objs ...client.Object) *pollerTestEnv {
@@ -983,11 +996,15 @@ func newPollerTestEnv(t *testing.T, slurmJobs []slurmclienttypes.V0044JobInfo, o
 	mockSlurm := &utils.SlurmClient{}
 	mockSlurm.SetPendingJobs(testPartitionName, slurmJobs)
 	cMap := clientmap.NewClientMap()
-	cMap.Add(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+	controllerKey := types.NamespacedName{Namespace: testNamespace, Name: testControllerName}
+	cMap.Add(t.Context(), controllerKey, mockSlurm)
 
 	env := &pollerTestEnv{
-		teardownChan: make(chan slurmtypes.SlurmJobTeardownEvent, 10),
-		now:          time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
+		teardownChan:  make(chan slurmtypes.SlurmJobTeardownEvent, 10),
+		clientMap:     cMap,
+		mockSlurm:     mockSlurm,
+		controllerKey: controllerKey,
+		now:           time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC),
 	}
 	env.poller = &SlurmPoller{
 		Client:            fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{wm}, objs...)...).Build(),
@@ -1016,6 +1033,35 @@ func (e *pollerTestEnv) drainTeardownEvents() []slurmtypes.SlurmJobTeardownEvent
 		default:
 			return events
 		}
+	}
+}
+
+// expectNoTeardownEvent fails the test if the poller sent a teardown event. step names the poll
+// cycle in the failure message.
+func (e *pollerTestEnv) expectNoTeardownEvent(t *testing.T, step string) {
+	t.Helper()
+	if events := e.drainTeardownEvents(); len(events) != 0 {
+		t.Fatalf("%s: expected no teardown event, got %v", step, events)
+	}
+}
+
+// expectTeardownEvent fails the test if the poller did not send exactly one teardown event, or if
+// a non-empty field of want differs from that event.
+func (e *pollerTestEnv) expectTeardownEvent(t *testing.T, want slurmtypes.SlurmJobTeardownEvent) {
+	t.Helper()
+	events := e.drainTeardownEvents()
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 teardown event, got %d: %v", len(events), events)
+	}
+	got := events[0]
+	if got.JobID != want.JobID {
+		t.Errorf("Teardown event JobID = %q, want %q", got.JobID, want.JobID)
+	}
+	if want.Reason != "" && got.Reason != want.Reason {
+		t.Errorf("Teardown event Reason = %q, want %q", got.Reason, want.Reason)
+	}
+	if want.Partition != "" && got.Partition != want.Partition {
+		t.Errorf("Teardown event Partition = %q, want %q", got.Partition, want.Partition)
 	}
 }
 
@@ -1283,6 +1329,95 @@ func TestPoll_OrphanedJobSet_PrunesDeletedJobSetsFromTracking(t *testing.T) {
 	}
 }
 
+// TestPoll_OrphanedJobSet_SlurmUnavailable_NoTeardown checks that the poller does not tear down
+// a JobSet when it cannot read the Slurm job list. If the poller used an empty job list instead,
+// a Slurm outage would tear down all running workloads. When Slurm answers again and the job is
+// still missing, the poller tears down the JobSet at once: two successful polls that are more than
+// the grace period apart did not find the job.
+func TestPoll_OrphanedJobSet_SlurmUnavailable_NoTeardown(t *testing.T) {
+	tests := []struct {
+		name            string
+		makeUnavailable func(t *testing.T, env *pollerTestEnv)
+	}{
+		{
+			name: "Slurm job list fails",
+			makeUnavailable: func(t *testing.T, env *pollerTestEnv) {
+				env.clientMap.Add(t.Context(), env.controllerKey, &errorClient{})
+			},
+		},
+		{
+			name: "Slurm client not ready",
+			makeUnavailable: func(_ *testing.T, env *pollerTestEnv) {
+				env.clientMap.Remove(env.controllerKey)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newPollerTestEnv(t, nil, newPollerTestJobSet("210").build())
+			start := env.now
+
+			// Poll cycle 1: Slurm answers without job 210, so the grace period starts.
+			env.poll(t)
+			env.expectNoTeardownEvent(t, "Poll cycle 1")
+
+			// Poll cycle 2: the grace period is over, but Slurm is unavailable. The poller
+			// cannot confirm that job 210 is still missing, so it must keep the JobSet.
+			tc.makeUnavailable(t, env)
+			env.now = start.Add(70 * time.Second)
+			env.poll(t)
+			env.expectNoTeardownEvent(t, "Poll cycle 2")
+
+			// Poll cycle 3: Slurm answers again, and job 210 is still missing. This also proves
+			// that poll cycle 1 started the grace period, so poll cycle 2 checked a real case.
+			env.clientMap.Add(t.Context(), env.controllerKey, env.mockSlurm)
+			env.now = start.Add(80 * time.Second)
+			env.poll(t)
+			env.expectTeardownEvent(t, slurmtypes.SlurmJobTeardownEvent{JobID: "210", Reason: metrics.ReasonJobOrphaned})
+		})
+	}
+}
+
+// TestPoll_OrphanedJobSet_SlurmOutage_GracePeriodStartsAfterRecovery checks that a Slurm outage
+// does not start the orphan grace period, also when the outage is longer than the grace period.
+// The job is in Slurm before the outage, so the grace period starts at the first successful poll
+// after the outage that does not find the job.
+func TestPoll_OrphanedJobSet_SlurmOutage_GracePeriodStartsAfterRecovery(t *testing.T) {
+	env := newPollerTestEnv(t,
+		[]slurmclienttypes.V0044JobInfo{newRunningJob(211, testPartitionName)},
+		newPollerTestJobSet("211").build(),
+	)
+	start := env.now
+
+	// Poll cycle 1: job 211 runs in Slurm.
+	env.poll(t)
+	env.expectNoTeardownEvent(t, "Poll cycle 1")
+
+	// Poll cycles 2 to 4: Slurm is unavailable for 3 minutes, which is 3 times the grace period.
+	env.clientMap.Add(t.Context(), env.controllerKey, &errorClient{})
+	for _, elapsed := range []time.Duration{10 * time.Second, 70 * time.Second, 3 * time.Minute} {
+		env.now = start.Add(elapsed)
+		env.poll(t)
+		env.expectNoTeardownEvent(t, fmt.Sprintf("Poll at %s with Slurm unavailable", elapsed))
+	}
+
+	// Poll cycle 5: Slurm is available again, but job 211 is gone, for example because slurmctld
+	// lost its state. This poll is the first one that does not find the job, so the grace period
+	// starts now.
+	env.mockSlurm.SetPendingJobs(testPartitionName, nil)
+	env.clientMap.Add(t.Context(), env.controllerKey, env.mockSlurm)
+	recovery := start.Add(3*time.Minute + 10*time.Second)
+	env.now = recovery
+	env.poll(t)
+	env.expectNoTeardownEvent(t, "Poll cycle 5")
+
+	// Poll cycle 6: the grace period that started at recovery is over.
+	env.now = recovery.Add(70 * time.Second)
+	env.poll(t)
+	env.expectTeardownEvent(t, slurmtypes.SlurmJobTeardownEvent{JobID: "211", Reason: metrics.ReasonJobOrphaned})
+}
+
 func TestShouldEmitAdmissionEvent(t *testing.T) {
 	const jobID int32 = 301
 	const jobSetName = "slurm-job-301"
@@ -1295,13 +1430,15 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		job        *slurmclienttypes.V0044JobInfo
-		existingJS *jobsetv1alpha2.JobSet
-		want       bool
+		name        string
+		wmAvailable bool
+		job         *slurmclienttypes.V0044JobInfo
+		existingJS  *jobsetv1alpha2.JobSet
+		want        bool
 	}{
 		{
-			name: "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			name:        "Skips when PENDING job has existing unsuspended JobSet and is already unheld (StatusNoAction)",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(false).
 				withStateReason("Resources").
@@ -1310,7 +1447,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
+			name:        "Skips when PENDING job has existing JobSet suspended by Kueue preemption (StatusNoAction)",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(false).
 				withStateReason("Resources").
@@ -1319,7 +1457,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Skips when PENDING job has no JobSet and is explicitly held by user",
+			name:        "Skips when PENDING job has no JobSet and is explicitly held by user",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1329,7 +1468,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Skips when PENDING job has no JobSet and is explicitly held by admin",
+			name:        "Skips when PENDING job has no JobSet and is explicitly held by admin",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldAdmin).
@@ -1339,7 +1479,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
+			name:        "Emits when PENDING job has no JobSet, is explicitly held, and requests multiple partitions",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withPartition(testPartitionName + ",other-partition").
 				withHold(true).
@@ -1349,7 +1490,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       true,
 		},
 		{
-			name: "Emits when PENDING job has no JobSet and is auto-held",
+			name:        "Emits when PENDING job has no JobSet and is auto-held",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1359,7 +1501,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       true,
 		},
 		{
-			name: "Skips when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusNoAction)",
+			name:        "Skips when PENDING job has existing unsuspended JobSet and becomes explicitly held (StatusNoAction)",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1368,7 +1511,8 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			want:       false,
 		},
 		{
-			name: "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
+			name:        "Emits when PENDING job has existing unsuspended JobSet and is still auto-held (StatusShouldUnhold)",
+			wmAvailable: true,
 			job: newPendingJobBuilder().
 				withHold(true).
 				withStateReason(ReasonJobHeldUser).
@@ -1377,11 +1521,43 @@ func TestShouldEmitAdmissionEvent(t *testing.T) {
 			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
 			want:       true,
 		},
+		{
+			name:        "Skips new job when WorkloadMixing is unavailable",
+			wmAvailable: false,
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: nil,
+			want:       false,
+		},
+		{
+			name:        "Emits StatusShouldUnhold for owned JobSet even when WorkloadMixing is unavailable",
+			wmAvailable: false,
+			job: newPendingJobBuilder().
+				withHold(true).
+				withStateReason(ReasonJobHeldUser).
+				withComment(AutoHoldMarker).
+				build(),
+			existingJS: newTestJobSet(jobSetName).withSuspend(false).build(),
+			want:       true,
+		},
+		{
+			name:        "Emits StatusJobSetMissing for unheld job without JobSet even when WorkloadMixing is unavailable",
+			wmAvailable: false,
+			job: newPendingJobBuilder().
+				withHold(false).
+				withStateReason("Resources").
+				build(),
+			existingJS: nil,
+			want:       true,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldEmitAdmissionEvent(tc.job, tc.existingJS); got != tc.want {
+			if got := shouldEmitAdmissionEvent(tc.wmAvailable, tc.job, tc.existingJS); got != tc.want {
 				t.Errorf("shouldEmitAdmissionEvent() = %v, want %v", got, tc.want)
 			}
 		})
@@ -1486,5 +1662,78 @@ func TestPoll_FilterRedundantAdmissionEvents(t *testing.T) {
 				t.Fatalf("Poll() emitted %d admission events, want %d", got, want)
 			}
 		})
+	}
+}
+
+func TestPoll_WorkloadMixingAvailabilityGate(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = k8sbridgev1alpha1.AddToScheme(scheme)
+	_ = jobsetv1alpha2.AddToScheme(scheme)
+
+	wm := newTestWorkloadMixing(testWMName, testControllerName, testPartitionName, testQueueName)
+	wm.UID = testWMUID
+	wm.Generation = 1
+	wm.Status.Conditions = []metav1.Condition{
+		{
+			Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: 1,
+			Reason:             testReasonLocalQueueNotFound,
+		},
+	}
+
+	newJob := *newEmptyTestJob().
+		withJobID(601).
+		withPartition(testPartitionName).
+		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
+		withHold(true).
+		withStateReason(ReasonJobHeldUser).
+		withComment(AutoHoldMarker).
+		build()
+
+	fakeK8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wm).Build()
+	cMap := clientmap.NewClientMap()
+	mockSlurm := &utils.SlurmClient{}
+	mockSlurm.SetPendingJobs(testPartitionName, []slurmclienttypes.V0044JobInfo{newJob})
+	cMap.Add(ctx, types.NamespacedName{Namespace: testNamespace, Name: testControllerName}, mockSlurm)
+
+	admissionChan := make(chan slurmtypes.SlurmJobAdmissionEvent, 10)
+	teardownChan := make(chan slurmtypes.SlurmJobTeardownEvent, 10)
+	poller := &SlurmPoller{
+		Client:          fakeK8sClient,
+		ClientMap:       cMap,
+		AdmissionEvents: admissionChan,
+		TeardownEvents:  teardownChan,
+	}
+
+	// Cycle 1 (IsAvailable() == false): skips emitting admission event for new job.
+	if err := poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll cycle 1 failed: %v", err)
+	}
+	if got := len(admissionChan); got != 0 {
+		t.Fatalf("Cycle 1 admission events = %d, want 0 while WM unavailable", got)
+	}
+
+	// Cycle 2 (IsAvailable() == true): emits admission event for the deferred job.
+	var latestWM k8sbridgev1alpha1.WorkloadMixing
+	if err := fakeK8sClient.Get(ctx, client.ObjectKeyFromObject(wm), &latestWM); err != nil {
+		t.Fatalf("Failed to get WorkloadMixing: %v", err)
+	}
+	latestWM.Status.Conditions[0].Status = metav1.ConditionTrue
+	latestWM.Status.Conditions[0].Reason = testReasonReconciled
+	if err := fakeK8sClient.Update(ctx, &latestWM); err != nil {
+		t.Fatalf("Failed to update WorkloadMixing: %v", err)
+	}
+
+	if err := poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll cycle 2 failed: %v", err)
+	}
+	if got := len(admissionChan); got != 1 {
+		t.Fatalf("Cycle 2 admission events = %d, want 1", got)
+	}
+	if ev := <-admissionChan; ev.JobID != "601" {
+		t.Fatalf("Cycle 2 admission event JobID = %q, want \"601\"", ev.JobID)
 	}
 }

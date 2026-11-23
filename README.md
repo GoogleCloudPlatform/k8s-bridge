@@ -51,6 +51,7 @@ See the `config/samples/` directory for full examples of configuring the `Worklo
 - [Quickstart Guide](docs/quickstart.md): Step-by-step instructions to deploy k8s-bridge and a sample workload mixing cluster.
 - [Priorities and Preemption](docs/priorities-and-preemption.md): Configure partition-based priorities and Kueue preemption for Slurm workloads.
 - [GPU Workloads](docs/gpu-workloads.md): Configure GPU-enabled Slurm partitions and run GPU jobs on Kubernetes.
+- [Pod Annotations](docs/pod-annotations.md): Pass Kubernetes Pod annotations, such as Kueue Topology-Aware Scheduling requests, with Slurm's `--extra` option, and configure Slurm for Topology-Aware Scheduling.
 - [GPU DWS Workloads](docs/gke/gpu-dws-workloads.md): Configure Dynamic Workload Scheduler (DWS) on GKE for GPU workloads.
 - [CCC](docs/gke/ccc.md): Configure Custom Compute Classes (CCC) on GKE.
 
@@ -98,10 +99,11 @@ All metrics use the `k8s_bridge_` prefix and bounded, low-cardinality labels:
 | `k8s_bridge_slurm_poller_errors_total` | Counter | `controller` | Total number of errors encountered during Slurm polling cycles. |
 | `k8s_bridge_slurm_client_status` | Gauge | `controller` | Health and connectivity status of the Slurm REST client (`1` = healthy, `0` = disconnected/error). |
 | `k8s_bridge_jobs_discovered_total` | Counter | `workload_mixing`, `partition` | Total number of pending Slurm jobs discovered. |
-| `k8s_bridge_jobs_sync_total` | Counter | `status`, `reason`, `workload_mixing`, `partition` | Cumulative count of job synchronization attempts and outcomes (`jobset_created`, `jobset_completed`, `jobset_failed`, `translation_error`, etc.). |
+| `k8s_bridge_jobs_sync_total` | Counter | `status`, `reason`, `workload_mixing`, `partition` | Cumulative count of job synchronization attempts and outcomes (`jobset_created`, `jobset_completed`, `jobset_failed`, `translation_error`, `jobset_admission_rejected`, etc.). |
 | `k8s_bridge_job_translation_duration_seconds` | Histogram | `workload_mixing`, `partition` | Latency of converting Slurm jobs to Kubernetes JobSets in seconds. |
 | `k8s_bridge_active_jobs` | Gauge | `workload_mixing`, `partition` | Current count of in-flight managed Slurm jobs. |
 | `k8s_bridge_active_workload_mixings` | Gauge | _none_ | Total number of active `WorkloadMixing` custom resources. |
+| `k8s_bridge_workload_mixing_available` | Gauge | `workload_mixing_namespace`, `workload_mixing` | Availability status of a `WorkloadMixing` custom resource (`1` when `Available=True` for the current generation, `0` otherwise). |
 | `k8s_bridge_tracked_partitions` | Gauge | `workload_mixing` | Number of Slurm partitions actively configured and tracked per `WorkloadMixing` resource. |
 | `k8s_bridge_dropped_events_total` | Counter | `workload_mixing` | Total number of events dropped due to channel buffer saturation. |
 | `k8s_bridge_events_queue_depth` | Gauge | _none_ | Current depth of the internal poller event queue. |

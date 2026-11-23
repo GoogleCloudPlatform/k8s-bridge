@@ -251,3 +251,14 @@ func WaitForWorkerPodsRunning(ns, jobSetName string, expectedCount int, timeout 
 
 	return podNames
 }
+
+// JobSetPods returns the Pods created for the named JobSet.
+func JobSetPods(ns, jobSetName string) []corev1.Pod {
+	ginkgo.GinkgoHelper()
+	out, err := Run(exec.Command("kubectl", "get", "pods", "-n", ns,
+		"-l", fmt.Sprintf("%s=%s", jobSetPodSelector, jobSetName), "-o", "json"))
+	gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Failed to list Pods of JobSet "+jobSetName)
+	var list corev1.PodList
+	gomega.Expect(json.Unmarshal([]byte(out), &list)).To(gomega.Succeed())
+	return list.Items
+}

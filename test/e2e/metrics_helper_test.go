@@ -35,17 +35,23 @@ import (
 // verifyMetricsEndpoint creates RBAC, generates a service account token, deploys the curl pod,
 // and asserts that the metrics output contains the specified substrings on the secure HTTPS endpoint.
 func verifyMetricsEndpoint(expectedMetrics ...string) {
-	verifyMetricsEndpointWithOptions(true, 8443, expectedMetrics...)
+	verifyMetricsEndpointState(expectedMetrics, nil)
+}
+
+// verifyMetricsEndpointState asserts that the secure HTTPS metrics endpoint contains all expectedPresent
+// substrings and none of the expectedAbsent substrings.
+func verifyMetricsEndpointState(expectedPresent, expectedAbsent []string) {
+	verifyMetricsEndpointWithOptions(true, 8443, expectedPresent, expectedAbsent)
 }
 
 // verifyInsecureMetricsEndpoint deploys the curl pod to access an unauthenticated
 // metrics endpoint on the specified port, and asserts that the metrics output
 // contains the specified substrings.
 func verifyInsecureMetricsEndpoint(port int, expectedMetrics ...string) {
-	verifyMetricsEndpointWithOptions(false, port, expectedMetrics...)
+	verifyMetricsEndpointWithOptions(false, port, expectedMetrics, nil)
 }
 
-func verifyMetricsEndpointWithOptions(secure bool, port int, expectedMetrics ...string) {
+func verifyMetricsEndpointWithOptions(secure bool, port int, expectedPresent, expectedAbsent []string) {
 	GinkgoHelper()
 
 	var token string
@@ -66,34 +72,37 @@ func verifyMetricsEndpointWithOptions(secure bool, port int, expectedMetrics ...
 		Expect(token).NotTo(BeEmpty())
 	}
 
-	By("creating the curl-metrics pod to access the metrics endpoint")
-	err := createCurlMetricsPodWithOptions(secure, port, token)
-	Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 	DeferCleanup(func() {
 		By("cleaning up the curl pod for metrics (deferred)")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 	})
 
-	By("waiting for the curl-metrics pod to complete")
+	By("scraping and verifying expected metrics on the metrics endpoint")
 	Eventually(func(g Gomega) {
-		cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-			"-o", "jsonpath={.status.phase}",
-			"-n", namespace)
-		output, err := utils.Run(cmd)
-		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
-	}, 5*time.Minute).Should(Succeed())
+		err := createCurlMetricsPodWithOptions(secure, port, token)
+		g.Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 
-	By("verifying expected metrics in curl-metrics output")
-	Eventually(func(g Gomega) {
+		g.Eventually(func(inner Gomega) {
+			cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
+				"-o", "jsonpath={.status.phase}",
+				"-n", namespace)
+			output, runErr := utils.Run(cmd)
+			inner.Expect(runErr).NotTo(HaveOccurred())
+			inner.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
+		}, 2*time.Minute, time.Second).Should(Succeed())
+
 		metricsOutput, err := getMetricsOutput()
 		g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
 		g.Expect(metricsOutput).NotTo(BeEmpty())
-		for _, expected := range expectedMetrics {
+
+		for _, expected := range expectedPresent {
 			g.Expect(metricsOutput).To(ContainSubstring(expected))
 		}
-	}, 30*time.Second).Should(Succeed())
+		for _, absent := range expectedAbsent {
+			g.Expect(metricsOutput).NotTo(ContainSubstring(absent))
+		}
+	}, 2*time.Minute, 5*time.Second).Should(Succeed())
 }
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.

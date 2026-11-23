@@ -110,17 +110,6 @@ func TestReconcile_PermanentFailure_TranslationError(t *testing.T) {
 	env.verifySlurmCancellation("missing GRES mapping for gpu:a100")
 }
 
-func TestReconcile_TemporaryFailure_GetJobError(t *testing.T) {
-	env := newReconcileTestEnv(t)
-	env.mockSlurm.GetError = errors.New("connection refused")
-
-	_, err := env.reconcile()
-	verifyError(t, err, "connection refused")
-
-	env.verifyJobSetNotFound()
-	env.verifyNoSlurmUpdates()
-}
-
 func TestReconcile_JobNotFound_Skipped(t *testing.T) {
 	tests := []struct {
 		name string
@@ -155,6 +144,102 @@ func TestReconcile_JobNotFound_Skipped(t *testing.T) {
 
 			env.verifyJobSetNotFound()
 			env.verifyNoSlurmUpdates()
+		})
+	}
+}
+
+// TestReconcile_SlurmUnavailable_KeepsExistingJobSet checks that the reconciler does not create,
+// change, or delete a JobSet, and does not cancel the job, when it cannot read the job from Slurm.
+// The failed JobSet case matters most: with the job data, the reconciler would cancel the job,
+// delete its dynamic nodes, and delete the JobSet.
+func TestReconcile_SlurmUnavailable_KeepsExistingJobSet(t *testing.T) {
+	slurmStates := []struct {
+		name        string
+		opts        []reconcileEnvOpt
+		getError    error
+		wantErr     string
+		wantRequeue time.Duration
+		wantLog     string
+	}{
+		{
+			name:     "Slurm API returns an error",
+			getError: errors.New("connection refused"),
+			wantErr:  "connection refused",
+		},
+		{
+			name:        "Slurm client not ready",
+			opts:        []reconcileEnvOpt{withWithoutSlurmClient()},
+			wantRequeue: 5 * time.Second,
+			wantLog:     "Slurm client not found in ClientMap, requeuing Slurm job",
+		},
+	}
+	jobSets := []struct {
+		name  string
+		build func() *jobsetv1alpha2.JobSet
+	}{
+		{
+			name:  "no JobSet",
+			build: func() *jobsetv1alpha2.JobSet { return nil },
+		},
+		{
+			name: "running JobSet",
+			build: func() *jobsetv1alpha2.JobSet {
+				return newReconTestJobSet().withSuspend(false).withSlurmdReplicas(1).build()
+			},
+		},
+		{
+			name: "failed JobSet",
+			build: func() *jobsetv1alpha2.JobSet {
+				return newReconTestJobSet().
+					withSuspend(false).
+					withSlurmdReplicas(1).
+					withCondition(string(jobsetv1alpha2.JobSetFailed), metav1.ConditionTrue).
+					build()
+			},
+		},
+	}
+
+	for _, slurm := range slurmStates {
+		t.Run(slurm.name, func(t *testing.T) {
+			for _, tc := range jobSets {
+				t.Run(tc.name, func(t *testing.T) {
+					js := tc.build()
+					var opts []reconcileEnvOpt
+					if js != nil {
+						opts = append(opts, withExtraObjects(js))
+					}
+					opts = append(opts, slurm.opts...)
+					env := newReconcileTestEnv(t, opts...)
+					env.mockSlurm.GetError = slurm.getError
+					var before *jobsetv1alpha2.JobSet
+					if js != nil {
+						before = env.getJobSet()
+					}
+					ctx, recorded := newObservedLoggerContext(t.Context())
+
+					res, err := env.reconcile(ctx)
+					if slurm.wantErr != "" {
+						verifyError(t, err, slurm.wantErr)
+					} else if err != nil {
+						t.Fatalf("Reconcile failed: %v", err)
+					}
+					if res.RequeueAfter != slurm.wantRequeue {
+						t.Errorf("Expected requeue after %v, got %v", slurm.wantRequeue, res.RequeueAfter)
+					}
+					if slurm.wantLog != "" {
+						if got := recorded.FilterMessage(slurm.wantLog).Len(); got != 1 {
+							t.Errorf("Expected 1 log entry %q, got %d", slurm.wantLog, got)
+						}
+					}
+
+					if before == nil {
+						env.verifyJobSetNotFound()
+					} else {
+						env.verifyJobSetUnchanged(before)
+					}
+					env.verifyNoSlurmUpdates()
+				})
+			}
 		})
 	}
 }
@@ -881,28 +966,6 @@ func TestReconcile_Cancelled_MultiPartition(t *testing.T) {
 	env.verifyJobSetNotFound()
 }
 
-func TestReconcile_Graceful_MissingClient(t *testing.T) {
-	env := newReconcileTestEnv(t, withWithoutSlurmClient())
-
-	var buf bytes.Buffer
-	testLogger := zap.New(zap.WriteTo(&buf), zap.UseDevMode(true))
-	ctx := logf.IntoContext(context.Background(), testLogger)
-
-	res, err := env.reconcile(ctx)
-	if err != nil {
-		t.Fatalf("Reconcile failed: %v", err)
-	}
-
-	if res.RequeueAfter != 5*time.Second {
-		t.Errorf("Expected requeue after 5s, got %v", res.RequeueAfter)
-	}
-
-	logOutput := buf.String()
-	if !strings.Contains(logOutput, "Slurm client not found in ClientMap") {
-		t.Errorf("Expected log message about missing client not found: %s", logOutput)
-	}
-}
-
 func TestReconcile_MissingClient_DeletingJobSet(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -954,10 +1017,7 @@ func TestSlurmJobReconciler_Start(t *testing.T) {
 	t.Run("Event is forwarded to genericEvents channel", func(t *testing.T) {
 		var buf bytes.Buffer
 		testLogger := zap.New(zap.WriteTo(&buf), zap.UseDevMode(true))
-		logf.SetLogger(testLogger)
-		ctx := t.Context()
-
-		ctx = logf.IntoContext(ctx, testLogger)
+		ctx, cancel := context.WithCancel(logf.IntoContext(t.Context(), testLogger))
 
 		cfg := &rest.Config{Host: "http://localhost:0"}
 		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
@@ -983,11 +1043,18 @@ func TestSlurmJobReconciler_Start(t *testing.T) {
 			t.Fatalf("SetupWithManager failed: %v", err)
 		}
 
+		done := make(chan struct{})
 		go func() {
+			defer close(done)
 			if err := reconciler.Start(ctx); err != nil {
-				logf.Log.Error(err, "Reconciler failed to start")
+				t.Errorf("Start() returned error: %v", err)
 			}
 		}()
+		// Stop the forwarding loop and wait for it, so it does not write logs after the test ends.
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
 
 		ev := slurmtypes.SlurmJobAdmissionEvent{
 			JobID: "54321",
@@ -1087,6 +1154,7 @@ func TestReconcile_JobSetCompleted(t *testing.T) {
 	job := newReconTestJob().
 		withJobState(slurmapi.V0044JobInfoJobStatePENDING).
 		withHold(true).
+		withTranslatedJobMarkers().
 		build()
 
 	env := newReconcileTestEnv(t,
@@ -1099,7 +1167,11 @@ func TestReconcile_JobSetCompleted(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifySlurmCancellation(ReasonJobSetCompleted)
+	// The Cancelled status replaces the Unheld status.
+	env.verifySlurmCancellation(cancelledStatus(ReasonJobSetCompleted))
+	if got := env.firstUpdatedComment(); strings.Contains(got, UnheldCommentPrefix) {
+		t.Errorf("Comment = %q, want the %q status replaced", got, UnheldCommentPrefix)
+	}
 	env.verifyJobSetNotFound()
 }
 
@@ -1123,7 +1195,7 @@ func TestReconcile_JobSetFailed(t *testing.T) {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
 
-	env.verifySlurmCancellation(ReasonJobSetFailed)
+	env.verifySlurmCancellation(cancelledStatus(ReasonJobSetFailed))
 	env.verifyJobSetNotFound()
 }
 
@@ -1282,7 +1354,7 @@ func TestCancelJobWithComment_PartConfigUnavailable422_DoesNotLogError(t *testin
 
 			env.verifySlurmCancellation(ReasonJobSetCompleted)
 
-			hasErrLog := strings.Contains(buf.String(), "Failed to set failure comment on Slurm job")
+			hasErrLog := strings.Contains(buf.String(), "Failed to set cancellation comment on Slurm job")
 			if hasErrLog != tc.wantErrorLog {
 				t.Errorf("Error log presence = %v, want %v (logs: %s)", hasErrLog, tc.wantErrorLog, buf.String())
 			}
@@ -1512,6 +1584,51 @@ func TestReconcile_ReleaseHold_IdempotentCommentAndConstraints(t *testing.T) {
 	}
 	if *reqMsg.Constraints != existingConstraints {
 		t.Errorf("Constraints = %q, want %q", *reqMsg.Constraints, existingConstraints)
+	}
+}
+
+// TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus checks that the Unheld status replaces a
+// Cancelled status left by an earlier failed cancellation.
+func TestReconcile_ReleaseHold_ReplacesStaleCancelledStatus(t *testing.T) {
+	job := newReconTestJob().
+		withNodes(2).
+		withAutoHold().
+		withComment("user-comment, " + CancelledCommentPrefix + " Translation failed: missing GRES mapping, " + AutoHoldMarker).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	want := fmt.Sprintf("user-comment, %s Kubernetes resource slurm-job-%s created successfully", UnheldCommentPrefix, reconJobIDStr)
+	if got := env.firstUpdatedComment(); got != want {
+		t.Errorf("Comment = %q, want %q", got, want)
+	}
+}
+
+// TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit checks that the unhold comment fits
+// Slurm's limit.
+func TestReconcile_ReleaseHold_LongUserComment_FitsSlurmLimit(t *testing.T) {
+	userComment := strings.Repeat("u", maxSlurmCommentLength-len(commentSeparator+AutoHoldMarker))
+	job := newReconTestJob().
+		withNodes(2).
+		withAutoHold().
+		withComment(userComment + commentSeparator + AutoHoldMarker).
+		build()
+	env := newReconcileTestEnv(t, withPendingSlurmJobs(job))
+
+	if _, err := env.reconcile(); err != nil {
+		t.Fatalf("Reconcile() returned unexpected error: %v", err)
+	}
+	env.verifySlurmUnhold()
+	got := env.firstUpdatedComment()
+	if len(got) > maxSlurmCommentLength {
+		t.Errorf("len(Comment) = %d, want <= %d", len(got), maxSlurmCommentLength)
+	}
+	wantStatus := fmt.Sprintf("%s Kubernetes resource slurm-job-%s created successfully", UnheldCommentPrefix, reconJobIDStr)
+	if !strings.HasPrefix(got, "uuu") || !strings.HasSuffix(got, truncatedCommentSuffix+commentSeparator+wantStatus) {
+		t.Errorf("Comment = %q, want the truncated user comment followed by %q", got, wantStatus)
 	}
 }
 
@@ -2833,5 +2950,63 @@ func TestJobSetWatchPredicate(t *testing.T) {
 		if pred.Generic(event.TypedGenericEvent[*jobsetv1alpha2.JobSet]{Object: js}) {
 			t.Errorf("Generic() = true, want false")
 		}
+	})
+}
+
+func TestReconcile_WorkloadMixingAvailabilityGate(t *testing.T) {
+	markUnavailable := withWorkloadMixingModifier(func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+		wm.Generation = 1
+		wm.Status.Conditions = []metav1.Condition{
+			{
+				Type:               k8sbridgev1alpha1.ConditionTypeAvailable,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: 1,
+				Reason:             testReasonLocalQueueNotFound,
+			},
+		}
+	})
+
+	t.Run("Defers new job while unavailable and admits once Available=True", func(t *testing.T) {
+		job := newReconTestJob().withNodes(1).withAutoHold().build()
+		env := newReconcileTestEnv(t, markUnavailable, withPendingSlurmJobs(job))
+
+		// 1. Unavailable -> deferred with no JobSet or Slurm updates.
+		res, err := env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("First reconcile = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifyJobSetNotFound()
+		env.verifyNoSlurmUpdates()
+
+		// 2. Available=True -> JobSet created and Slurm hold released.
+		wmKey := types.NamespacedName{Namespace: reconNamespace, Name: reconWmName}
+		var latestWM k8sbridgev1alpha1.WorkloadMixing
+		if err := env.baseClient.Get(t.Context(), wmKey, &latestWM); err != nil {
+			t.Fatalf("Failed to get WorkloadMixing: %v", err)
+		}
+		latestWM.Status.Conditions[0].Status = metav1.ConditionTrue
+		latestWM.Status.Conditions[0].Reason = testReasonReconciled
+		if err := env.baseClient.Update(t.Context(), &latestWM); err != nil {
+			t.Fatalf("Failed to update WorkloadMixing: %v", err)
+		}
+
+		res, err = env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("Recovery reconcile = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifyJobSetCreated("some-queue", reconJobIDStr, reconWmName)
+		env.verifySlurmUnhold()
+	})
+
+	t.Run("Proceeds for existing JobSet even when WorkloadMixing is unavailable", func(t *testing.T) {
+		job := newReconTestJob().withAutoHold().build()
+		existingJS := newReconTestJobSet().withSuspend(false).build()
+		env := newReconcileTestEnv(t, markUnavailable, withExtraObjects(existingJS), withPendingSlurmJobs(job))
+
+		res, err := env.reconcile()
+		if err != nil || res != (ctrl.Result{}) {
+			t.Fatalf("Reconcile() = (%v, %v), want (empty, nil)", res, err)
+		}
+		env.verifySlurmUnhold()
 	})
 }

@@ -41,6 +41,7 @@ const (
 	// LINT.ThenChange(
 	//   test/e2e/testdata/slurm_login.yaml:slurm_test_user,
 	//   test/e2e/testdata/workloadmixing_template.yaml:slurm_test_user,
+	//   test/e2e/testdata/workloadmixing_tas.yaml:slurm_test_user,
 	//   test/e2e/testdata/workloadmixing_gpu.yaml:slurm_test_user
 	// )
 

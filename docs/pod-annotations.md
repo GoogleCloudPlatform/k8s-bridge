@@ -1,0 +1,78 @@
+<!--
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# Passing Pod annotations with `--extra`
+
+Slurm users can add Kubernetes annotations to the `slurmd` Pods of a job with Slurm's `--extra` option of `sbatch`, `srun`, and `salloc`. This lets a single partition serve jobs with different Kueue [Topology-Aware Scheduling](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/) (TAS) requests:
+
+```bash
+sbatch -p a4x -N 16 --gpus-per-node=4 \
+  --extra="kueue.x-k8s.io/podset-required-topology=cloud.google.com/gce-topology-subblock" \
+  train.sh
+```
+
+> **Note:** Do not enable `SchedulerParameters=extra_constraints` in `slurm.conf` (it is disabled by default). When it is enabled, `slurmctld` treats `--extra` as a node filter and the job cannot be scheduled on dynamic nodes.
+
+## Format
+
+`--extra` is a comma-separated list of `key=value` entries, where each key is a full Kubernetes annotation key (`[<prefix>/]<name>`).
+
+- Whitespace around `,`, keys, and values is trimmed. An empty or whitespace-only `--extra` is ignored.
+- Empty entries, for example from a trailing comma, are skipped.
+- Slurm itself limits `--extra` to 1024 bytes.
+- Each entry must contain `=` and a non-empty key. Only the first `=` separates the key from the value, so values may contain `=`. Values may be empty. Duplicate keys are rejected.
+- Values cannot contain `,`, because `,` always separates entries and cannot be escaped. For example, `cfg=a=1,b=2` yields two annotations: `cfg: a=1` and `b: 2`.
+- The resulting annotations must be valid Kubernetes annotations.
+
+If `--extra` is invalid, k8s-bridge cancels the Slurm job. Its comment keeps the user's own text and gets `Cancelled by k8s-bridge:` followed by one of:
+
+- `Translation failed: invalid --extra: ...` when the `--extra` syntax is invalid.
+- `Translation failed: invalid PodTemplate annotations: ...` when the resulting annotations are not valid Kubernetes annotations. The message names the offending key.
+
+## Interaction with `WorkloadMixing.spec.podTemplate`
+
+Annotations in `spec.podTemplate.metadata.annotations` act as defaults. `--extra` annotations override defaults with the same key, and all other defaults are kept. If the combination is invalid, for example when the defaults set `kueue.x-k8s.io/podset-preferred-topology` and `--extra` sets `kueue.x-k8s.io/podset-required-topology`, Kueue rejects the `JobSet` and the Slurm job is cancelled as described below.
+
+## Admission errors
+
+k8s-bridge does not check Kueue TAS rules itself. Kueue's `JobSet` validating webhook checks them when k8s-bridge creates the `JobSet`. If the webhook or the API server rejects the `JobSet` (HTTP 422, or HTTP 400 or 403 from a validating webhook), k8s-bridge cancels the Slurm job and adds `Cancelled by k8s-bridge: JobSet admission rejected: <reason>` to its comment. Transient errors are retried.
+
+## Topology-Aware Scheduling
+
+k8s-bridge only passes the TAS annotations to the `slurmd` Pods. Kueue places the Pods. To set up the `Topology`, the TAS `ResourceFlavor`, and the `ClusterQueue`, and for the meaning of each annotation, see the Kueue [Topology-Aware Scheduling](https://kueue.sigs.k8s.io/docs/concepts/topology_aware_scheduling/) documentation.
+
+### Slurm configuration
+
+Use a flat topology with `alpha_step_rank: true` (Slurm 26.05 or later). With the Slinky `slurm` Helm chart, add `topology.yaml` to `configFiles` in your values file:
+
+```yaml
+configFiles:
+  topology.yaml: |
+    - topology: k8s-bridge
+      cluster_default: true
+      flat:
+        alpha_step_rank: true
+```
+
+Without Helm, put `topology.yaml` in a ConfigMap and list it in `Controller.spec.configFileRefs`.
+
+If the cluster already uses a tree or block topology for other partitions, add the `k8s-bridge` entry next to it with `cluster_default: false`, and set `Topology=k8s-bridge` on the k8s-bridge partitions. Dynamic k8s-bridge nodes are not part of any switch or block.
+
+### Rank order
+
+Kueue places the Pods of a job in the order of their `JobSet` job index, so neighboring indexes are close in the topology. With `alpha_step_rank`, Slurm sorts the nodes of a job by name, and k8s-bridge names them `slurm-job-<id>-slurmd-<jobIndex>-0`, so `SLURM_PROCID` follows the same order. Without it, ranks follow the order in which the dynamic nodes registered. GPU collective libraries build their communication rings from the rank order, and TPU jobs need `SLURM_PROCID` to match `TPU_WORKER_ID`.
+
+`alpha_step_rank` applies only to the block task distribution. Steps with more tasks than nodes use block by default. Steps with one task per node use cyclic by default, so run them with `srun -m block` (or set `SLURM_DISTRIBUTION=block`).
