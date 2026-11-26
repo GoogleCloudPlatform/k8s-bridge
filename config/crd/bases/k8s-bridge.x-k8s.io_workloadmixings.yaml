@@ -27,7 +27,24 @@ spec:
     singular: workloadmixing
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .spec.controllerRef.name
+      name: Controller
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Available')].status
+      name: Available
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Available')].reason
+      name: Reason
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Available')].message
+      name: Message
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: WorkloadMixing is the Schema for the workloadmixings API
@@ -67,6 +84,12 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+                x-kubernetes-validations:
+                - message: controllerRef.name must be 1 to 253 characters
+                  rule: has(self.name) && size(self.name) > 0 && size(self.name) <=
+                    253
+                - message: controllerRef is immutable
+                  rule: self == oldSelf
               mappedResources:
                 description: MappedResources is a list of generic resource mappings
                   (GRES).
@@ -75,7 +98,14 @@ spec:
                     k8sResourceName:
                       description: K8sResourceName is the Kubernetes resource name
                         (e.g., "nvidia.com/gpu", "google.com/tpu").
+                      maxLength: 253
+                      minLength: 3
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/[a-zA-Z0-9]([-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9])?$
                       type: string
+                      x-kubernetes-validations:
+                      - message: k8sResourceName must be a non-reserved Kubernetes
+                          extended resource (e.g. 'nvidia.com/gpu')
+                        rule: '!self.contains(''kubernetes.io/'') && !self.startsWith(''requests.'')'
                     nodeSelectors:
                       additionalProperties:
                         type: string
@@ -85,17 +115,29 @@ spec:
                     resourceName:
                       description: ResourceName is the Slurm GRES resource name (e.g.,
                         "gpu", "tpu").
+                      maxLength: 64
+                      minLength: 1
+                      pattern: ^[a-zA-Z0-9_-]+$
                       type: string
                     resourceType:
                       description: |-
                         ResourceType is the Slurm GRES type/model (e.g., "l4", "a100", "v5lite").
                         Optional if the GRES doesn't specify a sub-type.
+                      maxLength: 64
+                      pattern: ^[a-zA-Z0-9_.-]*$
                       type: string
                   required:
                   - k8sResourceName
                   - resourceName
                   type: object
+                maxItems: 64
                 type: array
+                x-kubernetes-validations:
+                - message: mappedResources must have unique (resourceName, resourceType)
+                    pairs
+                  rule: 'self.all(x, self.exists_one(y, x.resourceName == y.resourceName
+                    && (has(x.resourceType) ? x.resourceType : '''') == (has(y.resourceType)
+                    ? y.resourceType : '''')))'
               partitionsMapping:
                 description: PartitionsMapping is a list of partition configurations.
                 items:
@@ -108,13 +150,23 @@ spec:
                       maxLength: 64
                       pattern: ^[a-zA-Z0-9_-]+$
                       type: string
+                      x-kubernetes-validations:
+                      - message: dynamicNodeFeature must not start with reserved prefix
+                          'k8s-id-'
+                        rule: '!self.startsWith(''k8s-id-'')'
                     localQueue:
                       description: LocalQueue is the name of the Kueue LocalQueue
                         to map this partition to.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
                     partition:
                       description: Partition is the name of the Slurm partition to
                         observe/map.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-zA-Z0-9]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?$
                       type: string
                     threadsPerCore:
                       description: |-
@@ -126,12 +178,18 @@ spec:
                     workloadPriorityClass:
                       description: WorkloadPriorityClass is the name of the Kueue
                         WorkloadPriorityClass to map this partition to.
+                      maxLength: 63
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$
                       type: string
                   required:
                   - localQueue
                   - partition
                   type: object
+                maxItems: 64
                 type: array
+                x-kubernetes-list-map-keys:
+                - partition
+                x-kubernetes-list-type: map
               podTemplate:
                 description: |-
                   PodTemplate is an optional template for the Pods that will be created.
@@ -8641,6 +8699,13 @@ spec:
                     - containers
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: podTemplate.spec.restartPolicy must be 'Never' or 'OnFailure'
+                  rule: '!has(self.spec) || !has(self.spec.restartPolicy) || self.spec.restartPolicy
+                    in ['''', ''Never'', ''OnFailure'']'
+                - message: slurmd container image must not be empty when specified
+                  rule: '!has(self.spec) || !has(self.spec.containers) || self.spec.containers.all(c,
+                    c.name != ''slurmd'' || (has(c.image) && size(c.image) > 0))'
               threadsPerCore:
                 default: 2
                 description: |-

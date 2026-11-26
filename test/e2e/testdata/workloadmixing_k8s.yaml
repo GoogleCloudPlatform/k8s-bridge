@@ -22,4 +22,5 @@ spec:
     name: slurm
   partitionsMapping:
     - partition: workloadmixing-partition
+      localQueue: test-local-queue
       dynamicNodeFeature: dynamic_kpartition

@@ -25,18 +25,30 @@ import (
 // PartitionMapping defines configuration for a specific Slurm partition.
 type PartitionMapping struct {
 	// Partition is the name of the Slurm partition to observe/map.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9]([a-zA-Z0-9_.-]*[a-zA-Z0-9])?$"
 	// +required
 	Partition string `json:"partition"`
 
 	// LocalQueue is the name of the Kueue LocalQueue to map this partition to.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
 	// +required
 	LocalQueue string `json:"localQueue"`
 
 	// WorkloadPriorityClass is the name of the Kueue WorkloadPriorityClass to map this partition to.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern="^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$"
 	// +optional
 	WorkloadPriorityClass string `json:"workloadPriorityClass,omitempty"`
 
 	// DynamicNodeFeature is the feature name configured for dynamic nodes in this partition (e.g. "dynamic_kpartition").
+	// ---
+	// LINT.IfChange(unique_feature_prefix)
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('k8s-id-')",message="dynamicNodeFeature must not start with reserved prefix 'k8s-id-'"
+	// LINT.ThenChange(internal/controller/slurmjob/translator.go:unique_feature_prefix)
 	// +kubebuilder:validation:MaxLength=64
 	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9_-]+$"
 	// +optional
@@ -51,15 +63,24 @@ type PartitionMapping struct {
 
 type GenericResourceMapping struct {
 	// ResourceName is the Slurm GRES resource name (e.g., "gpu", "tpu").
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9_-]+$"
 	// +required
 	ResourceName string `json:"resourceName"`
 
 	// ResourceType is the Slurm GRES type/model (e.g., "l4", "a100", "v5lite").
 	// Optional if the GRES doesn't specify a sub-type.
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9_.-]*$"
 	// +optional
 	ResourceType string `json:"resourceType,omitempty"`
 
 	// K8sResourceName is the Kubernetes resource name (e.g., "nvidia.com/gpu", "google.com/tpu").
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/[a-zA-Z0-9]([-_.a-zA-Z0-9]{0,61}[a-zA-Z0-9])?$"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('kubernetes.io/') && !self.startsWith('requests.')",message="k8sResourceName must be a non-reserved Kubernetes extended resource (e.g. 'nvidia.com/gpu')"
 	// +required
 	K8sResourceName string `json:"k8sResourceName"`
 
@@ -71,14 +92,21 @@ type GenericResourceMapping struct {
 // WorkloadMixingSpec defines the desired state of WorkloadMixing
 type WorkloadMixingSpec struct {
 	// controllerRef is a reference to the Slurm controller / cluster.
+	// +kubebuilder:validation:XValidation:rule="has(self.name) && size(self.name) > 0 && size(self.name) <= 253",message="controllerRef.name must be 1 to 253 characters"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="controllerRef is immutable"
 	// +required
 	ControllerRef corev1.LocalObjectReference `json:"controllerRef"`
 
 	// PartitionsMapping is a list of partition configurations.
+	// +kubebuilder:validation:MaxItems=64
+	// +listType=map
+	// +listMapKey=partition
 	// +optional
 	PartitionsMapping []PartitionMapping `json:"partitionsMapping,omitempty"`
 
 	// MappedResources is a list of generic resource mappings (GRES).
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:XValidation:rule="self.all(x, self.exists_one(y, x.resourceName == y.resourceName && (has(x.resourceType) ? x.resourceType : '') == (has(y.resourceType) ? y.resourceType : '')))",message="mappedResources must have unique (resourceName, resourceType) pairs"
 	// +optional
 	MappedResources []GenericResourceMapping `json:"mappedResources,omitempty"`
 
@@ -86,6 +114,8 @@ type WorkloadMixingSpec struct {
 	// The CPU and memory limits of the slurmd container are the maximum node size.
 	// k8s-bridge cancels a Slurm job that needs more on one node. For each job, it sets
 	// the slurmd requests and limits.
+	// +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.restartPolicy) || self.spec.restartPolicy in ['', 'Never', 'OnFailure']",message="podTemplate.spec.restartPolicy must be 'Never' or 'OnFailure'"
+	// +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.containers) || self.spec.containers.all(c, c.name != 'slurmd' || (has(c.image) && size(c.image) > 0))",message="slurmd container image must not be empty when specified"
 	// +optional
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 
@@ -126,6 +156,11 @@ type WorkloadMixingStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Controller",type=string,JSONPath=".spec.controllerRef.name"
+// +kubebuilder:printcolumn:name="Available",type=string,JSONPath=".status.conditions[?(@.type=='Available')].status"
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=".status.conditions[?(@.type=='Available')].reason"
+// +kubebuilder:printcolumn:name="Message",type=string,priority=1,JSONPath=".status.conditions[?(@.type=='Available')].message"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // WorkloadMixing is the Schema for the workloadmixings API
 type WorkloadMixing struct {
