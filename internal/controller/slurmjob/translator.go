@@ -1149,7 +1149,10 @@ func injectSlurmVolumes(podSpec *corev1.PodSpec, controller *slinkyv1beta1.Contr
 
 var dynamicNodeFeatureRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// LINT.IfChange(unique_feature_prefix)
 const UniqueFeaturePrefix = "k8s-id-"
+
+// LINT.ThenChange(api/v1alpha1/workloadmixing_types.go:unique_feature_prefix)
 
 // slurmdManagedEnvNames are the env vars that appendSlurmdArgs sets on the
 // slurmd container. A pod template value with one of these names is dropped.
