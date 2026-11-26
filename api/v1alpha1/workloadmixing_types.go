@@ -72,7 +72,7 @@ type GenericResourceMapping struct {
 	// ResourceType is the Slurm GRES type/model (e.g., "l4", "a100", "v5lite").
 	// Optional if the GRES doesn't specify a sub-type.
 	// +kubebuilder:validation:MaxLength=64
-	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9_-]*$"
+	// +kubebuilder:validation:Pattern="^[a-zA-Z0-9_.-]*$"
 	// +optional
 	ResourceType string `json:"resourceType,omitempty"`
 

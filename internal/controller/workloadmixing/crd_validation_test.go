@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -83,6 +84,9 @@ var _ = Describe("WorkloadMixing CRD Validation", func() {
 		},
 		Entry("empty controllerRef.name", func(wm *k8sbridgev1alpha1.WorkloadMixing) {
 			wm.Spec.ControllerRef.Name = ""
+		}, "controllerRef"),
+		Entry("controllerRef.name exceeding 253 chars", func(wm *k8sbridgev1alpha1.WorkloadMixing) {
+			wm.Spec.ControllerRef.Name = strings.Repeat("a", 254)
 		}, "controllerRef"),
 		Entry("duplicate partition in partitionsMapping", func(wm *k8sbridgev1alpha1.WorkloadMixing) {
 			wm.Spec.PartitionsMapping = []k8sbridgev1alpha1.PartitionMapping{
@@ -178,7 +182,7 @@ spec:
 		Expect(err.Error()).To(ContainSubstring("mappedResources"))
 	})
 
-	It("accepts valid edge cases including explicit empty optionals, dotted RFC 1123 names, and optional podTemplate fields", func() {
+	It("accepts valid edge cases including explicit empty optionals, dotted MIG GRES types, dotted RFC 1123 names, and optional podTemplate fields", func() {
 		obj := unstructuredWMFromYAML(`
 apiVersion: k8s-bridge.x-k8s.io/v1alpha1
 kind: WorkloadMixing
@@ -195,6 +199,9 @@ spec:
     - resourceName: gpu
       resourceType: nvidia_l4
       k8sResourceName: nvidia.com/gpu
+    - resourceName: gpu
+      resourceType: a100_3g.20gb
+      k8sResourceName: nvidia.com/mig-3g.20gb
     - resourceName: gpu
       resourceType: ""
       k8sResourceName: nvidia.com/gpu
@@ -245,6 +252,7 @@ spec:
 			filepath.Join(repoRoot, "config", "samples", "*workloadmixing*.yaml"),
 			filepath.Join(repoRoot, "docs", "examples", "*", "workloadmixing*.yaml"),
 			filepath.Join(repoRoot, "test", "e2e", "testdata", "workloadmixing*.yaml"),
+			filepath.Join(repoRoot, "test", "e2e", "testdata", "partition_mapping_*.yaml"),
 		}
 
 		var manifestPaths []string

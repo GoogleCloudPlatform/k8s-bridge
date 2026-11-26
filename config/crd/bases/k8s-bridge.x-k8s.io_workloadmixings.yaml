@@ -124,7 +124,7 @@ spec:
                         ResourceType is the Slurm GRES type/model (e.g., "l4", "a100", "v5lite").
                         Optional if the GRES doesn't specify a sub-type.
                       maxLength: 64
-                      pattern: ^[a-zA-Z0-9_-]*$
+                      pattern: ^[a-zA-Z0-9_.-]*$
                       type: string
                   required:
                   - k8sResourceName
